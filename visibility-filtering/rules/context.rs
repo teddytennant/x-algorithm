@@ -1,319 +1,196 @@
+use crate::hydration::{Hydrator, Hydrators};
 use crate::models::{
-    tweet_timestamp_ms, AuthorLabel, HydratedTweetCandidate, SafetyLabelType, ViewerFeatures,
+    tweet_timestamp_ms, ArticleLifecycle, AuthorFeatures, AuthorLabelSet, ClientCapability,
+    CommunityModeration, HydratedTweetCandidate, SafetyLabelMap, TweetFeatures, Viewer,
+    ViewerFeatures, ViewerProfile,
 };
-use crate::params::NsfwGatingCountries;
-use xai_core_entities::entities::TakedownReason;
+use crate::params::{CountryList, CountryLists};
+use xai_core_entities::entities::ConversationControl;
 
-pub struct RuleContext<'a> {
+pub(crate) struct RuleContext<'a> {
+    facts: CoreFacts<'a>,
+    #[cfg(test)]
+    hydrated: Hydrators,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct CoreFacts<'a> {
     viewer: &'a ViewerFeatures,
     candidate: &'a HydratedTweetCandidate,
-    nsfw_gating_countries: &'a NsfwGatingCountries,
+    country_lists: &'a CountryLists,
 }
 
 impl<'a> RuleContext<'a> {
     pub(super) fn new(
         viewer: &'a ViewerFeatures,
         candidate: &'a HydratedTweetCandidate,
-        nsfw_gating_countries: &'a NsfwGatingCountries,
+        country_lists: &'a CountryLists,
     ) -> Self {
         Self {
-            viewer,
-            candidate,
-            nsfw_gating_countries,
+            facts: CoreFacts {
+                viewer,
+                candidate,
+                country_lists,
+            },
+            #[cfg(test)]
+            hydrated: Hydrators::all(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn hydrated_by(self, hydrated: Hydrators) -> Self {
+        Self { hydrated, ..self }
+    }
+
+    #[inline]
+    fn reads(&self, hydrator: Hydrator) -> &'a HydratedTweetCandidate {
+        #[cfg(test)]
+        assert!(
+            self.hydrated.contains(hydrator),
+            "a rule reads {hydrator:?}, which its policy does not derive"
+        );
+        #[cfg(not(test))]
+        let _ = hydrator;
+        self.facts.candidate
+    }
+
+    #[inline]
+    pub(super) fn facts(&self) -> CoreFacts<'a> {
+        self.facts
+    }
+
+    #[inline]
+    pub(super) fn failed(&self) -> Hydrators {
+        self.facts.candidate.failed
+    }
+
+    #[inline]
+    pub(super) fn source_tweet_id(&self) -> Option<u64> {
+        self.reads(Hydrator::PureCore).source_tweet_id
+    }
+
+    #[inline]
+    pub(super) fn tweet_features(&self) -> &'a TweetFeatures {
+        &self.reads(Hydrator::Tweet).tweet_features
+    }
+
+    #[inline]
+    pub(super) fn tweet_safety_labels(&self) -> &'a SafetyLabelMap {
+        &self.reads(Hydrator::TweetSafetyLabels).safety_labels
+    }
+
+    #[inline]
+    pub(super) fn author_features(&self) -> &'a AuthorFeatures {
+        &self.reads(Hydrator::AuthorSafety).author_features
+    }
+
+    #[inline]
+    pub(super) fn author_labels(&self) -> AuthorLabelSet {
+        self.reads(Hydrator::AuthorLabels).author_labels
+    }
+
+    #[inline]
+    pub(super) fn edge(&self, node: Hydrator) -> bool {
+        debug_assert!(node.is_edge(), "{node:?} is not an edge node");
+        self.reads(node).edges.contains(node)
+    }
+
+    #[inline]
+    pub(super) fn conversation_control(&self) -> Option<&'a ConversationControl> {
+        let features = self
+            .reads(Hydrator::ConversationControl)
+            .conversation_control
+            .as_ref();
+        features.map(|features| &features.control)
+    }
+
+    #[inline]
+    pub(super) fn viewer_country(&self) -> Option<&'a str> {
+        let features = self
+            .reads(Hydrator::ViewerCountry)
+            .conversation_control
+            .as_ref();
+        features.and_then(|features| features.viewer_country.as_deref())
+    }
+
+    #[inline]
+    pub(super) fn community_moderation(&self) -> CommunityModeration {
+        self.reads(Hydrator::CommunityModeration)
+            .community_moderation
+    }
+
+    #[inline]
+    pub(super) fn viewer_is_community_moderator(&self) -> Option<bool> {
+        self.reads(Hydrator::CommunityModerator)
+            .viewer_is_community_moderator
+    }
+
+    #[inline]
+    pub(super) fn viewer_is_removed_from_community(&self) -> bool {
+        self.reads(Hydrator::CommunityViewerRemoved)
+            .viewer_is_removed_from_community
+    }
+
+    #[inline]
+    pub(super) fn article_lifecycle(&self) -> Option<ArticleLifecycle> {
+        self.reads(Hydrator::ArticleLifecycle).article_lifecycle
+    }
+
+    #[inline]
+    pub(super) fn viewer_has_age_verified_18_label(&self) -> bool {
+        self.reads(Hydrator::ViewerLabels);
+        match &self.facts.viewer.viewer {
+            Viewer::LoggedIn {
+                has_age_verified_18_label,
+                ..
+            } => *has_age_verified_18_label,
+            Viewer::LoggedOut => false,
         }
     }
 
     #[inline]
-    pub fn viewer(&self) -> ViewerPredicates<'_> {
-        ViewerPredicates { ctx: self }
-    }
-
-    #[inline]
-    pub fn tweet(&self) -> TweetPredicates<'_> {
-        TweetPredicates { ctx: self }
-    }
-
-    #[inline]
-    pub fn author(&self) -> AuthorPredicates<'_> {
-        AuthorPredicates { ctx: self }
-    }
-
-    #[inline]
-    pub fn takedown(&self) -> TakedownPredicates<'_> {
-        TakedownPredicates { ctx: self }
-    }
-
-    #[inline]
-    pub fn nsfw_gating_country(&self, country_code: &str) -> bool {
-        self.nsfw_gating_countries.contains(country_code)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct ViewerPredicates<'a> {
-    ctx: &'a RuleContext<'a>,
-}
-
-impl ViewerPredicates<'_> {
-    #[inline]
-    pub fn is_logged_out(&self) -> bool {
-        self.ctx.viewer.viewer_is_logged_out()
-    }
-
-    #[inline]
-    pub fn is_underage(&self) -> bool {
-        self.ctx.viewer.viewer_is_underage()
-    }
-
-    #[inline]
-    pub fn has_no_stated_age(&self) -> bool {
-        self.ctx.viewer.viewer_has_no_stated_age()
-    }
-
-    #[inline]
-    pub fn allows_sensitive_media(&self) -> bool {
-        self.ctx.viewer.allows_sensitive_media
-    }
-
-    #[inline]
-    pub fn country(&self) -> Option<&str> {
-        self.ctx
-            .viewer
-            .account_country_code
-            .as_deref()
-            .or(self.ctx.viewer.country_code.as_deref())
-    }
-
-    #[inline]
-    pub fn is_author(&self) -> bool {
-        self.ctx.candidate.is_author_viewer(self.ctx.viewer.viewer)
-    }
-
-    #[inline]
-    pub fn follows_author(&self) -> bool {
-        self.ctx.candidate.viewer_follows_author()
-    }
-
-    #[inline]
-    pub fn blocks_author(&self) -> bool {
-        self.ctx.candidate.relationship.viewer_blocks_author
-    }
-
-    #[inline]
-    pub fn mutes_author(&self) -> bool {
-        self.ctx.candidate.relationship.viewer_mutes_author
-    }
-
-    #[inline]
-    pub fn mutes_retweets_from_author(&self) -> bool {
-        self.ctx
-            .candidate
-            .relationship
-            .viewer_mutes_retweets_from_author
-    }
-
-    #[inline]
-    pub fn is_conversation_author(&self) -> bool {
-        match (
-            &self.ctx.candidate.exclusive_content,
-            self.ctx.viewer.viewer_id(),
-        ) {
-            (Some(exclusive), Some(viewer_id)) => viewer_id == exclusive.conversation_author_id,
-            _ => false,
+    pub(super) fn viewer_profile(&self) -> Option<&'a ViewerProfile> {
+        self.reads(Hydrator::ViewerProfile);
+        match &self.facts.viewer.viewer {
+            Viewer::LoggedIn { profile, .. } => Some(profile),
+            Viewer::LoggedOut => None,
         }
     }
-
-    #[inline]
-    pub fn super_follows_author(&self) -> bool {
-        self.ctx
-            .candidate
-            .exclusive_content
-            .as_ref()
-            .is_some_and(|exclusive| exclusive.viewer_super_follows_author)
-    }
 }
 
-#[derive(Clone, Copy)]
-pub struct TweetPredicates<'a> {
-    ctx: &'a RuleContext<'a>,
-}
-
-impl TweetPredicates<'_> {
+impl<'a> CoreFacts<'a> {
     #[inline]
-    pub fn created_after(&self, unix_ms: u64) -> bool {
-        tweet_timestamp_ms(self.ctx.candidate.tweet_id) > unix_ms
+    pub(super) fn tweet_id(self) -> u64 {
+        self.candidate.tweet_id
     }
 
     #[inline]
-    pub fn has_safety_label(&self, label: SafetyLabelType) -> bool {
-        self.ctx.candidate.has_safety_label(label)
+    pub(super) fn viewer_id(self) -> Option<u64> {
+        self.viewer.viewer.user_id()
     }
 
     #[inline]
-    pub fn is_retweet(&self) -> bool {
-        self.ctx.candidate.is_retweet()
+    pub(super) fn request_country(self) -> Option<&'a str> {
+        self.viewer.country_code.as_deref()
     }
 
     #[inline]
-    pub fn is_stale(&self) -> bool {
-        self.ctx.candidate.is_stale_tweet()
+    pub(super) fn client_capability(self) -> ClientCapability {
+        self.viewer.client_capability
     }
 
     #[inline]
-    pub fn is_nullcast(&self) -> bool {
-        self.ctx.candidate.is_nullcast()
+    pub(super) fn is_author_viewer(self) -> bool {
+        self.viewer_id() == Some(self.candidate.author_id)
     }
 
     #[inline]
-    pub fn is_community_tweet(&self) -> bool {
-        self.ctx.candidate.is_community_tweet()
+    pub(super) fn created_after(self, unix_ms: u64) -> bool {
+        tweet_timestamp_ms(self.candidate.tweet_id) > unix_ms
     }
 
     #[inline]
-    pub fn has_media(&self) -> bool {
-        self.ctx.candidate.has_media()
-    }
-
-    #[inline]
-    pub fn has_dmca_media(&self) -> bool {
-        self.ctx.candidate.has_dmca_media()
-    }
-
-    #[inline]
-    pub fn has_nsfw_user_flag(&self) -> bool {
-        self.ctx.candidate.tweet_features.nsfw.user
-    }
-
-    #[inline]
-    pub fn has_nsfw_admin_flag(&self) -> bool {
-        self.ctx.candidate.tweet_features.nsfw.admin
-    }
-
-    #[inline]
-    pub fn is_exclusive(&self) -> bool {
-        self.ctx.candidate.exclusive_content.is_some()
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct AuthorPredicates<'a> {
-    ctx: &'a RuleContext<'a>,
-}
-
-impl AuthorPredicates<'_> {
-    #[inline]
-    pub fn is_suspended(&self) -> bool {
-        self.ctx.candidate.author_features.is_suspended
-    }
-
-    #[inline]
-    pub fn is_deactivated(&self) -> bool {
-        self.ctx.candidate.author_features.is_deactivated
-    }
-
-    #[inline]
-    pub fn is_erased(&self) -> bool {
-        self.ctx.candidate.author_features.is_erased
-    }
-
-    #[inline]
-    pub fn is_offboarded(&self) -> bool {
-        self.ctx.candidate.author_features.is_offboarded
-    }
-
-    #[inline]
-    pub fn is_protected(&self) -> bool {
-        self.ctx.candidate.author_features.is_protected
-    }
-
-    #[inline]
-    pub fn is_nsfw_user(&self) -> bool {
-        self.ctx.candidate.author_features.is_nsfw_user
-    }
-
-    #[inline]
-    pub fn is_nsfw_admin(&self) -> bool {
-        self.ctx.candidate.author_features.is_nsfw_admin
-    }
-
-    #[inline]
-    pub fn has_user_label(&self, label: AuthorLabel) -> bool {
-        self.ctx.candidate.author_has_user_label(label)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct TakedownPredicates<'a> {
-    ctx: &'a RuleContext<'a>,
-}
-
-impl TakedownPredicates<'_> {
-    #[inline]
-    pub fn legal_in_viewer_country(&self) -> bool {
-        self.in_viewer_country(legal_takedown_country)
-    }
-
-    #[inline]
-    pub fn local_laws_in_viewer_country(&self) -> bool {
-        self.in_viewer_country(local_laws_takedown_country)
-    }
-
-    #[inline]
-    fn in_viewer_country(&self, extractor: fn(&TakedownReason) -> Option<&str>) -> bool {
-        let viewer_country = self.ctx.viewer.country_code.as_deref();
-        self.ctx
-            .candidate
-            .tweet_features
-            .takedown_reasons
-            .iter()
-            .filter_map(extractor)
-            .any(|c| {
-                is_worldwide_code(c) || viewer_country.is_some_and(|v| c.eq_ignore_ascii_case(v))
-            })
-    }
-
-    #[inline]
-    pub fn media_restricted_in_viewer_country(&self) -> bool {
-        let country = self
-            .ctx
-            .viewer
-            .country_code
-            .as_deref()
-            .unwrap_or(WORLDWIDE_COUNTRY_CODE);
-        let allow = &self.ctx.candidate.tweet_features.media.geo_allow_list;
-        let deny = &self.ctx.candidate.tweet_features.media.geo_deny_list;
-        (!allow.is_empty() && !allow.iter().any(|c| c.eq_ignore_ascii_case(country)))
-            || deny.iter().any(|c| c.eq_ignore_ascii_case(country))
-    }
-}
-
-const WORLDWIDE_COUNTRY_CODE: &str = "xx";
-const WORLDWIDE_COPYRIGHT_COUNTRY_CODE: &str = "xy";
-
-fn is_worldwide_code(country_code: &str) -> bool {
-    country_code.eq_ignore_ascii_case(WORLDWIDE_COUNTRY_CODE)
-        || country_code.eq_ignore_ascii_case(WORLDWIDE_COPYRIGHT_COUNTRY_CODE)
-}
-
-fn legal_takedown_country(reason: &TakedownReason) -> Option<&str> {
-    match reason {
-        TakedownReason::LegalRequest { country_code }
-            if country_code.eq_ignore_ascii_case(WORLDWIDE_COPYRIGHT_COUNTRY_CODE) =>
-        {
-            None
-        }
-        TakedownReason::LegalRequest { country_code }
-        | TakedownReason::UnspecifiedReason { country_code } => Some(country_code),
-        TakedownReason::Dmca => Some(WORLDWIDE_COPYRIGHT_COUNTRY_CODE),
-        _ => None,
-    }
-}
-
-fn local_laws_takedown_country(reason: &TakedownReason) -> Option<&str> {
-    match reason {
-        TakedownReason::BystanderReport { country_code } if !is_worldwide_code(country_code) => {
-            Some(country_code)
-        }
-        _ => None,
+    pub(super) fn in_country_list(self, list: CountryList, country_code: &str) -> bool {
+        self.country_lists.contains(list, country_code)
     }
 }

@@ -31,4 +31,5 @@ class EapiModelConfig(BaseModel):
     api_host: str = ""
     log_reasoning_trace: bool = False
     enable_search: bool = False
+    open_search: bool = False
     reasoning_effort: str | None = None

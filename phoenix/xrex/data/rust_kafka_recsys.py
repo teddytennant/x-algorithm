@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
+from itertools import zip_longest
 from typing import Iterator
 
 from xai_configlib import configclass
 from xrex.data import rust_ext
-from xrex.data.parquet_recsys import load_global_ids_from_parquet_file
+from xrex.data.parquet_recsys import DataPosition, load_global_ids_from_parquet_file
 from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
 from xrex.data.streaming.kafkaconsumer import ConsumerMode, _check_reset_sentinel
 from xrex.data.streaming.kafkaloader import (
@@ -22,7 +24,6 @@ from xrex.data.streaming.kafkaloader import (
     system_ca_bundle_path,
 )
 
-
 rank_logger = logging.getLogger("rank")
 
 
@@ -31,6 +32,10 @@ _QSIZE_LOG_INTERVAL_SECS = 1.0
 
 @configclass
 class RustKafkaDataset(PhoenixKafkaDataset):
+    reader_count: int | None = None
+    reader_port: int = 19200
+    max_redistribution_bytes: int = 256 << 20
+
     queue_size: int = 1000
 
     keep_per_factor: float = 1.0
@@ -98,7 +103,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
 
     def _async_kafka_consumer_arrow(
         self,
-        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]]],
+        example_queue: queue.Queue[tuple[RecsysFeaturesBatch, dict[int, int]] | Exception],
         batch_size: int,
         shard_index: int,
         num_shards: int,
@@ -108,40 +113,44 @@ class RustKafkaDataset(PhoenixKafkaDataset):
     ) -> None:
         del run_server
 
-        rank_logger.info("[rust-kafka] Starting consumer thread")
-
-        self._warn_ignored_inherited_fields()
-
-        if self.num_kafka_partitions is None:
-            raise ValueError(
-                "RustKafkaDataset requires num_kafka_partitions to be set. "
-                "In normal trainer use this is auto-discovered by "
-                "PhoenixKafkaDataset.ensure_partition_count() during trainer "
-                "init; if you are calling make() directly, either call "
-                "self.ensure_partition_count() first or set "
-                "num_kafka_partitions explicitly."
-            )
-
-        if self.num_global_negatives_per_example > 0:
-            (
-                self.global_post_ids,
-                self.global_author_ids,
-                _,
-                self.global_post_sids,
-            ) = load_global_ids_from_parquet_file(
-                self.global_ids_file_path,
-                read_post_sid=self.use_post_sid,
-                sid_num_levels=self.sid_num_levels,
-            )
-
-        reload_thread = self._start_global_ids_reload_thread(stop_event)
-
-        RecordBatchProvider = rust_ext.load("xai_recsys_kafka_reader").RecordBatchProvider
-
-        provider: RecordBatchProvider | None = None
+        reader_count = 0
+        routed = self.reader_count != 0
+        provider = None
         control_watcher: threading.Thread | None = None
-
+        reload_thread: threading.Thread | None = None
         try:
+            reader_count = self.redistribution_reader_count(num_shards)
+            routed = bool(reader_count)
+            rank_logger.info("[rust-kafka] Starting consumer thread")
+
+            self._warn_ignored_inherited_fields()
+
+            if self.num_kafka_partitions is None:
+                raise ValueError(
+                    "RustKafkaDataset requires num_kafka_partitions to be set. "
+                    "In normal trainer use this is auto-discovered by "
+                    "PhoenixKafkaDataset.ensure_partition_count() during trainer "
+                    "init; if you are calling make() directly, either call "
+                    "self.ensure_partition_count() first or set "
+                    "num_kafka_partitions explicitly."
+                )
+
+            if self.num_global_negatives_per_example > 0:
+                (
+                    self.global_post_ids,
+                    self.global_author_ids,
+                    _,
+                    self.global_post_sids,
+                ) = load_global_ids_from_parquet_file(
+                    self.global_ids_file_path,
+                    read_post_sid=self.use_post_sid,
+                    sid_num_levels=self.sid_num_levels,
+                )
+
+            reload_thread = self._start_global_ids_reload_thread(stop_event)
+
+            RecordBatchProvider = rust_ext.load("xai_recsys_kafka_reader").RecordBatchProvider
+
             auth = auto_detect_auth(
                 self.bootstrap_servers,
                 self.sasl_mechanism,
@@ -158,7 +167,7 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                 group_id=self.group_id,
                 batch_size=batch_size,
                 num_shards=num_shards,
-                shard_index=shard_index,
+                shard_index=self._reader_rank if reader_count else shard_index,
                 num_partitions=self.num_kafka_partitions,
                 sasl_mechanism=self.sasl_mechanism,
                 sasl_username=auth.sasl_username or self.sasl_plain_username,
@@ -195,11 +204,25 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                 worker_rank=shard_index,
                 training_name=self.name,
                 ranker_index=str(shard_index),
+                **(
+                    {
+                        "reader_count": reader_count,
+                        "reader_addresses": self._reader_addresses,
+                        "redistribution_token": os.environ.get("XREX_KAFKA_REDISTRIBUTION_TOKEN"),
+                        "max_redistribution_bytes": self.max_redistribution_bytes,
+                    }
+                    if reader_count
+                    else {}
+                ),
             )
 
             in_rebaseline = threading.Event()
             control_watcher = self._start_control_watcher(
-                provider, stop_event, reset_event, in_rebaseline
+                provider,
+                stop_event,
+                reset_event,
+                in_rebaseline,
+                close_on_stop=bool(reader_count),
             )
 
             rust_queue_cap = provider.queue_capacity()
@@ -252,14 +275,32 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                     line = (
                         f"rust_channel.qsize()={provider.queue_depth()}/{rust_queue_cap} "
                         f"| example_queue.qsize()={example_queue.qsize()}/{python_queue_cap} "
-                        f"| in={in_msgs_per_s:.0f} msg/s "
-                        f"| out={batches_per_s:.1f} batch/s ({rows_per_s:.0f} rows/s)"
+                        + (f"| in={in_msgs_per_s:.0f} msg/s " if not reader_count else "")
+                        + f"| out={batches_per_s:.1f} batch/s ({rows_per_s:.0f} rows/s)"
                     )
                     drop_status = provider.drop_mode_status()
                     if drop_status is not None:
                         line += f" | {drop_status}"
                     rank_logger.info("%s", line)
+            if reader_count and not (stop_event is not None and stop_event.is_set()):
+                raise RuntimeError("Redistributed Kafka reader ended unexpectedly")
+        except Exception as error:
+            if routed and stop_event is not None and stop_event.is_set():
+                return
+            if routed:
+                while stop_event is None or not stop_event.is_set():
+                    try:
+                        example_queue.put(error, timeout=1.0)
+                        break
+                    except queue.Full:
+                        continue
+            raise
         finally:
+            if routed:
+                if stop_event is not None:
+                    stop_event.set()
+                if provider is not None:
+                    provider.close()
             if control_watcher is not None:
                 control_watcher.join(timeout=2.0)
             if reload_thread is not None:
@@ -321,6 +362,8 @@ class RustKafkaDataset(PhoenixKafkaDataset):
         stop_event: threading.Event | None,
         reset_event: threading.Event | None,
         in_rebaseline: threading.Event | None = None,
+        *,
+        close_on_stop: bool = False,
     ) -> threading.Thread | None:
         def watcher() -> None:
             last_reset_ts = time.time()
@@ -376,10 +419,28 @@ class RustKafkaDataset(PhoenixKafkaDataset):
                         "(will retry next tick): %s",
                         e,
                     )
+            if close_on_stop:
+                provider.close()
 
         thread = threading.Thread(target=watcher, name="rust-kafka-control-watcher", daemon=True)
         thread.start()
         return thread
+
+    def redistribution_reader_count(self, num_shards: int) -> int:
+        if num_shards < 1 or (
+            self.reader_count is not None and not 0 <= self.reader_count <= num_shards
+        ):
+            raise ValueError("reader_count must fit the positive trainer process count")
+        if self.reader_count is not None:
+            return self.reader_count
+        self.ensure_partition_count()
+        partitions = self.num_kafka_partitions
+        if partitions is None or partitions < 1:
+            raise ValueError("Automatic reader_count requires a positive partition count")
+        readers = next(
+            count for count in range(min(partitions, num_shards), 0, -1) if partitions % count == 0
+        )
+        return 0 if readers == num_shards else readers
 
     def make(
         self,
@@ -393,8 +454,38 @@ class RustKafkaDataset(PhoenixKafkaDataset):
         skip_rows: int = 0,
         keep_and_pad_partial_batch: bool | None = None,
         prefetch_factor: int = 2,
-        resume_position=None,
+        resume_position: DataPosition | None = None,
     ) -> Iterator[tuple[RecsysFeaturesBatch, dict[int, int] | None]]:
+        reader_count = self.redistribution_reader_count(num_shards)
+        rank_logger.info(
+            "Kafka readers: %d for %d training processes", reader_count or num_shards, num_shards
+        )
+        self._reader_addresses: list[str] = []
+        self._reader_rank = shard_index
+        if reader_count:
+            if len(server_hosts) != num_shards:
+                raise ValueError("reader_count must fit the trainer host list")
+            if self.is_eval:
+                raise ValueError("Redistribution requires one training iterator per rank")
+            ranks_by_host: dict[str, list[int]] = {}
+            for rank, host in enumerate(server_hosts):
+                ranks_by_host.setdefault(host, []).append(rank)
+            ranks = [
+                rank
+                for group in zip_longest(*ranks_by_host.values())
+                for rank in group
+                if rank is not None
+            ]
+            if reader_count < num_shards:
+                self._reader_rank = ranks.index(shard_index)
+            else:
+                ranks = list(range(num_shards))
+            counts: dict[str, int] = {}
+            for rank in ranks[:reader_count]:
+                host = server_hosts[rank]
+                port = self.reader_port + counts.get(host, 0)
+                self._reader_addresses.append(f"{host}:{port}")
+                counts[host] = counts.get(host, 0) + 1
         return super().make(
             batch_size=batch_size,
             shard_index=shard_index,

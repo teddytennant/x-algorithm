@@ -8,9 +8,8 @@ use tokio::time::MissedTickBehavior;
 use xai_thunder_proto::{LightPost, TweetDeleteEvent};
 
 use crate::config::{
-    DELETE_EVENT_KEY, MAX_ORIGINAL_POSTS_PER_AUTHOR, MAX_POSTING_LIST_SIZE,
-    MAX_REPLY_POSTS_PER_AUTHOR, MAX_TINY_POSTS_PER_USER_SCAN, MAX_VIDEO_POSTS_PER_AUTHOR,
-    TRIM_FRACTION,
+    DELETE_EVENT_KEY, MAX_POSTING_LIST_SIZE, MAX_TINY_POSTS_PER_USER_SCAN,
+    MAX_VIDEO_POSTS_PER_AUTHOR, TRIM_FRACTION,
 };
 use crate::metrics::{
     POST_STORE_DELETED_POSTS, POST_STORE_ENTITY_COUNT, POST_STORE_POSTS_RETURNED,
@@ -120,7 +119,7 @@ impl PostStore {
                 .or_default();
             user_posts_entry.push_back(TinyPost {
                 post_id: post.post_id,
-                created_at: post.deleted_at, 
+                created_at: post.deleted_at,
             });
         }
     }
@@ -239,7 +238,7 @@ impl PostStore {
             user_ids,
             MAX_VIDEO_POSTS_PER_AUTHOR,
             exclude_tweet_ids,
-            &HashSet::new(), 
+            &HashSet::new(),
             start_time,
             request_user_id,
         );
@@ -254,30 +253,33 @@ impl PostStore {
         exclude_tweet_ids: &HashSet<i64>,
         start_time: Instant,
         request_user_id: i64,
+        max_original_per_author: usize,
+        max_secondary_per_author: usize,
     ) -> Vec<LightPost> {
         let following_users_set: HashSet<i64> = user_ids.iter().copied().collect();
 
         let mut all_posts = self.get_posts_from_map(
             &self.original_posts_by_user,
             user_ids,
-            MAX_ORIGINAL_POSTS_PER_AUTHOR,
+            max_original_per_author,
             exclude_tweet_ids,
-            &HashSet::new(), 
+            &HashSet::new(),
             start_time,
             request_user_id,
         );
 
-        let secondary_posts = self.get_posts_from_map(
-            &self.secondary_posts_by_user,
-            user_ids,
-            MAX_REPLY_POSTS_PER_AUTHOR,
-            exclude_tweet_ids,
-            &following_users_set,
-            start_time,
-            request_user_id,
-        );
-
-        all_posts.extend(secondary_posts);
+        if max_secondary_per_author > 0 {
+            let secondary_posts = self.get_posts_from_map(
+                &self.secondary_posts_by_user,
+                user_ids,
+                max_secondary_per_author,
+                exclude_tweet_ids,
+                &following_users_set,
+                start_time,
+                request_user_id,
+            );
+            all_posts.extend(secondary_posts);
+        }
         POST_STORE_POSTS_RETURNED.observe(all_posts.len() as f64);
         all_posts
     }
@@ -338,7 +340,7 @@ impl PostStore {
 
                 let filtered_post_iter = light_post_iter.filter(|post| {
                     if following_users.is_empty() {
-                        return true; 
+                        return true;
                     }
                     post.in_reply_to_post_id.is_none_or(|reply_to_post_id| {
                         if let Some(replied_to_post) = self.posts.get(&reply_to_post_id) {
@@ -530,7 +532,7 @@ impl PostStore {
                             deleted_posts_to_remove.push(trimmed_post.post_id);
                             trimmed += 1;
                         } else {
-                            break; 
+                            break;
                         }
                     }
                 }
@@ -556,7 +558,7 @@ impl PostStore {
                             posts_to_remove.push(trimmed_post.post_id);
                             trimmed += 1;
                         } else {
-                            break; 
+                            break;
                         }
                     }
 
@@ -653,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_post_store_basic_operations() {
-        let store = PostStore::new(2 * 24 * 60 * 60, 0); 
+        let store = PostStore::new(2 * 24 * 60 * 60, 0);
 
         assert_eq!(store.original_posts_by_user.len(), 0);
         assert_eq!(store.posts.len(), 0);
@@ -666,7 +668,7 @@ mod tests {
                 &HashSet::new(),
                 &HashSet::new(),
                 Instant::now(),
-                1, 
+                1,
             ),
             Vec::new()
         );
@@ -679,7 +681,7 @@ mod tests {
                 &HashSet::new(),
                 &HashSet::new(),
                 Instant::now(),
-                1, 
+                1,
             ),
             Vec::new()
         );
@@ -687,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_exclude_tweet_ids_filtering() {
-        let store = PostStore::new(2 * 24 * 60 * 60, 0); 
+        let store = PostStore::new(2 * 24 * 60 * 60, 0);
 
         let current_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -720,7 +722,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             Instant::now(),
-            1, 
+            1,
         );
         assert_eq!(result.len(), 5);
         let post_ids: Vec<i64> = result.iter().map(|p| p.post_id).collect();
@@ -738,7 +740,7 @@ mod tests {
             &exclude_tweet_ids,
             &HashSet::new(),
             Instant::now(),
-            1, 
+            1,
         );
         assert_eq!(result_with_exclude.len(), 5);
         let post_ids_excluded: Vec<i64> = result_with_exclude.iter().map(|p| p.post_id).collect();
@@ -836,7 +838,7 @@ mod tests {
                 is_retweet: true,
                 is_reply: false,
                 source_post_id: Some(5000),
-                source_user_id: Some(1), 
+                source_user_id: Some(1),
                 has_video: false,
                 conversation_id: Some(1_005),
             },
@@ -865,16 +867,16 @@ mod tests {
             &HashSet::new(),
             &following_users,
             Instant::now(),
-            1, 
+            1,
         );
 
         let post_ids: HashSet<i64> = result.iter().map(|p| p.post_id).collect();
         assert_eq!(post_ids.len(), 3);
-        assert!(post_ids.contains(&1_001)); 
-        assert!(post_ids.contains(&1_002)); 
-        assert!(post_ids.contains(&1_004)); 
-        assert!(!post_ids.contains(&1_003)); 
-        assert!(!post_ids.contains(&1_005)); 
-        assert!(!post_ids.contains(&1_006)); 
+        assert!(post_ids.contains(&1_001));
+        assert!(post_ids.contains(&1_002));
+        assert!(post_ids.contains(&1_004));
+        assert!(!post_ids.contains(&1_003));
+        assert!(!post_ids.contains(&1_005));
+        assert!(!post_ids.contains(&1_006));
     }
 }

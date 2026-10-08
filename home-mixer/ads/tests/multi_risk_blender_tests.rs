@@ -1,4 +1,5 @@
 use crate::ads::multi_risk_blender::*;
+use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
 use xai_home_mixer_proto::{feed_item, BrandSafetyVerdict, FeedItem, ScoredPost};
 use xai_recsys_proto::{AdAdjacencyControl, AdIndexInfo, BrandSafetyRiskLevel};
 
@@ -212,4 +213,113 @@ fn excluded_high_does_not_burn_medium_pair() {
     let (above_200, below_200) = neighbours_by_ad[&200];
     assert_eq!(above_200, BrandSafetyVerdict::MediumRisk);
     assert_eq!(below_200, BrandSafetyVerdict::MediumRisk);
+}
+
+#[test]
+fn records_drop_reasons() {
+    let mut posts: Vec<_> = (1..=12).map(make_post).collect();
+    posts[0].tweet_text = "new tires".to_string();
+    let ad = |post_id: i64, insert_position: i32| AdIndexInfo {
+        insert_position,
+        ..make_normal_ad(post_id)
+    };
+    let mut keyword_ad = ad(100, 3);
+    keyword_ad.ad_adjacency_control.as_mut().unwrap().keywords = vec!["tires".to_string()];
+    let ads = vec![keyword_ad, ad(200, 6), ad(300, 9), ad(400, 12), ad(500, 15)];
+
+    let mut drops = Vec::new();
+    let result = blend_with_drops(posts, ads, 5, &mut drops);
+
+    assert_eq!(ad_count(&result), 3);
+    let summary: Vec<_> = drops
+        .iter()
+        .map(|d| {
+            (
+                d.tweet_id,
+                d.drop_reason(),
+                d.ad_info.as_ref().unwrap().insert_position,
+                d.blocking_tweet_id,
+                d.matched_keyword.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (100, AdDropReason::ExcludedKeyword, 3, 1, "tires"),
+            (500, AdDropReason::SpacingCap, 15, 0, ""),
+        ]
+    );
+}
+
+fn drop_summary(drops: &[DroppedAd]) -> Vec<(u64, AdDropReason, u64, u64)> {
+    drops
+        .iter()
+        .map(|d| {
+            (
+                d.tweet_id,
+                d.drop_reason(),
+                d.blocking_tweet_id,
+                d.matched_user_id,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn records_blocking_neighbours() {
+    let mut posts: Vec<_> = (1..=12).map(make_post).collect();
+    posts[0].brand_safety_verdict = BrandSafetyVerdict::LowRisk.into();
+    posts[1].author_id = 9999;
+    let mut sensitive_ad = make_normal_ad(100);
+    sensitive_ad
+        .ad_adjacency_control
+        .as_mut()
+        .unwrap()
+        .brand_safety_risk = BrandSafetyRiskLevel::BsrLow.into();
+    let mut handle_ad = make_normal_ad(200);
+    handle_ad.ad_adjacency_control.as_mut().unwrap().handles = vec![9999];
+
+    let mut drops = Vec::new();
+    let result = blend_with_drops(
+        posts,
+        vec![sensitive_ad, handle_ad, make_normal_ad(300)],
+        5,
+        &mut drops,
+    );
+
+    assert_eq!(ad_count(&result), 1);
+    assert_eq!(
+        drop_summary(&drops),
+        vec![
+            (100, AdDropReason::LowRiskNeighbour, 1, 0),
+            (200, AdDropReason::ExcludedHandle, 2, 9999),
+        ]
+    );
+}
+
+#[test]
+fn records_medium_risk_path_drops() {
+    let mut posts: Vec<_> = (1..=8).map(make_avoid_post).collect();
+    posts[0].author_id = 9999;
+
+    let mut drops = Vec::new();
+    let result = blend_with_drops(
+        posts,
+        vec![
+            make_bsr_high_ad_with_handles(100, &[9999]),
+            make_normal_ad(200),
+        ],
+        5,
+        &mut drops,
+    );
+
+    assert_eq!(ad_count(&result), 0);
+    assert_eq!(
+        drop_summary(&drops),
+        vec![
+            (100, AdDropReason::ExcludedHandle, 1, 9999),
+            (200, AdDropReason::NoEligibleNeighbours, 0, 0),
+        ]
+    );
 }

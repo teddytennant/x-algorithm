@@ -6,6 +6,9 @@ struct FlattenedBlinkScore {
   1: i64 userId
   2: string label
   3: double score
+  4: optional double scoreOutbound
+  5: optional double support
+  6: optional double supportOutbound
 }(hasPersonalData='true', persisted = 'true')
 
 struct UserPrediction {

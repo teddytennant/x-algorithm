@@ -44,8 +44,8 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cutlass_dsl import BaseDSL
-from quack import copy_utils, layout_utils
 
+from xrex.cutedsl.quack import copy_utils, layout_utils
 from xrex.cutedsl.ranker_fa4 import ampere_helpers as sm80_utils
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.block_info import BlockInfo

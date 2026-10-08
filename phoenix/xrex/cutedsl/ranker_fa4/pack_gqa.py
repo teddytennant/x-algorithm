@@ -37,9 +37,9 @@ from typing import Tuple, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
-from quack import layout_utils
 
 import xrex.cutedsl.ranker_fa4.utils as utils
+from xrex.cutedsl.quack import layout_utils
 
 
 def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):

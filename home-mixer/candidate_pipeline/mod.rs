@@ -7,6 +7,9 @@ pub mod reverse_chron_posts_pipeline;
 
 use std::sync::Arc;
 
+use crate::clients::author_brand_safety_client::{
+    AuthorBrandSafetyClient, ProdAuthorBrandSafetyClient,
+};
 use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PhoenixPredictionClient;
 use xai_candidate_pipeline::component_library::clients::phoenix_retrieval_client::PhoenixRetrievalClient;
 use xai_candidate_pipeline::component_library::clients::{
@@ -91,4 +94,21 @@ async fn build_vm_ranker_xds_client_uncached(
         }
         None => None,
     }
+}
+
+pub(crate) async fn shared_author_brand_safety_client(
+    datacenter: &str,
+) -> Arc<dyn AuthorBrandSafetyClient> {
+    static AUTHOR_BRAND_SAFETY_CLIENT: tokio::sync::OnceCell<Arc<dyn AuthorBrandSafetyClient>> =
+        tokio::sync::OnceCell::const_new();
+    AUTHOR_BRAND_SAFETY_CLIENT
+        .get_or_init(|| async {
+            Arc::new(
+                ProdAuthorBrandSafetyClient::new(datacenter)
+                    .await
+                    .expect("Failed to create AuthorBrandSafety client"),
+            ) as Arc<dyn AuthorBrandSafetyClient>
+        })
+        .await
+        .clone()
 }

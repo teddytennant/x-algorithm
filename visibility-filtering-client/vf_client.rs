@@ -1,5 +1,5 @@
 use crate::discovery::{build_vf_channel, VfChannel, VfChannelError, VfChannelParams, VfDiscovery};
-use crate::evaluated::{decode_action, EvaluationResult};
+use crate::evaluated::EvaluationResult;
 use crate::models::{Action, DropReason, FilteredReason, SafetyResult};
 use crate::tweet_safety_label::{proto_to_safety_label_map, SafetyLabelFailure};
 use anyhow::{anyhow, Result};
@@ -38,6 +38,7 @@ pub enum SafetyLevel {
     SearchTopQig = 165,
     SearchTopSafeSearchEnabled = 227,
     ExploreNsfwRecommendations = 236,
+    ImmersiveExpandedRecommendations = 247,
 }
 
 impl SafetyLevel {
@@ -53,6 +54,7 @@ impl SafetyLevel {
             165 => Some(Self::SearchTopQig),
             227 => Some(Self::SearchTopSafeSearchEnabled),
             236 => Some(Self::ExploreNsfwRecommendations),
+            247 => Some(Self::ImmersiveExpandedRecommendations),
             _ => None,
         }
     }
@@ -311,6 +313,7 @@ impl XaiVfClient {
     pub async fn evaluate_tweets(
         &self,
         mut request: vf_pb::EvaluateTweetsRequest,
+        metadata: &tonic::metadata::MetadataMap,
     ) -> Result<Vec<EvaluationResult>> {
         let tweets = std::mem::take(&mut request.tweets);
         let chunks: Vec<_> = tweets
@@ -319,12 +322,13 @@ impl XaiVfClient {
                 let request = &request;
                 async move {
                     let mut client = self.client.clone();
-                    let rpc = tonic::Request::new(vf_pb::EvaluateTweetsRequest {
+                    let mut rpc = tonic::Request::new(vf_pb::EvaluateTweetsRequest {
                         tweets: chunk.to_vec(),
                         ..request.clone()
                     });
+                    *rpc.metadata_mut() = metadata.clone();
                     let response = client.evaluate_tweets(rpc).await?.into_inner();
-                    decode_response(chunk, response)
+                    decode_response(chunk.len(), response)
                 }
             })
             .collect();
@@ -368,31 +372,17 @@ impl XaiVfClient {
 }
 
 fn decode_response(
-    requested: &[vf_pb::TweetData],
+    requested_count: usize,
     response: vf_pb::EvaluateTweetsResponse,
 ) -> Result<Vec<EvaluationResult>> {
-    use vf_pb::tweet_evaluation::Outcome;
     anyhow::ensure!(
-        response.results.len() == requested.len(),
+        response.results.len() == requested_count,
         "VF tweet count mismatch"
     );
-    requested
-        .iter()
-        .zip(response.results)
-        .map(|(expected, result)| {
-            anyhow::ensure!(
-                result.tweet.as_ref() == Some(expected),
-                "VF tweet order mismatch"
-            );
-            Ok(match result.outcome {
-                Some(Outcome::ActionThriftCompact(bytes)) => {
-                    EvaluationResult::Evaluated(Box::new(decode_action(&bytes)?))
-                }
-                Some(Outcome::NotEvaluated(_)) => EvaluationResult::NotEvaluated,
-                Some(Outcome::Failed(_)) => EvaluationResult::Failed,
-                None => anyhow::bail!("missing VF outcome"),
-            })
-        })
+    response
+        .results
+        .into_iter()
+        .map(|result| EvaluationResult::decode(result.outcome))
         .collect()
 }
 
@@ -400,14 +390,16 @@ fn to_proto_safety_level(level: SafetyLevel) -> vf_pb::SafetyLevel {
     match level {
         SafetyLevel::TimelineHome => vf_pb::SafetyLevel::TimelineHome,
         SafetyLevel::TimelineHomeRecommendations => vf_pb::SafetyLevel::TimelineHomeRecommendations,
+        SafetyLevel::ExploreNsfwRecommendations | SafetyLevel::ImmersiveExpandedRecommendations => {
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
+        }
         SafetyLevel::FilterNone
         | SafetyLevel::SearchTop
         | SafetyLevel::SearchLatest
         | SafetyLevel::SearchPhoto
         | SafetyLevel::SearchVideo
         | SafetyLevel::SearchTopQig
-        | SafetyLevel::SearchTopSafeSearchEnabled
-        | SafetyLevel::ExploreNsfwRecommendations => vf_pb::SafetyLevel::FilterAll,
+        | SafetyLevel::SearchTopSafeSearchEnabled => vf_pb::SafetyLevel::FilterAll,
     }
 }
 
@@ -676,6 +668,7 @@ mod tests {
 mod rust_vf_tests {
     use super::*;
     use crate::models::Action;
+    use crate::test_support::RecordingReceiver;
     use std::net::SocketAddr;
     use tokio::sync::Mutex;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -686,58 +679,45 @@ mod rust_vf_tests {
     };
 
     #[test]
-    fn decode_response_requires_complete_ordered_tweets_and_outcomes() {
+    fn decode_response_requires_one_decodable_outcome_per_requested_tweet() {
         use vf_pb::tweet_evaluation::Outcome;
-        let tweets = [
-            vf_pb::TweetData {
-                tweet_id: 1,
-                quote_context: None,
-            },
-            vf_pb::TweetData {
-                tweet_id: 1,
-                quote_context: Some(vf_pb::QuoteContext {
-                    outer_tweet_id: 2,
-                    outer_author_id: Some(3),
-                }),
-            },
-        ];
+        use xai_x_thrift::safety_result::FilteredReason;
+        use xai_x_thrift::tweet_service::{TweetFieldsResultFiltered, TweetFieldsResultState};
+        let bounced = TweetFieldsResultState::Filtered(TweetFieldsResultFiltered::new(
+            FilteredReason::TweetIsBounced(true),
+        ));
+        let evaluation = |outcome| vf_pb::TweetEvaluation {
+            outcome: Some(outcome),
+        };
         let results = vec![
-            vf_pb::TweetEvaluation {
-                tweet: Some(tweets[0]),
-                outcome: Some(Outcome::ActionThriftCompact(vec![0x2c, 0, 0].into())),
-            },
-            vf_pb::TweetEvaluation {
-                tweet: Some(tweets[1]),
-                outcome: Some(Outcome::Failed(vf_pb::Failed {})),
-            },
+            evaluation(Outcome::ResultStateThriftCompact(
+                xai_x_thrift::serialize_compact(&bounced).unwrap().into(),
+            )),
+            evaluation(Outcome::NotEvaluated(vf_pb::NotEvaluated {})),
+            evaluation(Outcome::Failed(vf_pb::Failed {})),
         ];
-        let decode = |results| decode_response(&tweets, vf_pb::EvaluateTweetsResponse { results });
+        let decode = |results| decode_response(3, vf_pb::EvaluateTweetsResponse { results });
         assert_eq!(
             decode(results.clone()).unwrap(),
             vec![
-                EvaluationResult::Evaluated(Box::new(xai_x_thrift::action::Action::Allow(
-                    xai_x_thrift::action::Allow::new()
-                ))),
-                EvaluationResult::Failed
+                EvaluationResult::Evaluated(Box::new(bounced)),
+                EvaluationResult::NotEvaluated,
+                EvaluationResult::Failed,
             ]
         );
-        let mut reversed = results.clone();
-        reversed.reverse();
         let mut missing = results.clone();
         missing.pop();
-        let mut wrong_quote = results.clone();
-        wrong_quote[1].tweet.as_mut().unwrap().quote_context = None;
         let mut absent = results.clone();
         absent[0].outcome = None;
         let mut corrupt = results;
-        corrupt[0].outcome = Some(Outcome::ActionThriftCompact(vec![0x2c].into()));
-        for results in [reversed, missing, wrong_quote, absent, corrupt] {
+        corrupt[0].outcome = Some(Outcome::ResultStateThriftCompact(vec![0x4c].into()));
+        for results in [missing, absent, corrupt] {
             assert!(decode(results).is_err());
         }
     }
 
     struct EvaluateStub {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
+        twitter_contexts: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         fail_chunks_smaller_than: usize,
         hang: bool,
     }
@@ -748,7 +728,12 @@ mod rust_vf_tests {
             &self,
             request: Request<vf_pb::EvaluateTweetsRequest>,
         ) -> Result<Response<vf_pb::EvaluateTweetsResponse>, Status> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.twitter_contexts.lock().unwrap().push(
+                request
+                    .metadata()
+                    .get("twittercontext")
+                    .map(|v| v.to_str().unwrap().to_string()),
+            );
             if self.hang {
                 std::future::pending::<()>().await;
             }
@@ -760,7 +745,6 @@ mod rust_vf_tests {
                 results: tweets
                     .into_iter()
                     .map(|tweet| vf_pb::TweetEvaluation {
-                        tweet: Some(tweet),
                         outcome: Some(if tweet.tweet_id % 100 < 50 {
                             vf_pb::tweet_evaluation::Outcome::NotEvaluated(vf_pb::NotEvaluated {})
                         } else {
@@ -807,18 +791,23 @@ mod rust_vf_tests {
             .await
             .unwrap();
         let client = XaiVfClient::from_channel(channel).with_timeout_ms(client_timeout_ms);
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert("twittercontext", "ctx".parse().unwrap());
         let result = tokio::spawn(async move {
             client
-                .evaluate_tweets(vf_pb::EvaluateTweetsRequest {
-                    safety_level: 8,
-                    tweets: (0..tweet_count)
-                        .map(|id| vf_pb::TweetData {
-                            tweet_id: id as u64,
-                            quote_context: None,
-                        })
-                        .collect(),
-                    ..Default::default()
-                })
+                .evaluate_tweets(
+                    vf_pb::EvaluateTweetsRequest {
+                        safety_level: 8,
+                        tweets: (0..tweet_count)
+                            .map(|id| vf_pb::TweetData {
+                                tweet_id: id as u64,
+                                quote_context: None,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    },
+                    &metadata,
+                )
                 .await
         })
         .await
@@ -830,10 +819,10 @@ mod rust_vf_tests {
 
     #[tokio::test]
     async fn evaluate_tweets_chunks_and_fails_whole_call_on_any_chunk_error_or_deadline() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let twitter_contexts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let results = evaluate_against(
             EvaluateStub {
-                calls: calls.clone(),
+                twitter_contexts: twitter_contexts.clone(),
                 fail_chunks_smaller_than: 0,
                 hang: false,
             },
@@ -843,11 +832,14 @@ mod rust_vf_tests {
         .await
         .unwrap();
         assert_eq!(results.len(), XAI_VF_MAX_BATCH_SIZE + 1);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            *twitter_contexts.lock().unwrap(),
+            vec![Some("ctx".to_string()); 2]
+        );
 
         assert!(evaluate_against(
             EvaluateStub {
-                calls: calls.clone(),
+                twitter_contexts: twitter_contexts.clone(),
                 fail_chunks_smaller_than: 2,
                 hang: false,
             },
@@ -858,7 +850,7 @@ mod rust_vf_tests {
         .is_err());
         assert!(evaluate_against(
             EvaluateStub {
-                calls,
+                twitter_contexts,
                 fail_chunks_smaller_than: 0,
                 hang: true,
             },
@@ -917,41 +909,6 @@ mod rust_vf_tests {
         assert_eq!(metrics.failed_ids, 0);
     }
 
-    #[derive(Default)]
-    struct RecordingReceiver {
-        counters: std::sync::Mutex<HashMap<String, u64>>,
-    }
-
-    impl RecordingReceiver {
-        fn counter(&self, key: &str) -> u64 {
-            *self.counters.lock().unwrap().get(key).unwrap_or(&0)
-        }
-    }
-
-    impl xai_stats_receiver::StatsReceiverExt for RecordingReceiver {
-        fn incr(&self, name: &str, scopes: &[(&str, &str)], value: u64) {
-            let mut key = name.to_string();
-            for (k, v) in scopes {
-                key.push('|');
-                key.push_str(k);
-                key.push('=');
-                key.push_str(v);
-            }
-            *self.counters.lock().unwrap().entry(key).or_default() += value;
-        }
-        fn observe(
-            &self,
-            _: &str,
-            _: &[(&str, &str)],
-            _: f64,
-            _: xai_stats_receiver::HistogramBuckets,
-        ) {
-        }
-        fn observe_expo(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn observe_vm(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-        fn gauge(&self, _: &str, _: &[(&str, &str)], _: f64) {}
-    }
-
     fn request_guard_with(receiver: Arc<RecordingReceiver>) -> FilterTweetsRequestMetricsGuard {
         FilterTweetsRequestMetricsGuard {
             receiver: Some(receiver),
@@ -1001,6 +958,14 @@ mod rust_vf_tests {
         assert_eq!(
             to_proto_safety_level(SafetyLevel::TimelineHomeRecommendations),
             vf_pb::SafetyLevel::TimelineHomeRecommendations
+        );
+        assert_eq!(
+            to_proto_safety_level(SafetyLevel::ExploreNsfwRecommendations),
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
+        );
+        assert_eq!(
+            to_proto_safety_level(SafetyLevel::ImmersiveExpandedRecommendations),
+            vf_pb::SafetyLevel::ImmersiveExpandedRecommendations
         );
         assert_eq!(
             to_proto_safety_level(SafetyLevel::FilterNone),

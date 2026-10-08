@@ -1,7 +1,7 @@
 load_generator: "com.twitter.media_understanding.media_model_proxy.loadtest.MediaModelProxyLoadTestConfig"
 rps: 100
 duration:
-  time: 10 
+  time: 10
 feeder:
   feed_source:
     log:
@@ -11,4 +11,4 @@ transport:
     - victim: "/cluster/smf1/media-model-proxy/staging/media-model-proxy"
   scheme:
     thrift:
-      num_clients: 1 
+      num_clients: 1

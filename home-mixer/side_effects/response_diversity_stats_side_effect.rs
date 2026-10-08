@@ -1,11 +1,11 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableResponseDiversityStatsExperimentBucket;
-use crate::util::composition::Composition;
 use rand::random;
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tonic::async_trait;
+use xai_candidate_pipeline::component_library::utils::Composition;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_feature_switches::ExperimentBucket;
 use xai_stats_receiver::{global_stats_receiver, HistogramBuckets, StatsReceiverExt};

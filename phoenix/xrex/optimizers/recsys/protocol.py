@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import jax
 
 from xrex.models.model_utils import Parameter
+
+if TYPE_CHECKING:
+    from xrex.cuda.async_emb import (
+        async_emb,
+    )
 
 
 def _lookup(embedding_table_param: Parameter, token_ids: jax.Array) -> Parameter:
@@ -36,3 +41,18 @@ class RecsysEmbeddingOptimizer(Protocol):
         valid_step: jax.Array,
         carry: Any = None,
     ) -> tuple[Parameter, Any, dict[str, jax.Array]]: ...
+
+
+@runtime_checkable
+class AsyncEmbOptimizer(Protocol):
+    def gradient_update_start(
+        self,
+        context: async_emb.AsyncEmbContextHandle,
+        table: jax.Array,
+        state: Any,
+        gate: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, Any, dict[str, jax.Array]]: ...
+
+    def gradient_update_done(
+        self, context: async_emb.AsyncEmbContextHandle, state: Any, gate: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, Any, jax.Array]: ...

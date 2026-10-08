@@ -10,7 +10,7 @@ use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_home_mixer_proto::feed_item::Item as FeedItemKind;
 use xai_home_mixer_proto::{
-    FeedItem, Frame, PushToHomePost, ScoredPost, ServedType, WhoToFollowModule,
+    FeedItem, Frame, PushToHomePost, ScoredPost, ServedType, VideoCarouselModule, WhoToFollowModule,
 };
 use xai_recsys_proto::AdIndexInfo;
 use xai_urt_thrift::operation::CursorType;
@@ -105,6 +105,11 @@ fn build_entries(feed_item: &FeedItem, position: i64) -> Vec<EntryWithItemIds> {
             build_frame_entry(frame, position).into_iter().collect()
         }
         Some(FeedItemKind::FeedSurvey(_)) => vec![build_feed_survey_entry(position)],
+        Some(FeedItemKind::VideoCarousel(carousel)) => {
+            build_video_carousel_entry(carousel, position)
+                .into_iter()
+                .collect()
+        }
         None => vec![],
     }
 }
@@ -308,6 +313,27 @@ fn build_wtf_entry(wtf: &WhoToFollowModule, position: i64) -> Option<EntryWithIt
         entity_type: EntityIdType::WHO_TO_FOLLOW,
         sort_index: Some(position),
         size: Some(size),
+        item_ids: Some(item_ids),
+    })
+}
+
+fn build_video_carousel_entry(
+    carousel: &VideoCarouselModule,
+    position: i64,
+) -> Option<EntryWithItemIds> {
+    if carousel.videos.is_empty() {
+        return None;
+    }
+    let item_ids: Vec<ItemIds> = carousel
+        .videos
+        .iter()
+        .filter_map(|video| build_tweet_entry(video, video.tweet_id, position).item_ids)
+        .flatten()
+        .collect();
+    Some(EntryWithItemIds {
+        entity_type: EntityIdType::VIDEO_CAROUSEL_MODULE,
+        sort_index: Some(position),
+        size: Some(carousel.videos.len() as i16),
         item_ids: Some(item_ids),
     })
 }

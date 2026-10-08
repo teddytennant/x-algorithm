@@ -79,10 +79,8 @@ def clear_xla_dump_flags(compile_options: xc.CompileOptions | None) -> xc.Compil
     debug_opts = ebo.debug_options
 
     debug_opts.xla_dump_to = ""
-
     debug_opts.xla_dump_hlo_module_re = ""
     debug_opts.xla_dump_hlo_pass_re = ""
-
     debug_opts.xla_dump_hlo_as_text = False
     debug_opts.xla_dump_hlo_as_proto = False
 

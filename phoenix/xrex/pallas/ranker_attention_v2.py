@@ -130,7 +130,6 @@ def mha_forward_kernel(
 
         mask = jnp.logical_or(seg_k == HISTORY_SEGMENT_ID, span_q[:, None] == span_k[None, :])
         mask = jnp.logical_and(seq_q_is_not_padding, mask)
-
         if causal:
             causal_mask = span_q[:, None] >= span_k[None, :]
             mask = jnp.logical_and(mask, causal_mask)

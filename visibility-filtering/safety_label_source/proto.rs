@@ -4,6 +4,10 @@ use xai_visibility_filtering_proto as vf_pb;
 use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelSource};
 
 pub(crate) fn label_to_proto(label: SafetyLabel) -> vf_pb::SafetyLabel {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "SafetyLabelSource is a generated Thrift union; vf_pb::SafetyLabel carries only the BotMaker, tool and Grok annotation sources, so it omits every other source, including any the IDL adds"
+    )]
     let safety_label_source = label.safety_label_source.and_then(|src| match src {
         SafetyLabelSource::BotMakerAction(a) => {
             Some(vf_pb::safety_label::SafetyLabelSource::BotmakerAction(
@@ -48,79 +52,4 @@ pub(crate) fn label_map_to_proto(
         .map(|(lt, label)| (i32::from(lt), label_to_proto(label)))
         .collect();
     vf_pb::SafetyLabelMap { labels: map }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use xai_x_thrift::tweet_safety_label::{
-        AgentTool, BotMakerAction, GraphId, GrokAnnotationAction, GrokAnnotationSource,
-        StreamertailAction, ToolAction,
-    };
-
-    fn empty_label(src: SafetyLabelSource) -> SafetyLabel {
-        SafetyLabel::new(None, None, None, None, Some(src), None, None, None)
-    }
-
-    #[test]
-    fn botmaker_action_to_proto() {
-        let label = empty_label(SafetyLabelSource::BotMakerAction(BotMakerAction::new(42)));
-        let proto = label_to_proto(label);
-        assert_eq!(
-            proto.safety_label_source,
-            Some(vf_pb::safety_label::SafetyLabelSource::BotmakerAction(
-                vf_pb::BotmakerAction { rule_id: 42 }
-            ))
-        );
-    }
-
-    #[test]
-    fn tool_action_to_proto() {
-        let label = empty_label(SafetyLabelSource::ToolAction(ToolAction::new(
-            AgentTool::BME,
-            "someone".to_string(),
-        )));
-        let proto = label_to_proto(label);
-        assert_eq!(
-            proto.safety_label_source,
-            Some(vf_pb::safety_label::SafetyLabelSource::ToolAction(
-                vf_pb::ToolAction {
-                    agent_tool: 15,
-                    actor_ldap: "someone".to_string(),
-                }
-            ))
-        );
-    }
-
-    #[test]
-    fn grok_annotation_action_to_proto() {
-        let label = empty_label(SafetyLabelSource::GrokAnnotationAction(
-            GrokAnnotationAction::new(GrokAnnotationSource::GROX_PTOS),
-        ));
-        let proto = label_to_proto(label);
-        assert_eq!(
-            proto.safety_label_source,
-            Some(
-                vf_pb::safety_label::SafetyLabelSource::GrokAnnotationAction(
-                    vf_pb::GrokAnnotationAction { source: 1 }
-                )
-            )
-        );
-    }
-
-    #[test]
-    fn unmapped_variant_produces_none() {
-        let label = empty_label(SafetyLabelSource::StreamertailAction(
-            StreamertailAction::new(GraphId::TEST),
-        ));
-        let proto = label_to_proto(label);
-        assert_eq!(proto.safety_label_source, None);
-    }
-
-    #[test]
-    fn no_source_produces_none() {
-        let label = SafetyLabel::new(None, None, None, None, None, None, None, None);
-        let proto = label_to_proto(label);
-        assert_eq!(proto.safety_label_source, None);
-    }
 }

@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn topic_router_explicit_mapping() {
-        let windows = vec![]; 
+        let windows = vec![];
         let router = topic_window_router();
 
         let r1 = make_core_record(1, 1, "1fav");
@@ -1359,7 +1359,7 @@ mod tests {
         let config = StoreConfig {
             output_dir: dir.path().to_path_buf(),
             windows: vec![WindowConfig::new("1fav", 24)],
-            compaction_interval_secs: 999, 
+            compaction_interval_secs: 999,
             versions_to_keep: 3,
             pipeline: "main".to_string(),
             sid_num_levels: 6,
@@ -1497,7 +1497,7 @@ mod tests {
         let metrics = make_metrics();
         let config = StoreConfig {
             output_dir: dir.path().to_path_buf(),
-            windows: vec![WindowConfig::new("test", 24)], 
+            windows: vec![WindowConfig::new("test", 24)],
             compaction_interval_secs: 999,
             versions_to_keep: 3,
             pipeline: "main".to_string(),
@@ -1508,7 +1508,7 @@ mod tests {
 
         let now_secs = chrono::Utc::now().timestamp() as f64;
         let recent_id = timestamp_secs_to_snowflake(now_secs - 100.0);
-        let old_id = timestamp_secs_to_snowflake(now_secs - 2.0 * 86400.0); 
+        let old_id = timestamp_secs_to_snowflake(now_secs - 2.0 * 86400.0);
 
         let records = vec![
             make_core_record(recent_id, 10, "test"),
@@ -1727,9 +1727,9 @@ mod tests {
         let store = make_sid_store(&dir);
         store
             .add_batch(vec![
-                make_sid_record(100, 10, vec![]),        
-                make_sid_record(200, 20, vec![1, 2, 3]), 
-                make_sid_record(300, 30, vec![]),        
+                make_sid_record(100, 10, vec![]),
+                make_sid_record(200, 20, vec![1, 2, 3]),
+                make_sid_record(300, 30, vec![]),
             ])
             .await
             .unwrap();
@@ -1743,8 +1743,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = make_sid_store(&dir);
         let now_secs = chrono::Utc::now().timestamp() as f64;
-        let young_pid = timestamp_secs_to_snowflake(now_secs - 60.0); 
-        let old_pid = timestamp_secs_to_snowflake(now_secs - 3600.0 * 5.0); 
+        let young_pid = timestamp_secs_to_snowflake(now_secs - 60.0);
+        let old_pid = timestamp_secs_to_snowflake(now_secs - 3600.0 * 5.0);
         store
             .add_batch(vec![
                 make_sid_record(young_pid, 1, vec![]),
@@ -1786,7 +1786,7 @@ mod tests {
             .await
             .unwrap();
         let mut patch = HashMap::new();
-        patch.insert(999_i64, vec![1, 2, 3]); 
+        patch.insert(999_i64, vec![1, 2, 3]);
         let updated = store.update_sids(patch).await.unwrap();
         assert_eq!(updated, 0, "unknown post_id silently skipped");
     }
@@ -1879,8 +1879,8 @@ mod tests {
         let pid_b = timestamp_secs_to_snowflake(now_secs - 50.0);
         store
             .add_batch(vec![
-                make_sid_record(pid_a, 10, vec![]),                 
-                make_sid_record(pid_b, 20, vec![1, 2, 3, 4, 5, 6]), 
+                make_sid_record(pid_a, 10, vec![]),
+                make_sid_record(pid_b, 20, vec![1, 2, 3, 4, 5, 6]),
             ])
             .await
             .unwrap();

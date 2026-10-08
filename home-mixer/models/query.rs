@@ -1,3 +1,4 @@
+use crate::ads::drops::AdDrops;
 use crate::models::candidate::PostCandidate;
 use crate::models::engagement_signals::EngagementSignalsByType;
 use crate::models::fs_recipient::FsRecipientInputs;
@@ -108,6 +109,7 @@ pub struct ScoredPostsQuery {
     pub user_installed_apps: Option<Vec<bool>>,
     pub subscription_level: Option<SubscriptionLevel>,
     pub is_shadow_traffic: bool,
+    pub is_under_the_hood_request: bool,
     pub is_preview: bool,
     pub is_polling: bool,
     #[serde(serialize_with = "serialize_debug")]
@@ -117,6 +119,7 @@ pub struct ScoredPostsQuery {
     pub served_history: Vec<ServedHistory>,
     pub who_to_follow_eligible: bool,
     pub feed_survey_eligible: bool,
+    pub video_carousel_eligible: bool,
     #[serde(serialize_with = "serialize_debug")]
     pub non_polling_timestamps: Option<NonPollingTimestamps>,
     pub impressed_post_ids: Vec<u64>,
@@ -124,6 +127,10 @@ pub struct ScoredPostsQuery {
     pub seed_candidate_post_ids: Vec<u64>,
     #[serde(serialize_with = "serialize_debug")]
     pub following_pagination_meta: Arc<OnceLock<FollowingPaginationMeta>>,
+    #[serde(skip)]
+    pub ad_drops: Arc<AdDrops>,
+    #[serde(serialize_with = "serialize_debug")]
+    pub video_carousel: Arc<OnceLock<Vec<PostCandidate>>>,
 }
 
 pub use xai_candidate_pipeline::component_library::clients::strato_client::UserDemographics;
@@ -220,6 +227,7 @@ impl ScoredPostsQuery {
             user_installed_apps: None,
             subscription_level,
             is_shadow_traffic,
+            is_under_the_hood_request: false,
             is_preview,
             is_polling: false,
             cursor: None,
@@ -227,11 +235,14 @@ impl ScoredPostsQuery {
             served_history: vec![],
             who_to_follow_eligible: false,
             feed_survey_eligible: false,
+            video_carousel_eligible: false,
             non_polling_timestamps: None,
             impressed_post_ids: Vec::new(),
             push_to_home_post_id,
             seed_candidate_post_ids: Vec::new(),
             following_pagination_meta: Arc::new(OnceLock::new()),
+            ad_drops: Arc::default(),
+            video_carousel: Arc::new(OnceLock::new()),
         }
     }
 

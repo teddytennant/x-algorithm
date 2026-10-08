@@ -6,7 +6,6 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
-
 _FA4_KERNEL_CACHE = {}
 
 
@@ -108,6 +107,8 @@ def ranker_attention_fa4(
     block_sparse_layout,
     valid_block_upper=None,
     valid_block_lower=None,
+    cap=-1.0,
+    cap_method="soft_sign",
 ):
     import cuda.bindings.driver as cuda_driver
     import cutlass
@@ -117,8 +118,16 @@ def ranker_attention_fa4(
     from xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors
     from xrex.cutedsl.ranker_fa4.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
     from xrex.cutedsl.ranker_fa4.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+    from xrex.cutedsl.ranker_fa4.utils import create_cap_scoremods
 
     arch = cutedsl_arch()
+    score_mod, score_mod_bwd = create_cap_scoremods(cap, cap_method)
+    cap_key = (float(cap), cap_method) if score_mod is not None else None
+    if score_mod is not None and arch == 80:
+        raise NotImplementedError(
+            "cutedsl ranker attention: attn_logit_cap > 0 needs score_mod, which the SM80 "
+            "kernels reject together with block sparsity; use qk_norm (cap <= 0) on A100"
+        )
     batch_size, seq_len, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[2]
     qhead_per_kvhead = num_q_heads // num_kv_heads
@@ -167,6 +176,7 @@ def ranker_attention_fa4(
         int(fwd_bs[1].shape[-1]),
         int(bwd_bs[1].shape[-1]),
         use_pack_gqa,
+        cap_key,
     )
 
     if cache_key not in _FA4_KERNEL_CACHE:
@@ -207,6 +217,7 @@ def ranker_attention_fa4(
                 intra_wg_overlap=True,
                 mma_pv_is_rs=True,
                 mask_mod=None,
+                score_mod=score_mod,
             )
         else:
             from xrex.cutedsl.ranker_fa4.flash_fwd_sm100 import FlashAttentionForwardSm100
@@ -220,6 +231,7 @@ def ranker_attention_fa4(
                 pack_gqa=use_pack_gqa,
                 is_persistent=True,
                 mask_mod=None,
+                score_mod=score_mod,
                 q_stage=1,
             )
 
@@ -361,6 +373,8 @@ def ranker_attention_fa4(
                 AtomLayoutMdQ=1,
                 num_threads=384,
                 mask_mod=None,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
                 subtile_factor=m_block // bwd_tile_m,
             )
             post_threads = 256
@@ -376,6 +390,8 @@ def ranker_attention_fa4(
                 is_causal=False,
                 is_local=False,
                 mask_mod=None,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
             )
             post_threads = 128
             post_dq_atom_layout = 1

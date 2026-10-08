@@ -83,3 +83,15 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Copyright 2023 The jax_triton Authors. Licensed under the Apache License,
 Version 2.0; see https://www.apache.org/licenses/LICENSE-2.0.
+
+## QuACK (Apache-2.0)
+
+The files under `xrex/cutedsl/quack/` are the torch-free subset of the
+quack-kernels project that `xrex/cutedsl/ranker_fa4/` uses, modified by
+X.AI Corp.:
+
+    https://github.com/Dao-AILab/quack
+
+Copyright (c) 2025-2026, the QuACK authors (per-file holders are retained in
+each file's header). Licensed under the Apache License, Version 2.0; see
+`xrex/cutedsl/quack/LICENSE` and https://www.apache.org/licenses/LICENSE-2.0.

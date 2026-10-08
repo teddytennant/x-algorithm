@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import concurrent.futures
 import dataclasses
 import json
 import logging
 import os
 import pathlib
 import threading
+import time
 
 import jax
 import orbax.checkpoint as ocp
@@ -22,6 +24,10 @@ from xai_checkpointing import save as checkpointing_save
 from xai_checkpointing.encrypted_kvstore import at_dir, encrypted_kvstore, use_encrypted_kvstore
 
 rank_logger = logging.getLogger("rank")
+
+_ENVELOPE_MAGIC = b"XAIENC01"
+_SPECIAL_CASE_NAMES = ("_DEK", "_DEK.claim")
+_SWEEP_THREADS = 64
 
 
 def encrypt_write(base, directory, name: str, data: bytes) -> None:
@@ -95,14 +101,21 @@ class EncryptedPyTreeCheckpointHandler(BasePyTreeCheckpointHandler):
 
     def finalize(self, directory):
         path = pathlib.Path(str(directory))
+        start = time.monotonic()
         checkpointing_save.finalize_ts(
             path,
             world_size=jax.process_count(),
             ts_context=checkpointing_save._get_ts_context(),
             encrypted_base=self._base_for(directory),
         )
+        grafted = time.monotonic()
         assert_all_enveloped(path)
-        rank_logger.info("Encrypted orbax finalize done (graft + sweep) at %s", path)
+        rank_logger.info(
+            "Encrypted orbax finalize done at %s (graft %.1fs, sweep %.1fs)",
+            path,
+            grafted - start,
+            time.monotonic() - grafted,
+        )
 
 
 class EncryptedCheckpointMetadataStore:
@@ -329,20 +342,38 @@ def get_encrypted_checkpointer(
     return _ENCRYPTED_CHECKPOINTER
 
 
+def _raise(error: OSError) -> None:
+    raise error
+
+
+def _files_under(directory: str) -> list[str]:
+    return [
+        os.path.join(root, name)
+        for root, _, names in os.walk(directory, onerror=_raise)
+        for name in names
+    ]
+
+
+def _is_enveloped(file: str) -> bool:
+    with open(file, "rb") as fh:
+        return fh.read(8) == _ENVELOPE_MAGIC
+
+
 def assert_all_enveloped(path: pathlib.Path) -> None:
     if not (path / "_DEK").is_file():
         raise RuntimeError(f"encrypted save left no master _DEK at {path}; not committing")
-    offenders = []
-    for f in sorted(path.rglob("*")):
-        if not f.is_file() or f.name in ("_DEK", "_DEK.claim"):
-            continue
-        with f.open("rb") as fh:
-            if fh.read(8) != b"XAIENC01":
-                offenders.append(f)
+    with os.scandir(path) as scan:
+        top_level = list(scan)
+    files = [entry.path for entry in top_level if not entry.is_dir()]
+    subdirs = [entry.path for entry in top_level if entry.is_dir() and not entry.is_symlink()]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_SWEEP_THREADS) as pool:
+        for nested in pool.map(_files_under, subdirs):
+            files.extend(nested)
+        files = [file for file in files if os.path.basename(file) not in _SPECIAL_CASE_NAMES]
+        enveloped = list(pool.map(_is_enveloped, files))
+    offenders = sorted(file for file, ok in zip(files, enveloped, strict=True) if not ok)
     if offenders:
-        raise RuntimeError(
-            f"encrypted save left plaintext at rest; not committing: {list(map(str, offenders))}"
-        )
+        raise RuntimeError(f"encrypted save left plaintext at rest; not committing: {offenders}")
 
 
 def extend_base(path: str, kms_client, encryption_chunk_size: int) -> dict:

@@ -61,9 +61,9 @@ public class Type {
   public static final Type DOUBLE;
   public static final Type BOOLEAN;
   public static final Type STRING;
-  public static final Type BINARY; 
+  public static final Type BINARY;
   public static final Type UNIT;
-  public static final Type SYMBOL; 
+  public static final Type SYMBOL;
 
   static {
 

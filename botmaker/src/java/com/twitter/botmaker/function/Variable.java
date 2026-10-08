@@ -26,7 +26,7 @@ public class Variable extends ASTNode<Runtime> {
   }
 
   public final String getVariableText() {
-    return getExprText(); 
+    return getExprText();
   }
 
   @Override

@@ -14,6 +14,7 @@ pub mod retrieval_candidates_kafka_side_effect;
 pub mod scored_stats_side_effect;
 pub mod served_ad_history_cache_side_effect;
 pub mod served_candidates_kafka_side_effect;
+pub mod served_event_kafka_side_effect;
 pub mod truncate_served_history_side_effect;
 pub mod update_past_request_timestamps_side_effect;
 pub mod update_served_history_side_effect;

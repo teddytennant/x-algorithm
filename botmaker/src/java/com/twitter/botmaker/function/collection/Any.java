@@ -41,7 +41,7 @@ public final class Any {
                                   Optional<ASTNode> batchSizeNodeOpt) throws SemanticCheckFailure {
 
     ASTNode batchSizeNode = batchSizeNodeOpt.isPresent() ? batchSizeNodeOpt.get()
-        : Constant.of("20", 20L); 
+        : Constant.of("20", 20L);
 
     return new ASTNode<Runtime>(
         exprText, ImmutableList.of(conditionNode, collectionNode, batchSizeNode)) {
@@ -164,7 +164,7 @@ public final class Any {
       if (nextVals.contains(Boolean.TRUE)) {
         return FUTURE_TRUE;
       }
-      if (remainingElements == elementsThisRound) { 
+      if (remainingElements == elementsThisRound) {
         return FUTURE_FALSE;
       }
       return evaluate(context, varName, originatingCollection,

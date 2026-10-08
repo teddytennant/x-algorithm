@@ -1,8 +1,9 @@
+use super::drops::{adjacency_drop, dropped_ad, truncate_recording_drops};
 use super::util::*;
 use super::AdsBlender;
 use crate::params::RESULT_SIZE;
+use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
 use xai_home_mixer_proto::{feed_item, FeedItem, ScoredPost};
-use xai_post_text::TokenSequence;
 use xai_recsys_proto::AdIndexInfo;
 use xai_stats_receiver::global_stats_receiver;
 
@@ -16,12 +17,30 @@ impl AdsBlender for MultiRiskAdsBlender {
     fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
         blend_impl(scored_posts, ads, MIN_POSTS_FOR_ADS)
     }
+
+    fn blend_inner_with_drops(
+        &self,
+        scored_posts: Vec<ScoredPost>,
+        ads: Vec<AdIndexInfo>,
+        drops: &mut Vec<DroppedAd>,
+    ) -> Vec<FeedItem> {
+        blend_with_drops(scored_posts, ads, MIN_POSTS_FOR_ADS, drops)
+    }
 }
 
 pub(crate) fn blend_impl(
     scored_posts: Vec<ScoredPost>,
     ads: Vec<AdIndexInfo>,
     min_posts: usize,
+) -> Vec<FeedItem> {
+    blend_with_drops(scored_posts, ads, min_posts, &mut Vec::new())
+}
+
+pub(crate) fn blend_with_drops(
+    scored_posts: Vec<ScoredPost>,
+    ads: Vec<AdIndexInfo>,
+    min_posts: usize,
+    drops: &mut Vec<DroppedAd>,
 ) -> Vec<FeedItem> {
     let n = scored_posts.len();
 
@@ -31,6 +50,10 @@ pub(crate) fn blend_impl(
         } else {
             "too_few_posts"
         });
+        drops.extend(
+            ads.iter()
+                .map(|ad| dropped_ad(ad, AdDropReason::TooFewPosts)),
+        );
         return posts_to_feed_items(scored_posts);
     }
 
@@ -53,6 +76,12 @@ pub(crate) fn blend_impl(
 
     let any_bsr_high = ads.iter().any(is_bsr_high_ad);
     if safe_budget == 0 && !(any_bsr_high && max_medium_slots > 0 && spacing_cap > 0) {
+        let reason = if spacing_cap == 0 {
+            AdDropReason::SpacingCap
+        } else {
+            AdDropReason::NoEligibleNeighbours
+        };
+        drops.extend(ads.iter().map(|ad| dropped_ad(ad, reason)));
         return posts_to_feed_items(scored_posts);
     }
 
@@ -80,14 +109,11 @@ pub(crate) fn blend_impl(
     let mut medium_opts: Vec<Option<ScoredPost>> = medium.into_iter().map(Some).collect();
     let mut triples: Vec<(AdIndexInfo, ScoredPost, ScoredPost)> = Vec::new();
 
-    let mut slot_tokens: Option<[Option<TokenSequence>; 2]> = None;
-    let mut medium_slot_tokens: Option<[Option<TokenSequence>; 2]> = None;
+    let mut slot_tokens: SlotTokens = None;
+    let mut medium_slot_tokens: SlotTokens = None;
 
-    let mut bsr_drop: u64 = 0;
     let mut bsr_ok: u64 = 0;
-    let mut handle_drop: u64 = 0;
-    let mut keyword_drop: u64 = 0;
-
+    let mut rejections = SlotRejections::default();
     let mut slot_rejections = SlotRejections::default();
 
     let mut safe_group_idx = 0;
@@ -95,61 +121,55 @@ pub(crate) fn blend_impl(
 
     for ad in ads {
         if triples.len() >= spacing_cap {
-            break;
+            drops.push(dropped_ad(&ad, AdDropReason::SpacingCap));
+            continue;
         }
 
         if is_bsr_high_ad(&ad) && medium_pair_idx < max_medium_slots {
             let start = medium_pair_idx * 2;
             let above_ref = medium_opts[start].as_ref();
             let below_ref = medium_opts[start + 1].as_ref();
-            if should_drop_handle(&ad, above_ref, below_ref) {
-                if safe_group_idx >= safe_budget || group_size == 0 {
-                    handle_drop += 1;
-                    slot_rejections.handle += 1;
+            match handle_block(&ad, above_ref, below_ref)
+                .or_else(|| keyword_block(&ad, above_ref, below_ref, &mut medium_slot_tokens))
+            {
+                None => {
+                    let above = medium_opts[start].take().unwrap();
+                    let below = medium_opts[start + 1].take().unwrap();
+                    triples.push((ad, above, below));
+                    medium_pair_idx += 1;
+                    medium_slot_tokens = None;
+                    slot_rejections = SlotRejections::default();
                     continue;
                 }
-            } else if keyword_matches(&ad, above_ref, below_ref, &mut medium_slot_tokens) {
-                if safe_group_idx >= safe_budget || group_size == 0 {
-                    keyword_drop += 1;
-                    slot_rejections.keyword += 1;
+                Some(block) if safe_group_idx >= safe_budget || group_size == 0 => {
+                    rejections.count(&block.reason);
+                    slot_rejections.count(&block.reason);
+                    drops.push(adjacency_drop(&ad, block));
                     continue;
                 }
-            } else {
-                let above = medium_opts[start].take().unwrap();
-                let below = medium_opts[start + 1].take().unwrap();
-                triples.push((ad, above, below));
-                medium_pair_idx += 1;
-                medium_slot_tokens = None;
-                slot_rejections = SlotRejections::default();
-                continue;
+                Some(_) => {}
             }
         }
 
         if safe_group_idx >= safe_budget || group_size == 0 {
+            drops.push(dropped_ad(&ad, AdDropReason::NoEligibleNeighbours));
             continue;
         }
         let group_start = safe_group_idx * group_size;
         let above_ref = safe_opts[group_start].as_ref();
         let below_ref = safe_opts[group_start + 1].as_ref();
 
-        if should_drop_bsr_low(&ad, above_ref, below_ref) {
-            bsr_drop += 1;
-            slot_rejections.bsr_low += 1;
-            continue;
-        }
-        if is_bsr_low_ad(&ad) {
+        let low_risk = low_risk_block(&ad, above_ref, below_ref);
+        if is_bsr_low_ad(&ad) && low_risk.is_none() {
             bsr_ok += 1;
         }
-
-        if should_drop_handle(&ad, above_ref, below_ref) {
-            handle_drop += 1;
-            slot_rejections.handle += 1;
-            continue;
-        }
-
-        if keyword_matches(&ad, above_ref, below_ref, &mut slot_tokens) {
-            keyword_drop += 1;
-            slot_rejections.keyword += 1;
+        let block = low_risk
+            .or_else(|| handle_block(&ad, above_ref, below_ref))
+            .or_else(|| keyword_block(&ad, above_ref, below_ref, &mut slot_tokens));
+        if let Some(block) = block {
+            rejections.count(&block.reason);
+            slot_rejections.count(&block.reason);
+            drops.push(adjacency_drop(&ad, block));
             continue;
         }
 
@@ -162,7 +182,12 @@ pub(crate) fn blend_impl(
     }
 
     let placed_ads = triples.len();
-    emit_enforcement_metrics(bsr_drop, bsr_ok, handle_drop, keyword_drop);
+    emit_enforcement_metrics(
+        rejections.bsr_low,
+        bsr_ok,
+        rejections.handle,
+        rejections.keyword,
+    );
     let offered_slots = num_ads
         .min(spacing_cap)
         .min(max_safe_slots.saturating_add(medium_pair_idx));
@@ -227,10 +252,7 @@ pub(crate) fn blend_impl(
         }
     }
 
-    items.truncate(RESULT_SIZE);
-    if matches!(items.last(), Some(item) if matches!(item.item, Some(feed_item::Item::Ad(_)))) {
-        items.pop();
-    }
+    truncate_recording_drops(&mut items, RESULT_SIZE, drops);
     for (i, item) in items.iter_mut().enumerate() {
         item.position = i as i32;
     }
@@ -268,6 +290,14 @@ pub(crate) struct SlotRejections {
 }
 
 impl SlotRejections {
+    fn count(&mut self, reason: &BlockReason) {
+        match reason {
+            BlockReason::LowRiskNeighbour => self.bsr_low += 1,
+            BlockReason::ExcludedHandle(_) => self.handle += 1,
+            BlockReason::ExcludedKeyword(_) => self.keyword += 1,
+        }
+    }
+
     pub(crate) fn stuck_outcome(&self) -> &'static str {
         if self.bsr_low == 0 && self.handle == 0 && self.keyword == 0 {
             "unfilled_no_ads"

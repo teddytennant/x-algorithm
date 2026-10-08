@@ -110,13 +110,9 @@ __global__ void xai_global_adler32_shard_kernel(
 #pragma unroll
     for (int d = N - 1; d >= 0; --d) {
       c_d = temp % shard_shape[d];
-
       global_c_d = c_d + shard_offsets[d];
-
       global_index += global_c_d * stride;
-
       stride *= global_shape[d];
-
       temp /= shard_shape[d];
     }
 

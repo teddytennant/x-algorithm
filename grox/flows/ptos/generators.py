@@ -5,9 +5,11 @@ from grox.flows.ptos.constants import (
     POST_MIN_IMPRESSION_STREAM_FOR_GROX_PTOS,
     SAFETY_PTOS_ADULT_CONTENT_LEADING_FRAMES,
     SAFETY_PTOS_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION,
+    SAFETY_PTOS_KEY_FRAMES,
     SAFETY_PTOS_SPECIAL_VIDEO,
     TOPIC_ADULT_CONTENT_LEADING_FRAMES,
     TOPIC_MEDIA_INJECTED_ADULT_INFRARED_VIDEO_SPAM_DETECTION,
+    TOPIC_KEY_FRAMES,
     TOPIC_SPECIAL_VIDEO,
     POST_MIN_TRACTION_STREAM_FOR_GROX_PTOS,
     SAFETY_PTOS_BACKFILL,
@@ -31,6 +33,7 @@ from grox.flows.ptos.plan_safety_ptos_adult_content_leading_frames import (
 from grox.flows.ptos.plan_safety_ptos_media_injected_adult_infrared_video_spam_detection import (
     PlanSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection,
 )
+from grox.flows.ptos.plan_safety_ptos_key_frames import PlanSafetyPtosKeyFrames
 from grox.flows.ptos.plan_safety_ptos_special_video import PlanSafetyPtosSpecialVideo
 from grox.flows.ptos.plan_safety_ptos_live_cluster_anchors import (
     PlanSafetyPtosLiveClusterAnchors,
@@ -119,6 +122,15 @@ class SafetyPtosAdultContentLeadingFramesStreamTaskGenerator(StreamTaskGenerator
 
     def _get_loader(self):
         return KafkaPostLoader(TOPIC_ADULT_CONTENT_LEADING_FRAMES)
+
+
+@register
+class SafetyPtosKeyFramesStreamTaskGenerator(StreamTaskGenerator):
+    TASK_GENERATOR_TYPE = SAFETY_PTOS_KEY_FRAMES
+    PLANS_TO_INJECT = {PlanSafetyPtosKeyFrames.KEY}
+
+    def _get_loader(self):
+        return KafkaPostLoader(TOPIC_KEY_FRAMES)
 
 
 @register

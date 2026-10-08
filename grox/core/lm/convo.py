@@ -30,6 +30,17 @@ MOTION_REVEAL_DESCRIPTION = (
     "content is more severe than the visible video, classify the post by the revealed content."
 )
 
+SHOT_KEY_FRAMES_DESCRIPTION = (
+    "Shot key frames of this video's opening follow: one still per distinct shot, including shots only a frame or "
+    "two long (a flash or a quick cut). Judge what they show as part of the video's actual content."
+)
+
+RANKED_KEY_FRAMES_DESCRIPTION = (
+    "Ranked key frames of this video follow: stills picked by an automated search for the moments that most need a "
+    "close look. A moment can be on screen for only a fraction of a second; judge what they show as part of the "
+    "video's actual content."
+)
+
 
 class Role(str, Enum):
     USER = "User"
@@ -62,8 +73,16 @@ class Video(BaseModel):
     is_deluxe_target: bool = False
     motion_reveal_frames: list[bytes] = Field(default_factory=lambda: [])
     preview_image: bytes | None = None
+    shot_key_frames: list[bytes] = Field(default_factory=lambda: [])
+    ranked_key_frames: list[bytes] = Field(default_factory=lambda: [])
 
-    @field_serializer("frames", "motion_reveal_frames", when_used="json")
+    @field_serializer(
+        "frames",
+        "motion_reveal_frames",
+        "shot_key_frames",
+        "ranked_key_frames",
+        when_used="json",
+    )
     def serialize_frames(self, value: list[bytes]) -> list[str]:
         return [b64encode(frame).decode("utf-8") for frame in value]
 
@@ -76,13 +95,33 @@ class Video(BaseModel):
     def decode_preview_image(cls, value: str | bytes | None) -> bytes | None:
         return b64decode(value) if isinstance(value, str) else value
 
-    @field_validator("frames", "motion_reveal_frames", mode="before")
+    @field_validator(
+        "frames",
+        "motion_reveal_frames",
+        "shot_key_frames",
+        "ranked_key_frames",
+        mode="before",
+    )
     @classmethod
     def decode_frames(cls, value: list[str] | list[bytes]) -> list[bytes]:
         is_list_str = len(value) > 0 and isinstance(value[0], str)
         if is_list_str:
             return [b64decode(frame) for frame in value]
         return value
+
+    def stills(self) -> list[bytes]:
+        return [*self.frames, *self.shot_key_frames, *self.ranked_key_frames]
+
+    def key_frame_parts(self) -> list[str | bytes]:
+        parts: list[str | bytes] = []
+        for description, stills in (
+            (SHOT_KEY_FRAMES_DESCRIPTION, self.shot_key_frames),
+            (RANKED_KEY_FRAMES_DESCRIPTION, self.ranked_key_frames),
+        ):
+            if stills:
+                parts.append(f"{description}\n")
+                parts.extend(stills)
+        return parts
 
     def _create_storyboard(
         self, frame_chunk: list[bytes], aspect_ratio: float | None = None
@@ -133,56 +172,59 @@ class Video(BaseModel):
         if self.preview_image:
             res.extend([f"{PREVIEW_IMAGE_LABEL} ", self.preview_image, "\n"])
 
-        res.append(
-            f"The video has a duration of {self.total_duration:.2f} seconds. "
-            "Below is a storyboard with composite panels of frames (which are sorted left to right, top to bottom) "
-            "and subtitles interleaved.\n"
-        )
-
-        frames_per_storyboard = STORYBOARD_COLUMNS**2
-        storyboards: list[bytes] = []
-        storyboard_indices: list[int] = []
-
-        for i in range(0, len(self.frames), frames_per_storyboard):
-            chunk_frames = self.frames[i : i + frames_per_storyboard]
-            storyboard_bytes = self._create_storyboard(chunk_frames, aspect_ratio)
-            storyboards.append(storyboard_bytes)
-            storyboard_indices.append(i)
-
-        for idx, (storyboard_bytes, frame_idx) in enumerate(
-            zip(storyboards, storyboard_indices, strict=True)
-        ):
-            start_frame = frame_idx
-            end_frame = min(frame_idx + frames_per_storyboard, len(self.frames))
-            start_time = start_frame * self.duration
-            end_time = (end_frame - 1) * self.duration
-
-            res.extend(
-                [
-                    " ",
-                    storyboard_bytes,
-                    f" Storyboard panel {idx + 1} (frames {start_frame + 1}-{end_frame} at {start_time:.2f}s-{end_time:.2f}s)",
-                ]
+        if self.frames:
+            res.append(
+                f"The video has a duration of {self.total_duration:.2f} seconds. "
+                "Below is a storyboard with composite panels of frames (which are sorted left to right, top to bottom) "
+                "and subtitles interleaved.\n"
             )
 
-            if self.subtitles:
-                subtitle_texts = []
-                for i in range(start_frame, end_frame):
-                    if i < len(self.subtitles) and self.subtitles[i]:
-                        frame_time = i * self.duration
-                        subtitle_texts.append(
-                            f"[{frame_time:.2f}s] {self.subtitles[i]}"
-                        )
+            frames_per_storyboard = STORYBOARD_COLUMNS**2
+            storyboards: list[bytes] = []
+            storyboard_indices: list[int] = []
 
-                if subtitle_texts:
-                    res.append(f" Subtitles: {'; '.join(subtitle_texts)}")
+            for i in range(0, len(self.frames), frames_per_storyboard):
+                chunk_frames = self.frames[i : i + frames_per_storyboard]
+                storyboard_bytes = self._create_storyboard(chunk_frames, aspect_ratio)
+                storyboards.append(storyboard_bytes)
+                storyboard_indices.append(i)
 
-            res.append("\n")
+            for idx, (storyboard_bytes, frame_idx) in enumerate(
+                zip(storyboards, storyboard_indices, strict=True)
+            ):
+                start_frame = frame_idx
+                end_frame = min(frame_idx + frames_per_storyboard, len(self.frames))
+                start_time = start_frame * self.duration
+                end_time = (end_frame - 1) * self.duration
+
+                res.extend(
+                    [
+                        " ",
+                        storyboard_bytes,
+                        f" Storyboard panel {idx + 1} (frames {start_frame + 1}-{end_frame} at {start_time:.2f}s-{end_time:.2f}s)",
+                    ]
+                )
+
+                if self.subtitles:
+                    subtitle_texts = []
+                    for i in range(start_frame, end_frame):
+                        if i < len(self.subtitles) and self.subtitles[i]:
+                            frame_time = i * self.duration
+                            subtitle_texts.append(
+                                f"[{frame_time:.2f}s] {self.subtitles[i]}"
+                            )
+
+                    if subtitle_texts:
+                        res.append(f" Subtitles: {'; '.join(subtitle_texts)}")
+
+                res.append("\n")
 
         if self.motion_reveal_frames:
             res.append(f"{MOTION_REVEAL_DESCRIPTION}\n")
             for idx, reveal_bytes in enumerate(self.motion_reveal_frames):
                 res.extend([" ", reveal_bytes, f" Motion-reveal still {idx + 1}\n"])
+
+        res.extend(self.key_frame_parts())
 
         return res
 
@@ -384,25 +426,28 @@ class Conversation(BaseModel):
                     if c.preview_image:
                         parts.append({"type": "text", "text": PREVIEW_IMAGE_LABEL})
                         parts.append(_image_part(c.preview_image))
-                    desc = f"The video lasts for {c.total_duration:.2f} seconds. The following {len(c.frames)} frames are sampled at equal intervals."
-                    parts.append({"type": "text", "text": desc})
-                    bucket_times = [i * c.duration for i in range(len(c.frames))]
-                    for i, (frame, time_sec) in enumerate(
-                        zip(c.frames, bucket_times, strict=True)
-                    ):
-                        subtitle = (
-                            c.subtitles[i]
-                            if c.subtitles and i < len(c.subtitles)
-                            else None
-                        )
-                        subtitle_str = f" with subtitle: {subtitle}" if subtitle else ""
-                        parts.append(
-                            {
-                                "type": "text",
-                                "text": f"Frame at {time_sec:.2f}s{subtitle_str}",
-                            }
-                        )
-                        parts.append(_image_part(frame))
+                    if c.frames:
+                        desc = f"The video lasts for {c.total_duration:.2f} seconds. The following {len(c.frames)} frames are sampled at equal intervals."
+                        parts.append({"type": "text", "text": desc})
+                        bucket_times = [i * c.duration for i in range(len(c.frames))]
+                        for i, (frame, time_sec) in enumerate(
+                            zip(c.frames, bucket_times, strict=True)
+                        ):
+                            subtitle = (
+                                c.subtitles[i]
+                                if c.subtitles and i < len(c.subtitles)
+                                else None
+                            )
+                            subtitle_str = (
+                                f" with subtitle: {subtitle}" if subtitle else ""
+                            )
+                            parts.append(
+                                {
+                                    "type": "text",
+                                    "text": f"Frame at {time_sec:.2f}s{subtitle_str}",
+                                }
+                            )
+                            parts.append(_image_part(frame))
                     if c.motion_reveal_frames:
                         parts.append(
                             {"type": "text", "text": MOTION_REVEAL_DESCRIPTION}
@@ -415,6 +460,12 @@ class Conversation(BaseModel):
                                 }
                             )
                             parts.append(_image_part(reveal))
+                    for part in c.key_frame_parts():
+                        parts.append(
+                            {"type": "text", "text": part}
+                            if isinstance(part, str)
+                            else _image_part(part)
+                        )
 
             if not parts:
                 continue

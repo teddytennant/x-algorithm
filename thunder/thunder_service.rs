@@ -14,7 +14,10 @@ use xai_thunder_proto::{
     GetInNetworkPostsRequest, GetInNetworkPostsResponse, LightPost,
 };
 
-use crate::config::{MAX_INPUT_LIST_SIZE, MAX_POSTS_TO_RETURN, MAX_VIDEOS_TO_RETURN};
+use crate::config::{
+    MAX_INPUT_LIST_SIZE, MAX_ORIGINAL_POSTS_PER_AUTHOR, MAX_POSTS_TO_RETURN,
+    MAX_REPLY_POSTS_PER_AUTHOR, MAX_VIDEOS_TO_RETURN,
+};
 use crate::metrics::{
     Timer, GET_IN_NETWORK_POSTS_COUNT, GET_IN_NETWORK_POSTS_DURATION,
     GET_IN_NETWORK_POSTS_DURATION_WITHOUT_STRATO, GET_IN_NETWORK_POSTS_EXCLUDED_SIZE,
@@ -229,6 +232,18 @@ impl InNetworkPostsService for ThunderServiceImpl {
         };
         GET_IN_NETWORK_POSTS_MAX_RESULTS.observe(max_results as f64);
 
+        let limits = req.per_author_limits.unwrap_or_default();
+        let max_original_per_author = limits
+            .max_posts_per_author
+            .map_or(MAX_ORIGINAL_POSTS_PER_AUTHOR, |n| {
+                (n as usize).min(MAX_ORIGINAL_POSTS_PER_AUTHOR)
+            });
+        let max_secondary_per_author = limits
+            .max_replies_reposts_per_author
+            .map_or(MAX_REPLY_POSTS_PER_AUTHOR, |n| {
+                (n as usize).min(MAX_REPLY_POSTS_PER_AUTHOR)
+            });
+
         let following_count = following_user_ids.len();
         if following_count > MAX_INPUT_LIST_SIZE {
             warn!(
@@ -282,6 +297,8 @@ impl InNetworkPostsService for ThunderServiceImpl {
                     &exclude_tweet_ids,
                     start_time,
                     request_user_id,
+                    max_original_per_author,
+                    max_secondary_per_author,
                 )
             };
 

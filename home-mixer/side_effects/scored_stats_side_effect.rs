@@ -25,6 +25,8 @@ const HEAVY_RANKER_TOP_K: &[usize] = &[1, 10, 35];
 
 const PHOENIX_RETRIEVAL_TOP_K: &[u32] = &[10, 100, 200, 500, 1000];
 
+const SIMCLUSTERS_TOP_K: &[u32] = &[50, 100, 200, 400, 600, 800];
+
 const DEFAULT_SAMPLING_RATE: f64 = 0.05;
 
 pub struct ScoredStatsSideEffect;
@@ -115,6 +117,7 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for ScoredStatsSideEffect {
                     record_retrieval_source_contribution(
                         receiver.as_ref(),
                         &input.selected_candidates,
+                        &input.non_selected_candidates,
                         &format!("{:?}", PhoenixSource::resolve_cluster(&input.query)),
                         &format!("{:?}", PhoenixScorer::resolve_cluster(&input.query)),
                         &experiment_buckets,
@@ -154,6 +157,7 @@ fn record_served_by_source(receiver: &dyn StatsReceiverExt, selected_candidates:
 fn record_retrieval_source_contribution(
     receiver: &dyn StatsReceiverExt,
     selected_candidates: &[PostCandidate],
+    non_selected_candidates: &[PostCandidate],
     retrieval_cluster: &str,
     ranker_cluster: &str,
     experiment_buckets: &[&ExperimentBucket],
@@ -165,8 +169,20 @@ fn record_retrieval_source_contribution(
         experiment_buckets
     };
     let selected_key = format!("{METRIC_PREFIX}.RetrievalContribution.Selected");
-    let top_k_key = format!("{METRIC_PREFIX}.RetrievalContribution.PhoenixTopK");
     let total_key = format!("{METRIC_PREFIX}.RetrievalContribution.SelectedTotal");
+    let scored_top_k_key = format!("{METRIC_PREFIX}.RetrievalContribution.ScoredTopK");
+    let top_k_keys = [
+        (
+            ServedType::ForYouPhoenixRetrieval,
+            PHOENIX_RETRIEVAL_TOP_K,
+            format!("{METRIC_PREFIX}.RetrievalContribution.PhoenixTopK"),
+        ),
+        (
+            ServedType::ForYouSimclusters,
+            SIMCLUSTERS_TOP_K,
+            format!("{METRIC_PREFIX}.RetrievalContribution.SimclustersTopK"),
+        ),
+    ];
 
     let mut sources = HashSet::new();
     for c in selected_candidates {
@@ -183,6 +199,13 @@ fn record_retrieval_source_contribution(
             }
         }
         [("credited", credited), ("inclusive", inclusive)]
+    };
+    let scored_within = |source: ServedType, k: u32| -> u64 {
+        selected_candidates
+            .iter()
+            .chain(non_selected_candidates)
+            .filter(|c| within_top_k(c, source, Some(k)))
+            .count() as u64
     };
 
     for b in buckets {
@@ -210,9 +233,17 @@ fn record_retrieval_source_contribution(
             }
         }
 
-        for k in PHOENIX_RETRIEVAL_TOP_K {
-            for (mode, value) in count(ServedType::ForYouPhoenixRetrieval, Some(*k)) {
-                incr(&top_k_key, &[("k", &k.to_string()), ("mode", mode)], value);
+        for (source, top_k, top_k_key) in &top_k_keys {
+            for k in *top_k {
+                let k_str = k.to_string();
+                for (mode, value) in count(*source, Some(*k)) {
+                    incr(top_k_key, &[("k", &k_str), ("mode", mode)], value);
+                }
+                incr(
+                    &scored_top_k_key,
+                    &[("source", source.as_str_name()), ("k", &k_str)],
+                    scored_within(*source, *k),
+                );
             }
         }
     }

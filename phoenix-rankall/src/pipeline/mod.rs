@@ -367,9 +367,9 @@ mod tests {
         let close_called = Arc::new(AtomicUsize::new(0));
         let consumer = MockConsumer::new(
             vec![
-                vec![vec![1, 2], vec![3, 4]],                
-                vec![vec![5, 6]],                            
-                vec![vec![7, 8], vec![9, 10], vec![11, 12]], 
+                vec![vec![1, 2], vec![3, 4]],
+                vec![vec![5, 6]],
+                vec![vec![7, 8], vec![9, 10], vec![11, 12]],
             ],
             commit_count.clone(),
             close_called.clone(),

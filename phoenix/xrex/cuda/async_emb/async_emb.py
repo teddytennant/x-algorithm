@@ -34,6 +34,9 @@ try:
         "xrex_async_emb_lookup_done", fn=async_emb_api.lookup_done(), platform="CUDA"
     )
     jax.ffi.register_ffi_target(
+        "xrex_async_emb_stage_update", fn=async_emb_api.stage_update(), platform="CUDA"
+    )
+    jax.ffi.register_ffi_target(
         "xrex_async_emb_rowwise_adagrad_update_start",
         fn={
             "initialize": async_emb_api.rowwise_adagrad_update_start_init(),
@@ -180,13 +183,34 @@ def lookup_done(pin: jax.Array, ctx: AsyncEmbContextHandle) -> jax.Array:
     return embeddings
 
 
-def rowwise_adagrad_update_start(
+def stage_update(
     grads: jax.Array,
     segment_ids: jax.Array,
     unique_tokens: jax.Array,
+    pending: jax.Array,
+    gate: jax.Array,
+    ctx: AsyncEmbContextHandle,
+) -> jax.Array:
+    assert grads.shape == (ctx.tokens_per_rank, ctx.emb_width) and grads.dtype == jnp.bfloat16
+    assert math.prod(segment_ids.shape) == ctx.tokens_per_rank
+    assert math.prod(unique_tokens.shape) == ctx.num_unique
+    with jax.named_scope("async_emb.stage_update"):
+        (pin,) = jax.ffi.ffi_call(
+            "xrex_async_emb_stage_update", [jax.ShapeDtypeStruct((1,), jnp.float32)]
+        )(
+            grads,
+            segment_ids.reshape(-1).astype(jnp.int32),
+            unique_tokens.reshape(-1).astype(jnp.int32),
+            pending.astype(jnp.int32).reshape(1),
+            gate,
+            **ctx.attrs(),
+        )
+    return pin
+
+
+def rowwise_adagrad_update_start(
     table: jax.Array,
     row_state: jax.Array,
-    pending: jax.Array,
     gate: jax.Array,
     ctx: AsyncEmbContextHandle,
     *,
@@ -195,29 +219,18 @@ def rowwise_adagrad_update_start(
     decay_factor: float,
     weight_decay_factor: float = 1.0,
 ):
-    assert grads.shape == (ctx.tokens_per_rank, ctx.emb_width) and grads.dtype == jnp.bfloat16
-    assert math.prod(segment_ids.shape) == ctx.tokens_per_rank
-    assert math.prod(unique_tokens.shape) == ctx.num_unique
-    flat_segment_ids = segment_ids.reshape(-1).astype(jnp.int32)
-    flat_unique_tokens = unique_tokens.reshape(-1).astype(jnp.int32)
     with jax.named_scope("async_emb.rowwise_adagrad_update_start"):
         outs = jax.ffi.ffi_call(
             "xrex_async_emb_rowwise_adagrad_update_start",
             [
-                jax.ShapeDtypeStruct(grads.shape, grads.dtype),
-                jax.ShapeDtypeStruct(flat_segment_ids.shape, jnp.int32),
-                jax.ShapeDtypeStruct(flat_unique_tokens.shape, jnp.int32),
                 jax.ShapeDtypeStruct(table.shape, table.dtype),
                 jax.ShapeDtypeStruct(row_state.shape, row_state.dtype),
+                jax.ShapeDtypeStruct((1,), jnp.float32),
             ],
-            input_output_aliases={0: 0, 1: 1, 2: 2, 3: 3, 4: 4},
+            input_output_aliases={0: 0, 1: 1},
         )(
-            grads,
-            flat_segment_ids,
-            flat_unique_tokens,
             table,
             row_state,
-            pending.astype(jnp.int32).reshape(1),
             gate,
             **ctx.attrs(),
             learning_rate=float(learning_rate),
@@ -229,14 +242,10 @@ def rowwise_adagrad_update_start(
 
 
 def rowwise_adagrad_lazy_update_start(
-    grads: jax.Array,
-    segment_ids: jax.Array,
-    unique_tokens: jax.Array,
     table: jax.Array,
     row_state: jax.Array,
     last_step: jax.Array,
     step: jax.Array,
-    pending: jax.Array,
     gate: jax.Array,
     ctx: AsyncEmbContextHandle,
     *,
@@ -245,33 +254,22 @@ def rowwise_adagrad_lazy_update_start(
     accum_decay_rate: float,
     weight_decay_rate: float,
 ):
-    assert grads.shape == (ctx.tokens_per_rank, ctx.emb_width) and grads.dtype == jnp.bfloat16
-    assert math.prod(segment_ids.shape) == ctx.tokens_per_rank
-    assert math.prod(unique_tokens.shape) == ctx.num_unique
     assert last_step.shape == row_state.shape and last_step.dtype == jnp.int32
-    flat_segment_ids = segment_ids.reshape(-1).astype(jnp.int32)
-    flat_unique_tokens = unique_tokens.reshape(-1).astype(jnp.int32)
     with jax.named_scope("async_emb.rowwise_adagrad_lazy_update_start"):
         outs = jax.ffi.ffi_call(
             "xrex_async_emb_rowwise_adagrad_lazy_update_start",
             [
-                jax.ShapeDtypeStruct(grads.shape, grads.dtype),
-                jax.ShapeDtypeStruct(flat_segment_ids.shape, jnp.int32),
-                jax.ShapeDtypeStruct(flat_unique_tokens.shape, jnp.int32),
                 jax.ShapeDtypeStruct(table.shape, table.dtype),
                 jax.ShapeDtypeStruct(row_state.shape, row_state.dtype),
                 jax.ShapeDtypeStruct(last_step.shape, jnp.int32),
+                jax.ShapeDtypeStruct((1,), jnp.float32),
             ],
-            input_output_aliases={0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5},
+            input_output_aliases={0: 0, 1: 1, 2: 2},
         )(
-            grads,
-            flat_segment_ids,
-            flat_unique_tokens,
             table,
             row_state,
             last_step,
             step.astype(jnp.int32).reshape(1),
-            pending.astype(jnp.int32).reshape(1),
             gate,
             **ctx.attrs(),
             learning_rate=float(learning_rate),
@@ -288,6 +286,7 @@ def rowwise_adagrad_update_done(gate: jax.Array, ctx: AsyncEmbContextHandle):
             "xrex_async_emb_rowwise_adagrad_update_done",
             [
                 jax.ShapeDtypeStruct((), jnp.float32),
+                jax.ShapeDtypeStruct((), jnp.int32),
                 jax.ShapeDtypeStruct((), jnp.int32),
                 jax.ShapeDtypeStruct((1,), jnp.float32),
             ],

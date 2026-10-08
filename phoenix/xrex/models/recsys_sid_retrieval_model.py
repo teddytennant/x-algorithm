@@ -483,7 +483,6 @@ class RecsysSIDRetrievalModel(RecsysAggregatedModel):
         with Summary() as summarizer:
             hist_emb, hist_mask = self._build_history_embeddings(batch, recsys_emb)
         H_total = hist_emb.shape[1]
-
         L = cfg.sid_num_levels
         K = cfg.sid_codebook_size
         sid_tf_list = []

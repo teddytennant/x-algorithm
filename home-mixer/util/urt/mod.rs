@@ -12,6 +12,7 @@ mod post_marshaller;
 mod prompt_marshaller;
 mod push_to_home_marshaller;
 pub(crate) mod reverse_chron_following;
+mod video_carousel_marshaller;
 mod wtf_marshaller;
 use crate::models::query::RequestType;
 use std::collections::BTreeMap;
@@ -119,6 +120,15 @@ pub(crate) fn make_urt_timeline(
                 language_code,
                 request_id,
             )),
+            Some(FeedItemKind::VideoCarousel(carousel)) => {
+                video_carousel_marshaller::marshal_video_carousel(
+                    carousel,
+                    feed_item.position as i64,
+                    initial_sort_index,
+                    language_code,
+                    country_code,
+                )
+            }
             _ => None,
         })
         .collect();

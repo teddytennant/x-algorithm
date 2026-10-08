@@ -27,7 +27,7 @@ pub(crate) enum FailureKind {
     ManhattanDecode,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum TwemcacheOutcome {
     Hit(vf_pb::SafetyLabelMap),
     NotFound,

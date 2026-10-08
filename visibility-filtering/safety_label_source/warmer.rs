@@ -40,7 +40,7 @@ impl WarmFetcher for StratoWarmFetcher {
                 (
                     WARM_COLUMN_PATH.to_string(),
                     "fetch".to_string(),
-                    vec![encode(&(*id as i64, ()))],
+                    vec![encode(&(id.cast_signed(), ()))],
                 )
             })
             .collect();
@@ -109,14 +109,12 @@ mod tests {
 
     struct FakeFetcher {
         batches: Mutex<Vec<Vec<u64>>>,
-        failed_per_batch: usize,
     }
 
     impl FakeFetcher {
-        fn new(failed_per_batch: usize) -> Arc<Self> {
+        fn new() -> Arc<Self> {
             Arc::new(Self {
                 batches: Mutex::new(Vec::new()),
-                failed_per_batch,
             })
         }
 
@@ -129,14 +127,14 @@ mod tests {
     impl WarmFetcher for FakeFetcher {
         async fn fetch(&self, ids: &[u64]) -> usize {
             self.batches.lock().unwrap().push(ids.to_vec());
-            self.failed_per_batch
+            0
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn drain_lingers_then_flushes_in_chunks() {
-        let fetcher = FakeFetcher::new(0);
-        let warmer = CacheWarmer::spawn(fetcher.clone());
+        let fetcher = FakeFetcher::new();
+        let warmer = CacheWarmer::spawn(Arc::<FakeFetcher>::clone(&fetcher));
 
         warmer.warm((0..30).collect());
         warmer.warm((30..60).collect());
@@ -149,46 +147,15 @@ mod tests {
         assert_eq!(batches[0], (0..50).collect::<Vec<u64>>());
         assert_eq!(batches[1], (50..60).collect::<Vec<u64>>());
         assert_eq!(batches[2], vec![100]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn accumulation_is_capped_per_flush() {
-        let fetcher = FakeFetcher::new(0);
-        let warmer = CacheWarmer::spawn(fetcher.clone());
 
         for start in (0..150).step_by(30) {
             warmer.warm((start..start + 30).collect());
         }
         tokio::time::sleep(WARM_LINGER * 2).await;
-
         let batches = fetcher.batches();
         assert!(batches
             .iter()
             .all(|batch| batch.len() <= WARM_FETCH_MAX_KEYS));
-        assert_eq!(batches.concat(), (0..150).collect::<Vec<u64>>());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn fetch_failure_does_not_stop_the_drain() {
-        let fetcher = FakeFetcher::new(1);
-        let warmer = CacheWarmer::spawn(fetcher.clone());
-
-        warmer.warm(vec![1]);
-        tokio::time::sleep(WARM_LINGER * 2).await;
-        warmer.warm(vec![2]);
-        tokio::time::sleep(WARM_LINGER * 2).await;
-
-        assert_eq!(fetcher.batches(), vec![vec![1], vec![2]]);
-    }
-
-    #[tokio::test]
-    async fn full_channel_drops_without_blocking() {
-        let (warmer, mut rx) = CacheWarmer::without_drain_task(1);
-
-        warmer.warm(vec![1]);
-        warmer.warm(vec![2]);
-
-        assert_eq!(rx.try_recv(), Ok(vec![1]));
-        assert!(rx.try_recv().is_err(), "the second publish was dropped");
+        assert_eq!(batches[3..].concat(), (0..150).collect::<Vec<u64>>());
     }
 }

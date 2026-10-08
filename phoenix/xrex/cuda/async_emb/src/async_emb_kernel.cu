@@ -210,7 +210,7 @@ void launch_grad_dispatch(
 ) {
   const int64_t work = slices.tokens_per_rank * int64_t(slices.nranks) * slices.shard_width /
                        (slices.shard_width % 8 == 0 ? 8 : 1);
-  grad_dispatch<<<grid_for(work, kSideGrid), kThreads, 0, stream>>>(
+  grad_dispatch<<<grid_for(work, kMainGrid), kThreads, 0, stream>>>(
       grads, send_slices, slices.tokens_per_rank, slices.shard_width, slices.nranks
   );
   XAI_CUDA_LAUNCH_CHECK();
@@ -298,7 +298,7 @@ void launch_grad_segment_sum(
 }
 
 __global__ void rowwise_adagrad_apply(
-    float* grad_accum,
+    const float* grad_accum,
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,
@@ -350,7 +350,7 @@ __global__ void rowwise_adagrad_apply(
     wd = __shfl_sync(0xffffffffu, wd, lane - col);
     if (ok) {
       const float step = (-adagrad.lr) * (1.f / (sqrtf(accum) + adagrad.eps));
-      const float grad = __bfloat162float(__float2bfloat16(grad_accum[elem]));
+      const float grad = __bfloat162float(__float2bfloat16(__ldg(grad_accum + elem)));
       const float delta = __bfloat162float(__float2bfloat16(step * grad));
       __nv_bfloat16* cell = table_shard + token * shard_width + col;
       const float decayed = __bfloat162float(__float2bfloat16(__bfloat162float(*cell) * wd));
@@ -359,14 +359,11 @@ __global__ void rowwise_adagrad_apply(
         row_state[token] = accum;
       }
     }
-    if (in_range) {
-      __stcs(grad_accum + elem, 0.f);
-    }
   }
 }
 
 void launch_rowwise_adagrad_apply(
-    float* grad_accum,
+    const float* grad_accum,
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,

@@ -4,6 +4,10 @@ syntax = "proto3";
 
 package xai.recsys.v1;
 
+option java_package = "com.x.user_action_sequence";
+option java_outer_classname = "proto_java";
+option java_multiple_files = true;
+
 service RecsysPredictor {
   rpc PredictNextActions(PredictNextActionsRequest)
       returns (PredictNextActionsResponse) {}
@@ -15,7 +19,35 @@ service RecsysRetrievalPredictor {
   rpc RetrieveTopKCandidates(RetrieveTopKCandidatesRequest)
       returns (RetrieveTopKCandidatesResponse) {}
 
+  rpc ScorePosts(ScorePostsRequest) returns (ScorePostsResponse) {}
+
   rpc ReloadModel(ReloadModelRequest) returns (ReloadModelResponse) {}
+}
+
+enum FeedRequestContext {
+  FEED_REQUEST_CONTEXT_UNKNOWN = 0;
+  FEED_REQUEST_CONTEXT_OTHER = 1;
+  FEED_REQUEST_CONTEXT_LAUNCH = 2;
+  FEED_REQUEST_CONTEXT_FOREGROUND = 3;
+  FEED_REQUEST_CONTEXT_FOREGROUND_TRUNCATE = 4;
+  FEED_REQUEST_CONTEXT_PULL_TO_REFRESH = 5;
+  FEED_REQUEST_CONTEXT_MANUAL_REFRESH = 6;
+  FEED_REQUEST_CONTEXT_NAVIGATE = 7;
+  FEED_REQUEST_CONTEXT_VIEWPORT_AWARE_REFRESH = 8;
+  FEED_REQUEST_CONTEXT_POLLING = 9;
+  FEED_REQUEST_CONTEXT_BACKGROUND_FETCH = 10;
+  FEED_REQUEST_CONTEXT_GAP = 11;
+  FEED_REQUEST_CONTEXT_SIGNUP = 12;
+  FEED_REQUEST_CONTEXT_TWEET_SELF_THREAD = 13;
+  FEED_REQUEST_CONTEXT_AUTO = 14;
+}
+
+enum FeedCursorDirection {
+  FEED_CURSOR_DIRECTION_UNKNOWN = 0;
+  FEED_CURSOR_DIRECTION_INITIAL = 1;
+  FEED_CURSOR_DIRECTION_TOP = 2;
+  FEED_CURSOR_DIRECTION_BOTTOM = 3;
+  FEED_CURSOR_DIRECTION_GAP = 4;
 }
 
 message ClientContext {
@@ -60,6 +92,8 @@ message UserContext {
   int32 user_following_count = 15;
   int32 user_blockers_count = 16;
   int32 user_muters_count = 17;
+  bool is_nsfw_user = 18;
+  bool is_nsfw_mode = 19;
 }
 
 message EngagementCountRow {
@@ -73,6 +107,7 @@ message EngagementCounts {
   repeated EngagementCountRow rows = 3;
   int64 updated_at_ms = 4;
   int64 window_end_ms = 5;
+  repeated int32 collected_actions = 6;
 }
 
 message ConversionHistoryContext {
@@ -142,6 +177,11 @@ message PurchaseValueBaseline {
   int64 impression_id = 1;
   int64 advertiser_account_id = 2;
   double mean_value_usd_28d = 3;
+  double mean_value_usd_28d_vt = 4;
+  double mean_content_view_usd_28d = 5;
+  double mean_add_to_cart_usd_28d = 6;
+  double mean_content_view_usd_28d_vt = 7;
+  double mean_add_to_cart_usd_28d_vt = 8;
 }
 
 message PageDecodeParams {
@@ -214,10 +254,51 @@ message RetrieveTopKCandidatesRequest {
   repeated float search_query_embedding = 11;
 
   UserContext user_context = 12;
+
+  uint32 num_cold_start_to_retrieve = 13;
+
+  repeated uint64 seed_post_ids = 14;
+
+  repeated ExcludedPostsBloomFilter excluded_posts_bloom_filters = 15;
+
+  repeated uint64 excluded_post_ids = 16;
+}
+
+message ExcludedPostsBloomFilter {
+  repeated fixed64 bit_array = 1;
+  int32 size_cap = 2;
+  double false_positive_rate = 3;
 }
 
 message RetrieveTopKCandidatesResponse {
   repeated ScoredCandidates topKCandidates = 1;
+}
+
+message ScorePostsRequest {
+  uint64 user_id = 1;
+  bytes columnar_sequence = 2;
+  ClientContext client_context = 3;
+  UserContext user_context = 4;
+  repeated uint64 post_ids = 5;
+
+  repeated uint32 requested_actions = 6;
+  repeated uint32 post_action_masks = 7;
+}
+
+message ScorePostsResponse {
+  PostActionScores scores = 1;
+}
+
+message PostActionScores {
+  repeated uint32 action_indices = 1;
+
+  uint32 num_posts = 2;
+
+  bytes probabilities_bf16 = 3;
+
+  bytes found = 4;
+
+  repeated uint32 post_action_masks = 5;
 }
 
 message DeviceFeature {
@@ -254,6 +335,24 @@ message ScoredCandidates {
   uint64 userId = 1;
 
   repeated ScoredCandidate candidates = 2;
+}
+
+enum RetrievalDatasetType {
+  RETRIEVAL_DATASET_TYPE_PAD = 0;
+  RETRIEVAL_DATASET_TYPE_HOME = 1;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_2_DAY = 2;
+  RETRIEVAL_DATASET_TYPE_RELEVANT_ADS = 3;
+  RETRIEVAL_DATASET_TYPE_CAROUSEL_ADS = 4;
+  RETRIEVAL_DATASET_TYPE_EVERGREEN = 5;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_NSFW = 6;
+  RETRIEVAL_DATASET_TYPE_ACTIVE_ADS = 7;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_4_DAY = 8;
+  RETRIEVAL_DATASET_TYPE_IMAGINE = 9;
+  RETRIEVAL_DATASET_TYPE_TAIL = 10;
+  RETRIEVAL_DATASET_TYPE_DPA_PRODUCTS = 11;
+  RETRIEVAL_DATASET_TYPE_TRENDING = 12;
+  RETRIEVAL_DATASET_TYPE_HOME_COLD = 13;
+  RETRIEVAL_DATASET_TYPE_HOME_HOT = 14;
 }
 
 message ScoredCandidate {
@@ -406,7 +505,9 @@ enum ActionName {
   CLIENT_TWEET_RELEVANT_TO_SEARCH = 105;
   CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH = 106;
   CLIENT_TWEET_LIVE_STREAM_REPLY = 107;
-  RESERVED_108 = 108;
+  LLM_JUDGE_RELEVANT_TO_SEARCH = 108;
+  LLM_JUDGE_NOT_RELEVANT_TO_SEARCH = 109;
+  CLIENT_NOTIFICATION_SETTING_OPT_OUT = 110;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -474,6 +575,8 @@ enum ActionName {
   ADS_PIXEL_FIRE = 191;
   ADS_LONG_DWELL_AND_PIXEL_FIRE = 192;
   P_LONG_DWELL_AND_PIXEL_FIRE = 193;
+  ADS_ATTRIBUTED_MACT_MMP_CLICK_INSTALL = 194;
+  ADS_ATTRIBUTED_MACT_MMP_VIEW_INSTALL = 195;
   ADS_PURCHASE_CONVERSION = 200;
   ADS_MID_FUNNEL_CONVERSION = 201;
   ADS_ADD_TO_CART_CONVERSION = 202;
@@ -515,12 +618,14 @@ enum ActionName {
 }
 
 enum ContinuousActionName {
-  INVALID_CONTINUOUS_ACTION_NAME = 0;
+  HOME_PROFILE_VISIT_SECS = 0;
   DWELL_TIME = 1;
   CLICK_DWELL_TIME = 2;
-  ACTIVE_SECS_5M_RESIDUAL_NORM = 3;
+  HOME_VIDEO_CONTINUATION_SECS = 3;
   BRIDGE_PROBABILITY = 4;
   ADS_WEB_CT_PURCHASE_VALUE = 5;
+  WEB_CONV_VALUE_USD = 6;
+  WEB_CONV_VALUE_RATIO = 7;
 }
 
 enum ActionGroup {
@@ -1299,6 +1404,8 @@ message ScoreInfo {
   optional double rewardRerankSlotProb = 5;
   optional uint32 rerankerHeadTag = 6;
   optional double pageDecodeSlotProb = 7;
+  repeated uint32 predictionHeads = 8;
+  repeated float predictionValues = 9;
 }
 
 message SlateContext {
@@ -1433,6 +1540,38 @@ message AdActionInfo {
   map<string, bool> booleanFeatures = 14;
 }
 
+enum UnifiedCardType {
+  UNIFIED_CARD_TYPE_UNSPECIFIED = 0;
+  IMAGE_WEBSITE = 1;
+  VIDEO_WEBSITE = 2;
+  IMAGE_APP = 3;
+  VIDEO_APP = 4;
+  IMAGE_AND_URLS = 5;
+  VIDEO_AND_URLS = 6;
+  IMAGE_CAROUSEL_WEBSITE = 7;
+  IMAGE_CAROUSEL_APP = 8;
+  VIDEO_CAROUSEL_WEBSITE = 9;
+  VIDEO_CAROUSEL_APP = 10;
+  VIDEO_PLAYABLE_APP = 11;
+  IMAGE = 12;
+  VIDEO = 13;
+  IMAGE_AND_BUTTON_WEBSITE = 14;
+  VIDEO_AND_BUTTON_WEBSITE = 15;
+  PRODUCT = 16;
+  SUMMARY_LARGE_IMAGE = 17;
+  IMAGE_MULTI_DEST_CAROUSEL_APP = 18;
+  VIDEO_MULTI_DEST_CAROUSEL_APP = 19;
+  IMAGE_MULTI_DEST_CAROUSEL_WEBSITE = 20;
+  VIDEO_MULTI_DEST_CAROUSEL_WEBSITE = 21;
+  MIXED_MEDIA_SINGLE_DEST_CAROUSEL_APP = 22;
+  MIXED_MEDIA_SINGLE_DEST_CAROUSEL_WEBSITE = 23;
+  MIXED_MEDIA_MULTI_DEST_CAROUSEL_APP = 24;
+  MIXED_MEDIA_MULTI_DEST_CAROUSEL_WEBSITE = 25;
+  MODEL_EXPLORER_WEBSITE = 26;
+  VIDEO_PLAYABLE_WEBSITE = 27;
+  IMAGE_COLLECTION_WEBSITE = 29;
+}
+
 message DpaProductInfo {
   int64 product_key = 1;
   bool is_hero = 2;
@@ -1465,6 +1604,8 @@ message AdInfo {
 
   int64 fundingInstrumentId = 16;
 
+  UnifiedCardType unified_card_type = 18;
+
   int64 product_set_id = 19;
   int64 line_item_daily_budget_local_micro = 20;
 
@@ -1473,6 +1614,10 @@ message AdInfo {
   DpaProductInfo dpa_product_info = 22;
 
   EngagementCounts engagement_counts = 23;
+
+  EngagementCounts viewer_advertiser_engagement_counts = 24;
+
+  EngagementCounts viewer_advertiser_conversion_counts = 25;
 }
 
 message UserAdActionMeta {
@@ -1693,7 +1838,7 @@ enum UserActionAggregationType {
   ADS_CHAD_WITH_CONV_TYPES = 27;
   ADS_WITH_KV_AD_HISTORY = 28;
   IMMERSIVE_LONG_DWELL = 29;
-  PLACEHOLDER_30 = 30;
+  DENSE_WITH_LONG_DWELL_HOME_EXCURSION = 30;
   PLACEHOLDER_31 = 31;
   PLACEHOLDER_32 = 32;
 }
@@ -1727,17 +1872,6 @@ enum ResponseFormat {
   RESPONSE_FORMAT_ARROW = 2;
 }
 
-message FetchAggregatedUserActionRequest {
-  int64 user_id = 1;
-  uint32 window_time_ms = 2;
-  UserActionAggregationType aggregation_type = 3;
-  uint32 max_sequence_length = 4;
-  UserActionSequenceSourceDataType sourceDataType = 5;
-  ResponseFormat response_format = 6;
-  optional int64 request_id = 7;
-  optional uint64 seed_post_id = 8;
-}
-
 enum UaasModelType {
   UAAS_MODEL_TYPE_UNSPECIFIED = 0;
   UAAS_MODEL_TYPE_RANKING = 1;
@@ -1752,6 +1886,17 @@ enum UaasProductSurface {
   UAAS_PRODUCT_SURFACE_NOTIF = 4;
   UAAS_PRODUCT_SURFACE_ADS = 5;
   UAAS_PRODUCT_SURFACE_REPLY = 6;
+}
+
+message FetchAggregatedUserActionRequest {
+  int64 user_id = 1;
+  uint32 window_time_ms = 2;
+  UserActionAggregationType aggregation_type = 3;
+  uint32 max_sequence_length = 4;
+  UserActionSequenceSourceDataType sourceDataType = 5;
+  ResponseFormat response_format = 6;
+  optional int64 request_id = 7;
+  optional uint64 seed_post_id = 8;
 }
 
 message FetchAggregatedUserActionRequests {

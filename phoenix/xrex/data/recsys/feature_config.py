@@ -17,6 +17,9 @@ class CategoricalFeature(enum.IntEnum):
     quoteCountBucketSeq = 12
     viewCountBucketSeq = 13
     authorIsNsfwSeq = 14
+    webConvTrackingIntegrationSeq = 15
+    exactPhraseSeq = 16
+    matchedWordFractionBucketSeq = 17
 
 
 COMPUTED_CATEGORICAL_FEATURE_NAMES: frozenset[str] = frozenset(
@@ -30,6 +33,7 @@ COMPUTED_CATEGORICAL_FEATURE_NAMES: frozenset[str] = frozenset(
         "quoteCountBucketSeq",
         "viewCountBucketSeq",
         "authorIsNsfwSeq",
+        "matchedWordFractionBucketSeq",
     }
 )
 
@@ -44,8 +48,11 @@ class BoolFeature(enum.IntEnum):
     isAuthorFollowingViewerSeq = 2
 
 
+WEB_CONV_TRACKING_INTEGRATION_CARDINALITY = 8
+
+
 class FloatFeature(enum.IntEnum):
-    pass
+    matchedWordFractionSeq = 1
 
 
 class Int64Feature(enum.IntEnum):
@@ -59,6 +66,8 @@ class Int64Feature(enum.IntEnum):
     ipAddressSeq = 10
     firstDpaProductKey = 11
     firstDpaProductKeyHash2 = 12
+    webConvTimeOnSiteInferredMsSeq = 13
+    webConvTimeOnSiteMeasuredMsSeq = 14
 
 
 COMPUTED_INT64_FEATURE_NAMES: frozenset[str] = frozenset({"firstDpaProductKeyHash2"})
@@ -72,6 +81,7 @@ ADS_PRODUCT_KEY_HASH_BIAS_2 = 393_342_739
 ADS_PRODUCT_KEY_HASH_MODULUS = 2_147_483_647
 
 STALE_POST_14D_TTL_SEC = 1_213_200
+STALE_POST_30D_TTL_SEC = 2_595_600
 
 
 CATEGORICAL_FEATURES: list[str] = [f.name for f in CategoricalFeature]
@@ -146,7 +156,22 @@ OPTIONAL_COLUMNS: list[str] = [
     "sample_source",
     "valueLabelValidSeq",
     "valueBaselineMeanUsdSeq",
-    "conversionKeepMask",
+    "conversionKeepBits",
+    "conversionDelayMsSeq",
+    "conversionDelayMsSeq_KEY",
+    "conversionDelayMsSeq_PURCHASE",
+    "conversionDelayMsSeq_SIGN_UP",
+    "conversionDelayMsSeq_CUSTOM",
+    "conversionDelayMsSeq_ADD_TO_CART",
+    "conversionDelayMsSeq_CHECKOUT_INITIATED",
+    "webConvTimeOnSiteInferredMsSeq",
+    "webConvTimeOnSiteMeasuredMsSeq",
+    "webConvTrackingIntegrationSeq",
+    "exactPhraseSeq",
+    "matchedWordFractionSeq",
+    "lexicalTextSeq",
+    "lexicalQuerySeq",
+    "lexicalAuthorSeq",
 ]
 
 

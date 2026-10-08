@@ -185,7 +185,7 @@ public abstract class Filter extends ASTNode<Runtime> {
           return combine(previousFilteredObjects, thisBatchFilteredObjects);
         });
 
-    if (remainingElements == elementsThisRound) { 
+    if (remainingElements == elementsThisRound) {
       return currentFilteredObjectsFuture;
     }
 

@@ -293,7 +293,7 @@ fn test_assign_sparse_gaps_beyond_ideal() {
 fn test_no_ads() {
     let blender = SafeGapAdsBlender::default();
     let posts = vec![make_post(1), make_post(2), make_post(3)];
-    let result = blender.blend(posts, vec![]);
+    let result = blender.blend(posts, vec![], &mut Vec::new());
 
     assert_eq!(result.len(), 3);
     for (i, item) in result.iter().enumerate() {
@@ -305,7 +305,7 @@ fn test_no_ads() {
 #[test]
 fn test_no_posts() {
     let blender = SafeGapAdsBlender::default();
-    let result = blender.blend(vec![], vec![make_ad(100), make_ad(200)]);
+    let result = blender.blend(vec![], vec![make_ad(100), make_ad(200)], &mut Vec::new());
     assert_eq!(result.len(), 0);
 }
 
@@ -313,7 +313,7 @@ fn test_no_posts() {
 fn test_too_few_posts_skips_ads() {
     let blender = SafeGapAdsBlender::default();
     let posts: Vec<_> = (1..=4).map(make_post).collect();
-    let result = blender.blend(posts, vec![make_ad(100), make_ad(200)]);
+    let result = blender.blend(posts, vec![make_ad(100), make_ad(200)], &mut Vec::new());
 
     assert_eq!(result.len(), 4);
     assert_eq!(ad_count(&result), 0);

@@ -6,7 +6,7 @@ use xai_stats_receiver::{global_stats_receiver, HistogramBuckets};
 use super::types::{FailureKind, FallbackReason, LabelSource};
 
 const REQUESTS: &str = "safety_labels_lookup_requests";
-const LATENCY_MS: &str = "safety_labels_lookup_latency_ms";
+const LATENCY_MS: &str = "safety_labels_lookup_latency_ms_vm";
 const LOOKUP_TWEET_IDS: &str = "safety_labels_lookup_tweet_ids";
 const FAILURES: &str = "safety_labels_lookup_failures";
 const SOURCE_REQUESTS: &str = "safety_labels_source_requests";
@@ -91,12 +91,7 @@ impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
         let outcome = <&str>::from(self.outcome.get());
         incr(REQUESTS, &[("outcome", outcome)], 1);
-        observe(
-            LATENCY_MS,
-            &[],
-            self.start.elapsed().as_secs_f64() * 1000.0,
-            HistogramBuckets::Bucket0To50,
-        );
+        observe_vm(LATENCY_MS, &[], self.start.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -186,5 +181,32 @@ fn observe(metric: &str, labels: &[(&str, &str)], value: f64, buckets: Histogram
 fn observe_vm(metric: &str, labels: &[(&str, &str)], value: f64) {
     if let Some(sr) = global_stats_receiver() {
         sr.observe_vm(metric, labels, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use xai_visibility_filtering::tweet_safety_label::{
+        BATCH_LATENCY_VM_METRIC, LATENCY_VM_METRIC,
+    };
+
+    use super::LATENCY_MS;
+
+    #[test]
+    fn dashboard_generator_pins_the_get_safety_labels_vm_latency_metrics() {
+        let cargo = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/dashboard.py");
+        let ws = "crates/x-product/xai-visibility-filtering-service/scripts/dashboard.py";
+        let path = if Path::new(cargo).exists() { cargo } else { ws };
+        let dashboard = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        for pin in [
+            format!("LOOKUP_LATENCY_VM_METRIC = \"{LATENCY_MS}\""),
+            format!("VF_CLIENT_LATENCY_VM_METRIC = \"{LATENCY_VM_METRIC}\""),
+            format!("VF_CLIENT_BATCH_LATENCY_VM_METRIC = \"{BATCH_LATENCY_VM_METRIC}\""),
+        ] {
+            assert!(dashboard.contains(&pin), "dashboard.py is missing `{pin}`");
+        }
     }
 }

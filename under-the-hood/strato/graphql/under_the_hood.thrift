@@ -1,9 +1,12 @@
 
+include "com/twitter/timelines/render/richtext.thrift"
+
 struct UnderTheHoodReportInfo {
   1: optional string reportPeriod
   2: optional map<string, bool> eligibilityChecks (
     strato.graphql.typename = "UnderTheHoodReportEligibilityCheckEntry"
   )
+  3: optional richtext.RichText note
 } (strato.graphql.typename = "UnderTheHoodReportInfo")
 
 struct UnderTheHoodReport {

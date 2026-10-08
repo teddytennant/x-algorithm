@@ -42,9 +42,9 @@ import cutlass.cute as cute
 import cutlass.utils as utils_basic
 from cutlass import Int32
 from cutlass.cute.nvgpu import cpasync, warp
-from quack import layout_utils
-from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.quack import layout_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import ampere_helpers as sm80_utils
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.block_sparse_utils import get_block_sparse_iteration_info_bwd

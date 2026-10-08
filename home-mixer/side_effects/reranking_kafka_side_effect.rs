@@ -1,6 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::scorers::ranking_scorer::{ScoringWeights, WEIGHTED_VALUE_MODEL_MODE};
+use crate::scorers::value_model;
 use prost::Message;
 use rand::random;
 use std::collections::HashMap;
@@ -12,6 +12,8 @@ use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_home_mixer_proto as pb;
 
 const TOP_K: usize = 50;
+
+const WEIGHTED_VALUE_MODEL_MODE: &str = "weighted";
 
 pub struct RerankingKafkaSideEffect {
     kafka_client: Arc<dyn KafkaPublisherClient>,
@@ -83,7 +85,7 @@ impl SideEffect<ScoredPostsQuery, PostCandidate> for RerankingKafkaSideEffect {
             total_candidates_count: Some(total_count),
             request_join_id: Some(input.query.request_id),
             product_surface: product_surface.into(),
-            applied_weights: ScoringWeights::from_params(&input.query.params).applied_weights_map(),
+            applied_weights: value_model::applied_weights(&input.query),
             value_model_mode: Some(WEIGHTED_VALUE_MODEL_MODE.to_string()),
         };
 
@@ -149,11 +151,6 @@ fn build_scored_candidate(candidate: &PostCandidate, position: i32) -> pb::Score
         "click_dwell_time",
         s.click_dwell_time,
     );
-    insert_score(
-        &mut prediction_scores,
-        "active_secs_5m_residual_norm",
-        s.active_secs_5m_residual_norm,
-    );
 
     let source_tweet_id = candidate.retweeted_tweet_id.unwrap_or(candidate.tweet_id);
 
@@ -190,7 +187,7 @@ mod tests {
     };
 
     fn default_weights_map() -> HashMap<String, f64> {
-        ScoringWeights::from_params(&xai_feature_switches::Params::default()).applied_weights_map()
+        value_model::applied_weights(&ScoredPostsQuery::default())
     }
 
     #[test]
@@ -240,7 +237,6 @@ mod tests {
                 not_dwelled_score: Some(0.4),
                 post_unexplored_score: Some(0.5),
                 click_dwell_time: Some(1.5),
-                active_secs_5m_residual_norm: Some(0.6),
                 ..Default::default()
             },
             ..Default::default()
@@ -251,10 +247,6 @@ mod tests {
         assert_eq!(scored.prediction_scores["not_dwelled"], 0.4);
         assert_eq!(scored.prediction_scores["post_unexplored"], 0.5);
         assert_eq!(scored.prediction_scores["click_dwell_time"], 1.5);
-        assert_eq!(
-            scored.prediction_scores["active_secs_5m_residual_norm"],
-            0.6
-        );
     }
 
     #[test]

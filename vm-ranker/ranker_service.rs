@@ -13,23 +13,32 @@ use crate::metrics::{
     Timer, IN_FLIGHT_REQUESTS, REJECTED_REQUESTS, SCORE_CANDIDATES_IN, SCORE_DURATION,
     SCORE_ERRORS, SCORE_REQUESTS,
 };
-use crate::scoring::DppContext;
+use crate::ranking_config::RankingConfig;
+use crate::scoring::{DppContext, RankContext};
 
 pub struct VMRankerServiceImpl {
     request_semaphore: Arc<Semaphore>,
     dpp: Option<DppContext>,
+    config: Option<Arc<RankingConfig>>,
 }
 
 impl VMRankerServiceImpl {
-    pub fn new(max_concurrent_requests: usize, dpp: Option<DppContext>) -> Self {
+    pub fn new(
+        max_concurrent_requests: usize,
+        dpp: Option<DppContext>,
+        config: Option<Arc<RankingConfig>>,
+    ) -> Self {
+        let enabled = |on: bool| if on { "enabled" } else { "disabled" };
         info!(
-            "Initializing VMRankerService with max_concurrent_requests={}, dpp={}",
+            "Initializing VMRankerService with max_concurrent_requests={}, dpp={}, ranking_config={}",
             max_concurrent_requests,
-            if dpp.is_some() { "enabled" } else { "disabled" },
+            enabled(dpp.is_some()),
+            enabled(config.is_some()),
         );
         Self {
             request_semaphore: Arc::new(Semaphore::new(max_concurrent_requests)),
             dpp,
+            config,
         }
     }
 
@@ -85,16 +94,18 @@ impl VmRankerService for VMRankerServiceImpl {
         SCORE_CANDIDATES_IN
             .with_label_values(&[model_id])
             .observe(num_candidates as f64);
-        let result = crate::scoring::rank(req, self.dpp.as_ref())
-            .await
-            .map_err(|e| {
-                warn!(
-                    "rank failed: viewer={} value_model_id='{}': {}",
-                    viewer_id, model_id, e
-                );
-                SCORE_ERRORS.with_label_values(&[model_id]).inc();
-                Status::internal(e)
-            })?;
+        let ctx = RankContext {
+            dpp: self.dpp.clone(),
+            config: self.config.clone(),
+        };
+        let result = crate::scoring::rank(req, ctx).await.map_err(|e| {
+            warn!(
+                "rank failed: viewer={} value_model_id='{}': {}",
+                viewer_id, model_id, e
+            );
+            SCORE_ERRORS.with_label_values(&[model_id]).inc();
+            Status::internal(e)
+        })?;
 
         if rand::rng().random_ratio(1, 1000) {
             info!(

@@ -2,12 +2,18 @@ use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
 use log::info;
+use std::sync::Arc;
 use std::time::Duration;
 use tonic::service::Routes;
 use xai_http_server::{CancellationToken, GrpcConfig, HttpServer};
 
 use xai_vm_ranker::{
-    args::Args, dpp::DppConfig, embedding_store, ranker_service::VMRankerServiceImpl,
+    args::Args,
+    config_sync::{ConfigSync, ConfigSyncOptions},
+    dpp::DppConfig,
+    embedding_store,
+    ranker_service::VMRankerServiceImpl,
+    ranking_config::RankingConfig,
     scoring::DppContext,
 };
 
@@ -43,7 +49,48 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    let ranker_service = VMRankerServiceImpl::new(args.max_concurrent_requests, dpp);
+    let process_overrides = xai_feature_switches::parse_fs_overrides(
+        &std::env::var("XAI_FS_OVERRIDES").unwrap_or_default(),
+    );
+    if !process_overrides.is_empty() {
+        info!(
+            "process-wide feature-switch overrides (staging pins): {:?}",
+            process_overrides.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+    }
+    let ranking_config = if args.config_sync_enabled {
+        let sync = ConfigSync::start(ConfigSyncOptions {
+            remote: args.config_sync_remote.clone(),
+            branch: args.config_sync_branch.clone(),
+            root: args.config_sync_root.clone(),
+            interval: Duration::from_secs(args.config_sync_interval_secs.max(5)),
+            initial_sync_timeout: Duration::from_secs(args.config_sync_initial_timeout_secs),
+        })
+        .await
+        .context("initial config sync failed")?;
+        let config = Arc::new(
+            RankingConfig::load(
+                &ConfigSync::features_path(&args.config_sync_root),
+                &ConfigSync::abdecider_path(&args.config_sync_root),
+                process_overrides,
+                args.fs_impressions_datacenter.as_deref(),
+            )
+            .await?,
+        );
+        info!(
+            "ranking config loaded at revision {}; the feature-switch engine re-reads the synced files every 30s; impressions={}",
+            sync.revision().unwrap_or_default(),
+            args.fs_impressions_datacenter.as_deref().unwrap_or("off")
+        );
+        sync.spawn_poller();
+        Some(config)
+    } else {
+        info!("config sync disabled; ranking parameters are not resolved");
+        None
+    };
+
+    let ranker_service =
+        VMRankerServiceImpl::new(args.max_concurrent_requests, dpp, ranking_config);
     info!(
         "Initialized VMRankerService with max_concurrent_requests={}",
         args.max_concurrent_requests

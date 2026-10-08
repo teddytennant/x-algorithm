@@ -18,15 +18,15 @@ impl Source<ScoredPostsQuery, FeedItem> for ScoredPostsSource {
             .await
             .map_err(|e| format!("ScoredPostsSource: {e}"))?;
 
-        let feed_items = output
-            .scored_posts
-            .into_iter()
-            .map(|post| FeedItem {
-                position: 0,
-                item: Some(feed_item::Item::Post(post)),
-            })
-            .collect();
+        let posts = output.scored_posts.into_iter().map(|post| FeedItem {
+            position: 0,
+            item: Some(feed_item::Item::Post(post)),
+        });
+        let video_carousel = output.video_carousel.map(|carousel| FeedItem {
+            position: 0,
+            item: Some(feed_item::Item::VideoCarousel(carousel)),
+        });
 
-        Ok(feed_items)
+        Ok(posts.chain(video_carousel).collect())
     }
 }

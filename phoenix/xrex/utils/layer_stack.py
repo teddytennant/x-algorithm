@@ -177,7 +177,7 @@ class _LayerStack:
     def __init__(
         self,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
@@ -267,24 +267,11 @@ class _LayerStack:
             lifted_state = _apply_generator_fn_to_parameter_states(params, state)
         scanned = LayerStackScanned(params=params, rng=rng, state=lifted_state, args_ys=args_ys)
 
-        if self._unroll == self._count:
-            yss = []
-            states = []
-            for i in range(self._count):
-                xs = jax.tree.map(lambda x, i=i: x[i], scanned)
-                carry, (ys, state) = layer(carry, xs)
-                yss.append(ys)
-                states.append(state)
-
-            states = jax.tree.map(jnp.stack, *states)
-            updater.update(states)
-            return carry.x, jax.tree.map(jnp.stack, *yss)
-        else:
-            carry, (zs, states) = self._scan_impl(
-                layer, carry, scanned, length=count, unroll=self._unroll, reverse=reverse
-            )
-            updater.update(states)
-            return carry.x, zs
+        carry, (zs, states) = self._scan_impl(
+            layer, carry, scanned, length=count, unroll=self._unroll, reverse=reverse
+        )
+        updater.update(states)
+        return carry.x, zs
 
     def _call_wrapped(
         self,
@@ -300,7 +287,7 @@ class _LayerStackNoPerLayer(_LayerStack):
         self,
         f: WrappedFn,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
@@ -331,7 +318,7 @@ class _LayerStackWithPerLayer(_LayerStack):
         self,
         f: WrappedFn,
         count: int,
-        unroll: int,
+        unroll: bool,
         pass_reverse_to_layer_fn: bool = False,
         transparency_map: TransparencyMapping | None = None,
         name: str = "",
@@ -355,7 +342,7 @@ class _LayerStackWithPerLayer(_LayerStack):
 def layer_stack(
     num_layers: int,
     with_per_layer_inputs=False,
-    unroll: int = 1,
+    unroll: bool = False,
     pass_reverse_to_layer_fn: bool = False,
     transparent: bool = False,
     transparency_map: TransparencyMapping | None = None,

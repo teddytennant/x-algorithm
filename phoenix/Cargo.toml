@@ -9,6 +9,8 @@ members = [
     "crates/serving/xai-recsys-proto",
     "crates/serving/xai-recsys-server",
     "crates/serving/xai-recsys-sid-proto",
+    "crates/serving/xai-recsys-sid-retrieval",
+    "crates/serving/xai-recsys-sid-retrieval-proto",
     "crates/storage/xai-o2",
 ]
 
@@ -17,6 +19,7 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
+arc-swap = "1.7"
 arrow = { version = "59", features = ["ipc_compression"] }
 async-trait = "0.1"
 autometrics = { version = "2", features = ["prometheus-exporter"] }
@@ -44,6 +47,7 @@ libc = "0.2"
 log = { version = "0.4", features = ["kv", "kv_unstable"] }
 md5 = "0.8"
 memmap2 = "0.9.8"
+moka = "0.12"
 murmur3 = "0.5.2"
 nix = { version = "0.30", features = ["poll", "process", "signal", "sched", "term", "mount", "fs", "ioctl", "mman", "reboot", "user"] }
 num = "0.4.3"
@@ -61,6 +65,7 @@ rayon = "1"
 rcgen = { version = "0.13", features = ["pem"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 scopeguard = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serial_test = "3"
 simd-adler32 = "0.3.7"
@@ -78,6 +83,7 @@ tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
 tower = "0.5"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "smallvec", "tracing-log", "std", "ansi"] }
 url = "2"
 xai-o2 = { path = "crates/storage/xai-o2" }
 xai-recsys = { path = "crates/common/xai-recsys" }
@@ -85,6 +91,7 @@ xai-recsys-mm-server = { path = "crates/serving/xai-recsys-mm-server" }
 xai-recsys-proto = { path = "crates/serving/xai-recsys-proto" }
 xai-recsys-server = { path = "crates/serving/xai-recsys-server" }
 xai-recsys-sid-proto = { path = "crates/serving/xai-recsys-sid-proto" }
+xai-recsys-sid-retrieval-proto = { path = "crates/serving/xai-recsys-sid-retrieval-proto" }
 zstd = "0.13"
 
 [workspace.lints.clippy]

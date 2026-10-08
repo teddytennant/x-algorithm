@@ -1,3 +1,4 @@
+use crate::ads::drops::logged_ad_info;
 use crate::models::query::{RequestType, ScoredPostsQuery};
 use crate::params::{AdsBlenderType, EnableAdsBrandSafetyVerdictV2, EnableAdsInjectionLogging};
 use prost::Message;
@@ -13,7 +14,7 @@ use xai_candidate_pipeline::component_library::utils::is_prod;
 use xai_candidate_pipeline::side_effect::{SideEffect, SideEffectInput};
 use xai_core_entities::entities::SubscriptionLevel as CoreSubscriptionLevel;
 use xai_home_mixer_proto::{feed_item, FeedItem};
-use xai_recsys_proto::{AdAdjacencyControl, AdIndexInfo, ProductSurface};
+use xai_recsys_proto::ProductSurface;
 use xai_served_impression_proto::served_impression::DisplayLocation;
 
 #[derive(Clone)]
@@ -106,6 +107,7 @@ impl SideEffect<ScoredPostsQuery, FeedItem> for AdsInjectionLoggingSideEffect {
                 RequestType::Following => "following".to_string(),
                 _ => query.params.get(AdsBlenderType),
             },
+            dropped_ads: query.ad_drops.take(),
         };
 
         let bytes = timeline.encode_to_vec();
@@ -128,6 +130,7 @@ fn build_timeline_entry(item: &FeedItem, position: usize) -> TimelineEntry {
             brand_safety_verdict: post.brand_safety_verdict,
             ad_info: None,
             safety_labels: post.safety_label_types.clone(),
+            nsfw_author_ads: post.nsfw_author_ads,
         },
         Some(feed_item::Item::Ad(ad)) => TimelineEntry {
             tweet_id: ad.post_id as u64,
@@ -136,32 +139,20 @@ fn build_timeline_entry(item: &FeedItem, position: usize) -> TimelineEntry {
             promoted: true,
             impression_id: ad.impression_id as u64,
             brand_safety_verdict: 0,
-            ad_info: Some(slim_ad_info(ad)),
+            ad_info: Some(logged_ad_info(ad)),
             safety_labels: vec![],
+            nsfw_author_ads: false,
         },
         Some(feed_item::Item::WhoToFollow(_))
         | Some(feed_item::Item::Prompt(_))
         | Some(feed_item::Item::PushToHome(_))
         | Some(feed_item::Item::Frame(_))
         | Some(feed_item::Item::FeedSurvey(_))
+        | Some(feed_item::Item::VideoCarousel(_))
         | None => TimelineEntry {
             position: position as i32,
             ..Default::default()
         },
-    }
-}
-
-fn slim_ad_info(ad: &AdIndexInfo) -> AdIndexInfo {
-    AdIndexInfo {
-        account_id: ad.account_id,
-        ad_adjacency_control: ad
-            .ad_adjacency_control
-            .as_ref()
-            .map(|c| AdAdjacencyControl {
-                brand_safety_risk: c.brand_safety_risk,
-                ..Default::default()
-            }),
-        ..Default::default()
     }
 }
 

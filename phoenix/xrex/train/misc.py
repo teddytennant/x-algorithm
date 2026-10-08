@@ -113,6 +113,7 @@ class PostEmbeddings(NamedTuple):
     author_ids: jax.Array
     embeddings: Parameter
     dataset_types: jax.Array
+    mol_side_table: Parameter | None = None
 
 
 class RecsysInferenceState(NamedTuple):

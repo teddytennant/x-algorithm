@@ -112,7 +112,7 @@ public interface RegexCache {
             if (!limited || list.size() < limit - 1) {
               list.add(str.substring(off, next));
               off = next + 1;
-            } else {    
+            } else {
               list.add(str.substring(off, str.length()));
               off = str.length();
               break;

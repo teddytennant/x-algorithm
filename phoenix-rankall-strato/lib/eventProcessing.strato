@@ -239,6 +239,16 @@ def isReply(post: Tweet): Boolean = {
   post.coreData.map { core => core.reply.nonEmpty }.getOrElse(false)
 }
 
+def isSelfReply(post: Tweet): Boolean = {
+  post.coreData.map { core =>
+    core.reply.map { reply => reply.inReplyToUser == core.user }.getOrElse(false)
+  }.getOrElse(false)
+}
+
+def hasMinFavoriteCount(engagementCount: Option[EngagementCount], minFavorites: Long): Boolean = {
+  engagementCount.flatMap { ec => ec.favoriteCount }.getOrElse(0L) >= minFavorites
+}
+
 def isCommunityPost(post: Tweet): Boolean = {
   post.communities.nonEmpty
 }
@@ -640,6 +650,8 @@ Library({
     videoDurationMs = videoDurationMs,
     getAuthorId = getAuthorId,
     isReply = isReply,
+    isSelfReply = isSelfReply,
+    hasMinFavoriteCount = hasMinFavoriteCount,
     isCommunityPost = isCommunityPost,
     isAdultPost = isAdultPost,
     isNsfwPost = isNsfwPost,

@@ -56,9 +56,9 @@ from cutlass.cutlass_dsl import (
 from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 from cutlass.utils.hardware_info import HardwareInfo
-from quack.cute_dsl_utils import ParamsBase
 
 import xrex.cutedsl.ranker_fa4.utils as utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4.fast_math import clz
 
 

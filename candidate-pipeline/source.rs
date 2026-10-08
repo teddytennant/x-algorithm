@@ -2,7 +2,7 @@ use std::any::{type_name_of_val, Any};
 use tonic::async_trait;
 
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
-use crate::pipeline_summary::record_source_fetched;
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use tracing::error;
@@ -19,13 +19,15 @@ where
 
     #[xai_stats_macro::receive_stats(size=Bucket500To1000)]
     #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "source", fields(name = self.name()))]
-    async fn run(&self, query: &Q, _stage: PipelineStage) -> Result<Vec<C>, String> {
+    async fn run(&self, query: &Q, stage: PipelineStage) -> Result<Vec<C>, String> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         match self.source(query).await {
             Ok(candidates) => {
-                record_source_fetched(self.name(), candidates.len());
+                stats.finish_source(candidates.len());
                 Ok(candidates)
             }
             Err(err) => {
+                stats.finish();
                 error!("{} Failed: {}", self.name(), err);
                 Err(err)
             }

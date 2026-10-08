@@ -41,9 +41,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import Arch, BaseDSL
-from quack import copy_utils, layout_utils
-from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.quack import copy_utils, layout_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfo
 from xrex.cutedsl.ranker_fa4.tile_scheduler import (

@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from xai_configlib import Config, configclass
 from xai_proto import recsys_pb2
 from xrex.cuda.top_k_by_key import top_k_by_key
+from xrex.data.cold_pool_filter import DEFAULT_COLD_START_MAX_AGE_SECONDS
 from xrex.data.recsys.constants import action_type_map
 from xrex.data.recsys.recsys_batch import EmbeddingType
 from xrex.data.recsys.safety_filter import (
@@ -64,6 +65,7 @@ from xrex.utils.utils import Summary
 
 logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
+QUERY_HEAD_RECENCY_SCALE_TOKENS = 16.0
 EPS = 1e-12
 INF = 1e12
 
@@ -518,6 +520,231 @@ def _compute_retrieval_metrics(
     }
 
 
+class MolScorer(typing.NamedTuple):
+    adapter_v: jax.Array
+    adapter_u: jax.Array
+    gate_w1: jax.Array
+    gate_b1: jax.Array
+    gate_w2: jax.Array
+    gate_b2: jax.Array
+    gate_user_w: jax.Array | None = None
+    gate_item_w: jax.Array | None = None
+
+    def item_components(self, items: jax.Array) -> jax.Array:
+        x = items.astype(jnp.float32)
+        delta = jnp.einsum("...d,ldr->...lr", x, self.adapter_v)
+        delta = jnp.einsum("...lr,lrd->...ld", delta, self.adapter_u).astype(items.dtype)
+        comps = items[..., None, :] + delta
+        sq = jnp.sum(jnp.square(comps.astype(jnp.float32)), axis=-1, keepdims=True)
+        inv_norm = jax.lax.rsqrt(jnp.maximum(sq, EPS)).astype(items.dtype)
+        return comps * inv_norm
+
+    def mix(self, cosines: jax.Array, bias: jax.Array | None = None) -> jax.Array:
+        flat = cosines.reshape(*cosines.shape[:-2], -1)
+        pre = flat.astype(jnp.bfloat16) @ self.gate_w1.astype(jnp.bfloat16)
+        hidden = jax.nn.silu(pre + self.gate_b1.astype(jnp.bfloat16))
+        logits = (hidden @ self.gate_w2.astype(jnp.bfloat16)).astype(jnp.float32) + self.gate_b2
+        if bias is not None:
+            logits = logits + bias
+        gate = jax.nn.softmax(logits, axis=-1)
+        return jnp.sum(gate * flat.astype(jnp.float32), axis=-1)
+
+    def user_gate_bias(self, users: jax.Array) -> jax.Array | None:
+        if self.gate_user_w is None:
+            return None
+        return users[:, 0].astype(jnp.float32) @ self.gate_user_w
+
+    def item_gate_bias(self, items: jax.Array) -> jax.Array | None:
+        if self.gate_item_w is None:
+            return None
+        return items.astype(jnp.float32) @ self.gate_item_w
+
+    @staticmethod
+    def _combined_bias(user_bias: jax.Array | None, item_bias: jax.Array | None):
+        if user_bias is None and item_bias is None:
+            return None
+        bias = 0.0
+        if user_bias is not None:
+            bias = bias + user_bias
+        if item_bias is not None:
+            bias = bias + item_bias
+        return bias
+
+    def pair_scores_from_components(
+        self, users: jax.Array, comps: jax.Array, item_bias: jax.Array | None
+    ) -> jax.Array:
+        cos = jnp.einsum("bkd,nld->bnkl", users.astype(comps.dtype), comps)
+        user_bias = self.user_gate_bias(users)
+        bias = self._combined_bias(
+            None if user_bias is None else user_bias[:, None, :],
+            None if item_bias is None else item_bias[None, :, :],
+        )
+        return self.mix(cos, bias)
+
+    def pair_scores(self, users: jax.Array, items: jax.Array, user_chunk: int = 0) -> jax.Array:
+        comps = self.item_components(items)
+        item_bias = self.item_gate_bias(items)
+        batch_size = users.shape[0]
+        if user_chunk <= 0 or user_chunk >= batch_size or batch_size % user_chunk != 0:
+            return self.pair_scores_from_components(users, comps, item_bias)
+
+        def one(u):
+            return self.pair_scores_from_components(u, comps, item_bias)
+
+        out = jax.lax.map(
+            jax.checkpoint(one),
+            users.reshape(batch_size // user_chunk, user_chunk, *users.shape[1:]),
+        )
+        return out.reshape(batch_size, -1)
+
+    def per_candidate_scores(self, users: jax.Array, items: jax.Array) -> jax.Array:
+        comps = self.item_components(items)
+        cos = jnp.einsum("bkd,bcld->bckl", users.astype(comps.dtype), comps)
+        user_bias = self.user_gate_bias(users)
+        bias = self._combined_bias(
+            None if user_bias is None else user_bias[:, None, :], self.item_gate_bias(items)
+        )
+        return self.mix(cos, bias)
+
+    def serving_side_tables(
+        self, posts: jax.Array, post_scales: jax.Array | None = None
+    ) -> tuple[jax.Array, jax.Array]:
+        L, D, R = self.adapter_v.shape
+        kl = self.gate_w1.shape[0]
+        item_w = (
+            self.gate_item_w if self.gate_item_w is not None else jnp.zeros((D, kl), jnp.float32)
+        )
+        proj = jnp.concatenate(
+            [self.adapter_v[l] for l in range(L)]
+            + [jnp.transpose(self.adapter_u[l]) for l in range(L)]
+            + [item_w],
+            axis=1,
+        ).astype(jnp.bfloat16)
+        x = posts.astype(jnp.bfloat16)
+        y = jnp.dot(x, proj, preferred_element_type=jnp.float32)
+        sq = jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)
+        if post_scales is not None:
+            y = y * post_scales[:, None]
+            sq = sq * jnp.square(post_scales)
+        rows = posts.shape[0]
+        t = y[:, : L * R].reshape(rows, L, R)
+        u_t = y[:, L * R : 2 * L * R].reshape(rows, L, R)
+        gram = jnp.einsum("lrd,lsd->lrs", self.adapter_u, self.adapter_u)
+        sq_norms = (
+            sq[:, None]
+            + 2.0 * jnp.sum(t * u_t, axis=-1)
+            + jnp.einsum("mlr,lrs,mls->ml", t, gram, t)
+        )
+        norms = jnp.sqrt(jnp.maximum(sq_norms, EPS))
+        return jnp.transpose(norms), jnp.transpose(y[:, 2 * L * R :])
+
+    def side_table_rows(self, posts: jax.Array) -> jax.Array:
+        norms, ibias = self.serving_side_tables(posts)
+        return jnp.concatenate([jnp.transpose(norms), jnp.transpose(ibias)], axis=1)
+
+    def sharded_serving_side_tables(self, posts: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return _mol_side_tables_chunked(self, posts.astype(jnp.bfloat16), None)
+
+    def transformed_queries(self, users: jax.Array) -> jax.Array:
+        u = users.astype(jnp.float32)
+        t = jnp.einsum("bkd,lrd->bklr", u, self.adapter_u)
+        t = jnp.einsum("bklr,ldr->bkld", t, self.adapter_v)
+        return u[:, :, None, :] + t
+
+    def chunked_pair_scores(self, users: jax.Array, items: jax.Array, chunk: int) -> jax.Array:
+        comps = self.item_components(items)
+        item_bias = self.item_gate_bias(items)
+        batch_size = users.shape[0]
+        chunk = min(chunk, batch_size)
+        assert batch_size % chunk == 0, (
+            f"eval users {batch_size} must be divisible by mol_eval_user_chunk {chunk}"
+        )
+
+        def one(u):
+            return self.pair_scores_from_components(u, comps, item_bias).astype(jnp.bfloat16)
+
+        out = jax.lax.map(one, users.reshape(batch_size // chunk, chunk, *users.shape[1:]))
+        return out.reshape(batch_size, -1)
+
+
+def _mol_side_tables_chunked(
+    scorer: MolScorer,
+    posts: jax.Array,
+    post_scales: jax.Array | None,
+    max_chunk_rows: int = 1 << 22,
+) -> tuple[jax.Array, jax.Array]:
+    rows, width = posts.shape
+    chunk = next(c for c in range(min(rows, max_chunk_rows), 0, -1) if rows % c == 0)
+    blocks = posts.reshape(rows // chunk, chunk, width)
+    if post_scales is None:
+        norms, ibias = jax.lax.map(scorer.serving_side_tables, blocks)
+    else:
+        norms, ibias = jax.lax.map(
+            lambda args: scorer.serving_side_tables(*args),
+            (blocks, post_scales.reshape(rows // chunk, chunk)),
+        )
+    return (
+        jnp.transpose(norms, (1, 0, 2)).reshape(norms.shape[1], rows),
+        jnp.transpose(ibias, (1, 0, 2)).reshape(ibias.shape[1], rows),
+    )
+
+
+def _mol_transformed_query_dots(
+    q_cb: jax.Array, posts: jax.Array, post_scales: jax.Array | None
+) -> jax.Array:
+    if post_scales is None:
+        return jnp.matmul(q_cb.astype(posts.dtype), posts.T)
+    qf = q_cb.astype(jnp.float32)
+    qs = jnp.maximum(jnp.max(jnp.abs(qf), axis=1) / 127.0, 1e-12)
+    qq = jnp.clip(jnp.round(qf / qs[:, None]), -127, 127).astype(jnp.int8)
+    acc = jax.lax.dot_general(qq, posts, (((1,), (1,)), ((), ())), preferred_element_type=jnp.int32)
+    return (acc.astype(jnp.float32) * qs[:, None] * post_scales[None, :]).astype(jnp.bfloat16)
+
+
+def mol_kernel_scores(
+    scorer: MolScorer,
+    users: jax.Array,
+    posts: jax.Array,
+    post_scales: jax.Array | None = None,
+    side_tables: tuple[jax.Array, jax.Array] | None = None,
+) -> jax.Array:
+    from xrex.cuda import mol_epilogue
+
+    if post_scales is None:
+        posts = posts.astype(jnp.bfloat16)
+    if side_tables is None:
+        norms, ibias = _mol_side_tables_chunked(scorer, posts, post_scales)
+    else:
+        norms, ibias = side_tables
+    B, K, D = users.shape
+    q = scorer.transformed_queries(users)
+    L = q.shape[2]
+    kl = K * L
+    q_cb = jnp.transpose(q, (1, 2, 0, 3)).reshape(kl * B, D)
+    dots = _mol_transformed_query_dots(q_cb, posts, post_scales)
+    ubias = scorer.user_gate_bias(users)
+    ubias = jnp.zeros((B, kl), jnp.float32) if ubias is None else ubias.astype(jnp.float32)
+    return mol_epilogue.mol_epilogue(
+        dots,
+        norms,
+        jnp.transpose(ubias),
+        ibias,
+        scorer.gate_w1,
+        scorer.gate_b1,
+        scorer.gate_w2,
+        scorer.gate_b2,
+        num_users=B,
+        num_components=L,
+    )
+
+
+def positive_count_user_weight(per_user_count: jax.Array, power: float) -> jax.Array:
+    valid_user = per_user_count > 0
+    num_valid_users = jnp.sum(valid_user.astype(jnp.float32))
+    weight = jnp.where(valid_user, jnp.maximum(per_user_count, 1.0) ** power, 0.0)
+    return weight * num_valid_users / jnp.maximum(jnp.sum(weight), 1e-6)
+
+
 def compute_retrieval_loss(
     batch: RecsysFeaturesBatch,
     user_representation: jax.Array,
@@ -540,6 +767,11 @@ def compute_retrieval_loss(
     safety_filter_bits: int = 0b11,
     safety_filter_soft_weight: float = 0.0,
     safety_filter_apply_to_candidates: bool = False,
+    own_negative_logit_offset: float = 0.0,
+    positive_count_user_weight_power: float = 0.0,
+    mol_scorer: MolScorer | None = None,
+    mol_train_user_chunk: int = 0,
+    mask_in_batch_false_negatives: bool = False,
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     B, L, _ = candidate_representation.shape
     N = num_global_negatives_per_example
@@ -548,26 +780,42 @@ def compute_retrieval_loss(
         f"candidate_representation.shape[1] ({candidate_representation.shape[1]}) must be candidate_seq_len ({C}) + num_global_negatives_per_example ({N})"
     )
 
+    use_mol = mol_scorer is not None
+
+    @jax.checkpoint
+    def _mol_pair_scores(users, items, scorer):
+        return scorer.pair_scores(users, items, user_chunk=mol_train_user_chunk)
+
+    @jax.checkpoint
+    def _mol_candidate_scores(users, items, scorer):
+        return scorer.per_candidate_scores(users, items)
+
     @shard_map(
         mesh=mesh,
-        in_specs=(P(data_axis), P(data_axis), P(data_axis)),
+        in_specs=(P(data_axis), P(data_axis), P(data_axis), P()),
         out_specs=(P(data_axis), P(data_axis)),
         check_vma=False,
     )
     def _sharded_full_matmul(
-        local_user: jax.Array, local_candidate: jax.Array, padding_mask: jax.Array
+        local_user: jax.Array, local_candidate: jax.Array, padding_mask: jax.Array, scorer
     ) -> tuple[jax.Array, jax.Array]:
         local_B = local_user.shape[0]
 
         if use_in_batch_negatives:
             inbatch_cand = local_candidate[:, :C, :].reshape((local_B * C, -1))
-            inbatch_scores = local_user @ inbatch_cand.T
+            if use_mol:
+                inbatch_scores = _mol_pair_scores(local_user, inbatch_cand, scorer)
+            else:
+                inbatch_scores = local_user @ inbatch_cand.T
 
             inbatch_pad = padding_mask[:, :C].reshape((1, local_B * C))
             inbatch_scores = jnp.where(inbatch_pad, inbatch_scores, -INF)
         else:
             inbatch_cand = local_candidate[:, :C, :]
-            inbatch_scores = jnp.einsum("bd,bcd->bc", local_user, inbatch_cand)
+            if use_mol:
+                inbatch_scores = _mol_candidate_scores(local_user, inbatch_cand, scorer)
+            else:
+                inbatch_scores = jnp.einsum("bd,bcd->bc", local_user, inbatch_cand)
 
             inbatch_pad = padding_mask[:, :C]
             inbatch_scores = jnp.where(inbatch_pad, inbatch_scores, -INF)
@@ -576,7 +824,10 @@ def compute_retrieval_loss(
             global_neg_scores = jnp.array([[0]])
         else:
             global_cand = local_candidate[:, C:, :].reshape((local_B * N, -1))
-            global_neg_scores = local_user @ global_cand.T
+            if use_mol:
+                global_neg_scores = _mol_pair_scores(local_user, global_cand, scorer)
+            else:
+                global_neg_scores = local_user @ global_cand.T
 
             global_pad = padding_mask[:, C:].reshape((1, local_B * N))
             global_neg_scores = jnp.where(global_pad, global_neg_scores, -INF)
@@ -652,7 +903,10 @@ def compute_retrieval_loss(
     ).astype(jnp.bool_)
 
     raw_batch_scores, raw_global_neg_scores = _sharded_full_matmul(
-        user_representation, candidate_representation, candidate_padding_mask
+        user_representation,
+        candidate_representation,
+        candidate_padding_mask,
+        mol_scorer if use_mol else (),
     )
 
     metrics = {}
@@ -665,7 +919,7 @@ def compute_retrieval_loss(
 
     if logq_correction_scale > 0.0:
         tweet_counts = get_candidate_tweet_counts(
-            batch,
+            cast_jax(batch["candidate_seq"]["post_hashes"]),
             log_q_num_bins=100_000_000,
             negative_sample_mask=jnp.ones((B, L), dtype=jnp.bool_),
         )
@@ -710,17 +964,21 @@ def compute_retrieval_loss(
 
     @shard_map(
         mesh=mesh,
-        in_specs=(P(data_axis), P(data_axis)),
-        out_specs=(P(data_axis), P(data_axis)),
+        in_specs=(P(data_axis), P(data_axis), P(data_axis), P(data_axis)),
+        out_specs=(P(data_axis), P(data_axis), P(data_axis)),
         check_vma=False,
     )
     def _rearrange_negatives(
-        batch_scores_shard: jax.Array, global_neg_scores_shard: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        if not use_in_batch_negatives:
-            return batch_scores_shard, global_neg_scores_shard
-
+        batch_scores_shard: jax.Array,
+        global_neg_scores_shard: jax.Array,
+        cand_hash_shard: jax.Array,
+        pos_mask_shard: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
         b = batch_scores_shard.shape[0]
+        n_false_neg = jnp.zeros((b,), dtype=jnp.float32)
+        if not use_in_batch_negatives:
+            return batch_scores_shard, global_neg_scores_shard, n_false_neg
+
         batch_scores_shard = batch_scores_shard.reshape((b, b, C))
 
         self_cands = batch_scores_shard[jnp.arange(b), jnp.arange(b)]
@@ -730,22 +988,42 @@ def compute_retrieval_loss(
         in_batch_negatives = batch_scores_shard[jnp.arange(b)[:, None], off_diag_cols].reshape(
             b, (b - 1) * C
         )
+        if mask_in_batch_false_negatives:
+            col_hash = jnp.broadcast_to(cand_hash_shard[None], (b, b, C))[
+                jnp.arange(b)[:, None], off_diag_cols
+            ].reshape(b, (b - 1) * C)
+            same_post = jnp.any(
+                (col_hash[:, None, :] == cand_hash_shard[:, :, None]) & pos_mask_shard[:, :, None],
+                axis=1,
+            )
+            in_batch_negatives = jnp.where(same_post, -INF, in_batch_negatives)
+            n_false_neg = jnp.sum(same_post.astype(jnp.float32), axis=-1)
 
         if N > 0:
-            return self_cands, jnp.concatenate(
-                [in_batch_negatives, global_neg_scores_shard], axis=1
+            return (
+                self_cands,
+                jnp.concatenate([in_batch_negatives, global_neg_scores_shard], axis=1),
+                n_false_neg,
             )
         else:
-            return self_cands, in_batch_negatives
+            return self_cands, in_batch_negatives, n_false_neg
 
-    self_scores, common_neg_scores = _rearrange_negatives(batch_scores, global_neg_scores)
+    self_scores, common_neg_scores, n_false_neg = _rearrange_negatives(
+        batch_scores,
+        global_neg_scores,
+        batch["candidate_seq"]["post_hashes"][:, :C, 0].astype(jnp.int32),
+        valid_positive_mask,
+    )
     assert isinstance(self_scores, jax.Array)
     assert isinstance(common_neg_scores, jax.Array)
+    metrics["false_negative_cols_per_user"] = jnp.mean(n_false_neg)
 
     numerator_logits = self_scores
 
     true_neg_scores = jnp.where(
-        has_hard_negative_actions | has_soft_negative_actions, self_scores, -INF
+        has_hard_negative_actions | has_soft_negative_actions,
+        self_scores + own_negative_logit_offset,
+        -INF,
     )
     denominator_logits = jnp.concatenate([common_neg_scores, true_neg_scores], axis=-1)
 
@@ -798,7 +1076,10 @@ def compute_retrieval_loss(
             return user_user_logits, item_item_logits
 
         user_user_logits, item_item_logits = _sharded_u2u_and_i2i_matmul(
-            user_representation, candidate_representation, candidate_padding_mask, numerator_logits
+            user_representation[:, 0] if user_representation.ndim == 3 else user_representation,
+            candidate_representation,
+            candidate_padding_mask,
+            numerator_logits,
         )
 
         log_denominator = jax.scipy.special.logsumexp(
@@ -818,6 +1099,10 @@ def compute_retrieval_loss(
     batch_mean = jnp.where(per_user_count > 0, per_user_sum / per_user_count, 0.0)
 
     num_valid_users = jnp.sum((per_user_count > 0).astype(jnp.float32))
+    if positive_count_user_weight_power > 0.0:
+        batch_mean = batch_mean * positive_count_user_weight(
+            per_user_count, positive_count_user_weight_power
+        )
     contrastive_loss = jnp.where(
         num_valid_users > 0,
         jnp.sum(batch_mean) / num_valid_users,
@@ -1082,6 +1367,9 @@ class RecsysTwoTowerModel(hk.Module):
             sid_hash_level=_config.sid_hash_level,
             entity_hashes=cast_jax(post_hashes) if needs_hashes else None,
             sid_cross_attn=_config.sid_cross_attn,
+            sid_prefix2_embed_dim=_config.sid_prefix2_embed_dim,
+            sid_prefix3_embed_dim=_config.sid_prefix3_embed_dim,
+            sid_prefix3_rows=_config.sid_prefix3_rows,
         )
 
     def _sid_token_or_zeros_init(self, seq, _config) -> jax.Array | None:
@@ -1253,12 +1541,23 @@ class RecsysTwoTowerModel(hk.Module):
                 counts = jax.ops.segment_sum(valid.reshape(-1), seg_ids, num_segments=num_segments)
                 return summed / jnp.maximum(counts[:, None], 1.0)
 
-            user_representation = _pool(
-                user_outputs, cast_jax(layout.padding_mask), cast_jax(layout.cu_seqlens)
-            )
+            if self.config.user_query_heads > 0:
+                user_representation = self._packed_query_heads(
+                    user_outputs,
+                    cast_jax(layout.padding_mask),
+                    cast_jax(layout.cu_seqlens),
+                    bs_per_device,
+                )
+            else:
+                user_representation = _pool(
+                    user_outputs, cast_jax(layout.padding_mask), cast_jax(layout.cu_seqlens)
+                )
 
             user_representation = with_sharding_constraint(
-                user_representation, P(self.data_axis, None)
+                user_representation,
+                P(self.data_axis, None)
+                if user_representation.ndim == 2
+                else P(self.data_axis, None, None),
             )
         else:
             user_embeddings, user_padding_mask, *_ = pad_to_next_128_multiple(
@@ -1304,6 +1603,11 @@ class RecsysTwoTowerModel(hk.Module):
             user_embedding_sum = jnp.sum(user_embeddings_masked, axis=1)
             user_mask_sum = jnp.sum(user_mask_float, axis=1, keepdims=True)
             user_representation = user_embedding_sum / jnp.maximum(user_mask_sum, 1.0)
+            if self.config.user_query_heads > 0:
+                from_end = jnp.cumsum(user_mask_float[:, ::-1], axis=1)[:, ::-1]
+                user_representation = self._query_heads_pool(
+                    user_outputs, user_mask_float, from_end - 1.0
+                )
 
         num_heads = self.config.candidate_tower_config.num_candidate_heads
         all_candidate_reprs: list[jax.Array] = []
@@ -1322,6 +1626,148 @@ class RecsysTwoTowerModel(hk.Module):
 
         return user_representation, all_candidate_reprs, stats
 
+    def _query_head_params(self, emb_dim: int) -> tuple[jax.Array, jax.Array]:
+        num_heads = self.config.user_query_heads
+        std = self.config.user_query_head_init_std
+        q = get_parameter(
+            "user_query_head_q",
+            shape=[num_heads, emb_dim],
+            dtype=jnp.float32,
+            init=hk.initializers.RandomNormal(std) if std > 0 else hk.initializers.Constant(0.0),
+            pspec=P(),
+        )
+        gamma = get_parameter(
+            "user_query_head_recency_gamma",
+            shape=[num_heads],
+            dtype=jnp.float32,
+            init=hk.initializers.Constant(0.0),
+            pspec=P(),
+        )
+        return q, gamma
+
+    def _query_head_logits(
+        self, outputs: jax.Array, from_newest: jax.Array, q: jax.Array, gamma: jax.Array
+    ) -> jax.Array:
+        scale = 1.0 / math.sqrt(outputs.shape[-1])
+        content = jnp.einsum("...td,kd->...tk", outputs.astype(jnp.float32), q) * scale
+        recency = from_newest[..., None] / QUERY_HEAD_RECENCY_SCALE_TOKENS
+        return content - gamma * recency
+
+    def _query_heads_pool(
+        self, outputs: jax.Array, valid: jax.Array, from_newest: jax.Array
+    ) -> jax.Array:
+        q, gamma = self._query_head_params(outputs.shape[-1])
+        logits = self._query_head_logits(outputs, from_newest, q, gamma)
+        logits = jnp.where(valid[:, :, None] > 0, logits, -1e9)
+        weights = jax.nn.softmax(logits, axis=1) * valid[:, :, None]
+        return jnp.einsum("btk,btd->bkd", weights, outputs.astype(jnp.float32))
+
+    def _packed_query_heads(
+        self,
+        outputs: jax.Array,
+        padding_mask: jax.Array,
+        cu_seqlens: jax.Array,
+        bs_per_device: int,
+    ) -> jax.Array:
+        q, gamma = self._query_head_params(outputs.shape[-1])
+        K = self.config.user_query_heads
+        data_axis = self.data_axis
+
+        @shard_map(
+            mesh=self.sharding_context.mesh,
+            in_specs=(P(data_axis), P(data_axis), P(data_axis), P(), P()),
+            out_specs=P(data_axis),
+            check_vma=False,
+        )
+        def _pool_heads(outputs, mask, cu_seqlens, q, gamma):
+            rows, packed_len, emb_dim = outputs.shape
+            positions = jnp.arange(packed_len, dtype=cu_seqlens.dtype)
+            local_user_ids = jnp.clip(
+                jax.vmap(lambda starts: jnp.searchsorted(starts, positions, side="right") - 1)(
+                    cu_seqlens
+                ),
+                0,
+                bs_per_device - 1,
+            )
+            seg_end = jnp.take_along_axis(cu_seqlens, local_user_ids + 1, axis=1)
+            from_newest = (seg_end - positions[None, :] - 1).astype(jnp.float32)
+            seg_ids = (
+                jnp.arange(rows, dtype=cu_seqlens.dtype)[:, None] * bs_per_device + local_user_ids
+            ).reshape(-1)
+            num_segments = rows * bs_per_device
+            valid = mask.reshape(-1).astype(jnp.float32)
+            logits = self._query_head_logits(outputs, from_newest, q, gamma).reshape(-1, K)
+            logits = jnp.where(valid[:, None] > 0, logits, -1e9)
+            seg_max = jax.ops.segment_max(logits, seg_ids, num_segments=num_segments)
+            weights = jnp.exp(logits - seg_max[seg_ids]) * valid[:, None]
+            seg_sum = jax.ops.segment_sum(weights, seg_ids, num_segments=num_segments)
+            weights = weights / jnp.maximum(seg_sum[seg_ids], 1e-30)
+            flat = outputs.astype(jnp.float32).reshape(-1, emb_dim)
+            pooled = [
+                jax.ops.segment_sum(
+                    flat * weights[:, k : k + 1], seg_ids, num_segments=num_segments
+                )
+                for k in range(K)
+            ]
+            return jnp.stack(pooled, axis=1)
+
+        return _pool_heads(outputs, padding_mask, cu_seqlens, q, gamma)
+
+    def _mol_scorer(self) -> MolScorer | None:
+        num_components = self.config.mol_item_components
+        if num_components == 0:
+            return None
+        num_mix = max(1, self.config.user_query_heads) * num_components
+        emb_dim = self.config.candidate_tower_config.emb_table_width
+        rank = self.config.mol_item_adapter_rank
+        hidden = self.config.mol_gate_hidden
+        conditioned = self.config.mol_conditioned_gate
+        zeros = hk.initializers.Constant(0.0)
+
+        def param(name, shape, init):
+            return get_parameter(name, shape=shape, dtype=jnp.float32, init=init, pspec=P())
+
+        return MolScorer(
+            adapter_v=param(
+                "mol_item_adapter_v",
+                [num_components, emb_dim, rank],
+                hk.initializers.RandomNormal(1.0 / math.sqrt(emb_dim)),
+            ),
+            adapter_u=param("mol_item_adapter_u", [num_components, rank, emb_dim], zeros),
+            gate_w1=param(
+                "mol_gate_w1",
+                [num_mix, hidden],
+                hk.initializers.RandomNormal(1.0 / math.sqrt(num_mix)),
+            ),
+            gate_b1=param("mol_gate_b1", [hidden], zeros),
+            gate_w2=param("mol_gate_w2", [hidden, num_mix], zeros),
+            gate_b2=param("mol_gate_b2", [num_mix], zeros),
+            gate_user_w=param("mol_gate_user_w", [emb_dim, num_mix], zeros)
+            if conditioned
+            else None,
+            gate_item_w=param("mol_gate_item_w", [emb_dim, num_mix], zeros)
+            if conditioned
+            else None,
+        )
+
+    def mol_side_table_rows(self, post_table: jax.Array) -> jax.Array:
+        scorer = self._mol_scorer()
+        assert scorer is not None
+        return scorer.side_table_rows(post_table)
+
+    def mol_side_tables(self, post_table: jax.Array) -> tuple[jax.Array, jax.Array]:
+        scorer = self._mol_scorer()
+        assert scorer is not None
+        mesh = self.sharding_context.mesh
+        saxis = "expert"
+        return shard_map(
+            scorer.sharded_serving_side_tables,
+            mesh=mesh,
+            in_specs=(P(saxis),),
+            out_specs=(P(None, saxis), P(None, saxis)),
+            check_vma=False,
+        )(post_table)
+
     @hk.transparent
     def forward(
         self,
@@ -1335,10 +1781,12 @@ class RecsysTwoTowerModel(hk.Module):
         topic_bitmaps: jax.Array | None = None,
         topic_user_bitmasks: jax.Array | None = None,
         eval_bs_per_device: int = 0,
-        dataset_ranges: tuple[tuple[int, int], ...] | None = None,
+        dataset_ranges: tuple[tuple[int, int], ...] | jax.Array | None = None,
         use_async_topk: bool = False,
         use_radix_select_topk: bool = False,
         post_scales: jax.Array | None = None,
+        dataset_capacities: tuple[int, ...] | None = None,
+        mol_side_tables: tuple[jax.Array, jax.Array] | None = None,
     ) -> tuple[tuple[jax.Array, jax.Array], ...]:
         saxis = "expert"
 
@@ -1372,20 +1820,47 @@ class RecsysTwoTowerModel(hk.Module):
                 users_per_expert = user_embedding.shape[0] // mesh.shape[saxis]
                 max_eval_users = eval_bs_per_device * mesh.shape[saxis]
                 if eval_bs_per_device < users_per_expert:
+                    rest = user_embedding.shape[1:]
                     user_embedding = user_embedding.reshape(
-                        mesh.shape[saxis], users_per_expert, user_embedding.shape[-1]
-                    )[:, :eval_bs_per_device].reshape(max_eval_users, user_embedding.shape[-1])
+                        mesh.shape[saxis], users_per_expert, *rest
+                    )[:, :eval_bs_per_device].reshape(max_eval_users, *rest)
             return user_embedding
+
+        mol_scorer = self._mol_scorer()
+        use_mol = mol_scorer is not None
+        use_mol_kernel = use_mol and self.config.mol_serving_kernel
+
+        side_spec = P(None, saxis) if mol_side_tables is not None else P()
+        side_args = mol_side_tables if mol_side_tables is not None else ((), ())
+
+        def _side(norms, ibias):
+            return (norms, ibias) if mol_side_tables is not None else None
+
+        def _score_posts(
+            user_embedding: jax.Array, posts: jax.Array, scorer, side=None
+        ) -> jax.Array:
+            if use_mol:
+                users = user_embedding if user_embedding.ndim == 3 else user_embedding[:, None, :]
+                if use_mol_kernel:
+                    return mol_kernel_scores(scorer, users, posts, side_tables=side).astype(
+                        jnp.bfloat16
+                    )
+                return scorer.chunked_pair_scores(
+                    users, posts.astype(jnp.bfloat16), self.config.mol_eval_user_chunk
+                )
+            return jnp.matmul(user_embedding.astype(jnp.bfloat16), posts.T)
 
         @shard_map(
             mesh=mesh,
-            in_specs=(P(saxis), P()),
+            in_specs=(P(saxis), P(), P(), side_spec, side_spec),
             out_specs=P(),
             check_vma=False,
         )
-        def compute_top_k(post_embeddings: jax.Array, user_embedding: jax.Array) -> jax.Array:
+        def compute_top_k(
+            post_embeddings: jax.Array, user_embedding: jax.Array, scorer, norms, ibias
+        ) -> jax.Array:
             user_embedding = _trim_eval_users(user_embedding)
-            scores = jnp.matmul(user_embedding.astype(jnp.bfloat16), post_embeddings.T)
+            scores = _score_posts(user_embedding, post_embeddings, scorer, _side(norms, ibias))
             scores = jax.lax.all_to_all(
                 scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
             )
@@ -1439,14 +1914,39 @@ class RecsysTwoTowerModel(hk.Module):
 
             @shard_map(
                 mesh=mesh,
-                in_specs=(P(saxis), P(), P(saxis)),
+                in_specs=(P(saxis), P(), P(saxis), P(), side_spec, side_spec),
                 out_specs=P(),
                 check_vma=False,
             )
             def compute_top_k_int8(
-                post_q8: jax.Array, user_embedding: jax.Array, scales: jax.Array
+                post_q8: jax.Array,
+                user_embedding: jax.Array,
+                scales: jax.Array,
+                scorer,
+                norms,
+                ibias,
             ) -> jax.Array:
                 user_embedding = _trim_eval_users(user_embedding)
+                if use_mol_kernel:
+                    users = (
+                        user_embedding if user_embedding.ndim == 3 else user_embedding[:, None, :]
+                    )
+                    scores = mol_kernel_scores(
+                        scorer,
+                        users,
+                        post_q8,
+                        post_scales=scales,
+                        side_tables=_side(norms, ibias),
+                    ).astype(jnp.bfloat16)
+                    return jax.lax.all_to_all(
+                        scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
+                    )
+                if use_mol:
+                    posts = post_q8.astype(jnp.float32) * scales[:, None]
+                    scores = _score_posts(user_embedding, posts, scorer)
+                    return jax.lax.all_to_all(
+                        scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
+                    )
                 uf = user_embedding.astype(jnp.float32)
                 us = jnp.maximum(jnp.max(jnp.abs(uf), axis=1) / 127.0, 1e-12)
                 uq = jnp.clip(jnp.round(uf / us[:, None]), -127, 127).astype(jnp.int8)
@@ -1460,16 +1960,55 @@ class RecsysTwoTowerModel(hk.Module):
                     scores, axis_name=saxis, split_axis=0, concat_axis=1, tiled=True
                 )
 
-            all_scores = compute_top_k_int8(post_embeddings, user_representation, post_scales)
+            all_scores = compute_top_k_int8(
+                post_embeddings,
+                user_representation,
+                post_scales,
+                mol_scorer if use_mol else (),
+                *side_args,
+            )
         else:
-            all_scores = compute_top_k(post_embeddings, user_representation)
+            all_scores = compute_top_k(
+                post_embeddings, user_representation, mol_scorer if use_mol else (), *side_args
+            )
 
-        use_slice_path = (
-            dataset_ranges is not None
-            and eligible_mask is None
-            and not use_topic_filter
-            and not skip_dataset_mask
+        no_per_post_filter = (
+            eligible_mask is None and not use_topic_filter and not skip_dataset_mask
         )
+        if dataset_capacities is not None:
+            assert isinstance(dataset_ranges, jax.Array) and no_per_post_filter, (
+                "dataset_capacities need dataset_ranges as an array input and no per-post filter"
+            )
+            assert len(dataset_capacities) == len(target_dataset_types), (
+                f"dataset_capacities ({len(dataset_capacities)}) must align with "
+                f"target_dataset_types ({len(target_dataset_types)})"
+            )
+            results = []
+            for d, capacity in enumerate(dataset_capacities):
+
+                @shard_map(mesh=mesh, in_specs=(P(), P()), out_specs=(P(), P()), check_vma=False)
+                def window_and_top_k(all_scores, ranges, _d=d, _w=capacity):
+                    start, end = ranges[_d, 0], ranges[_d, 1]
+                    start_c = jnp.minimum(start, all_scores.shape[1] - _w)
+                    window = jax.lax.dynamic_slice_in_dim(all_scores, start_c, _w, axis=1)
+                    col = start_c + jnp.arange(_w, dtype=jnp.int32)
+                    masked = jnp.where(
+                        ((col >= start) & (col < end))[None, :],
+                        window,
+                        jnp.finfo(all_scores.dtype).min,
+                    )
+                    sorted_scores, sorted_indices = local_top_k(masked, top_k)
+                    sorted_indices = sorted_indices + start_c
+                    return (
+                        jax.lax.all_gather(sorted_scores, axis_name=saxis, axis=0, tiled=True),
+                        jax.lax.all_gather(sorted_indices, axis_name=saxis, axis=0, tiled=True),
+                    )
+
+                top_k_scores, top_k_indices = window_and_top_k(all_scores, dataset_ranges)
+                results.append((top_k_indices, top_k_scores.astype(jnp.float32)))
+            return tuple(results)
+
+        use_slice_path = dataset_ranges is not None and no_per_post_filter
         if use_slice_path:
             assert len(dataset_ranges) == len(target_dataset_types), (
                 f"dataset_ranges ({len(dataset_ranges)}) must align with "
@@ -1505,7 +2044,9 @@ class RecsysTwoTowerModel(hk.Module):
         results = []
         for ds_type in target_dataset_types:
             if dataset_types is not None and not skip_dataset_mask:
-                type_mask = dataset_types.squeeze() == ds_type
+                stored = dataset_types.squeeze()
+                match = jnp.asarray(RetrievalDataset.mask_values(ds_type), dtype=stored.dtype)
+                type_mask = jnp.isin(stored, match)
             else:
                 type_mask = jnp.ones(post_embeddings.shape[0], dtype=jnp.bool_)
 
@@ -1561,6 +2102,8 @@ class RecsysTwoTowerModel(hk.Module):
             init=hk.initializers.Constant(0.1),
             pspec=P(),
         )
+        if self.config.fixed_temperature > 0.0:
+            temperature = jnp.asarray(self.config.fixed_temperature, dtype=jnp.float32)
 
         loss_batch = batch
         if self.config.use_seqpack:
@@ -1587,6 +2130,7 @@ class RecsysTwoTowerModel(hk.Module):
         head_names = self.config.head_names
 
         total_loss = jnp.array(0.0)
+        mol_scorer = self._mol_scorer()
         for h in range(num_heads):
             pos_actions, hard_neg_actions, soft_neg_actions = per_head_actions[h]
             head_loss, head_metrics = compute_retrieval_loss(
@@ -1611,6 +2155,11 @@ class RecsysTwoTowerModel(hk.Module):
                 safety_filter_bits=self.config.safety_filter_bits,
                 safety_filter_soft_weight=self.config.safety_filter_soft_weight,
                 safety_filter_apply_to_candidates=self.config.safety_filter_apply_to_candidates,
+                own_negative_logit_offset=self.config.own_negative_logit_offset,
+                positive_count_user_weight_power=self.config.positive_count_user_weight_power,
+                mol_scorer=mol_scorer,
+                mol_train_user_chunk=self.config.mol_train_user_chunk,
+                mask_in_batch_false_negatives=self.config.mask_in_batch_false_negatives,
             )
             total_loss = total_loss + head_loss
             if num_heads > 1:
@@ -1642,6 +2191,10 @@ class RecsysTwoTowerModelConfig(Config):
 
     logq_correction_scale: float = 2.0
 
+    fixed_temperature: float = 0.0
+    own_negative_logit_offset: float = 0.0
+    positive_count_user_weight_power: float = 0.0
+
     enable_fake_positives: bool = False
 
     num_global_negatives_per_example: int = 0
@@ -1657,6 +2210,18 @@ class RecsysTwoTowerModelConfig(Config):
     multimodal_embedding_type: EmbeddingType | None = None
 
     user_features: UserFeaturesConfig = UserFeaturesConfig()
+
+    user_query_heads: int = 0
+    user_query_head_init_std: float = 0.0
+    mol_item_components: int = 0
+    mol_item_adapter_rank: int = 64
+    mol_gate_hidden: int = 32
+    mol_conditioned_gate: bool = False
+    mol_train_user_chunk: int = 0
+    mol_eval_user_chunk: int = 32
+    mol_serving_kernel: bool = False
+    mol_side_table_in_checkpoint: bool = False
+    mask_in_batch_false_negatives: bool = False
 
     positive_actions: list[int] = field(
         default_factory=lambda: [
@@ -1683,6 +2248,9 @@ class RecsysTwoTowerModelConfig(Config):
     )
 
     checkpoint_dataset_names: list[str] | None = None
+
+    split_home_checkpoint: bool = False
+    cold_start_max_age_seconds: float = DEFAULT_COLD_START_MAX_AGE_SECONDS
 
     immersive_positive_actions: list[int] = field(
         default_factory=lambda: [
@@ -1716,6 +2284,13 @@ class RecsysTwoTowerModelConfig(Config):
     head_dataset_mapping: dict[str, int] | None = None
 
     head_names: list[str] = field(default_factory=lambda: ["home"])
+
+    @property
+    def mol_side_table_width(self) -> int:
+        wanted = self.mol_serving_kernel or self.mol_side_table_in_checkpoint
+        if not (wanted and self.mol_item_components > 0):
+            return 0
+        return self.mol_item_components * (1 + max(self.user_query_heads, 1))
 
     @classmethod
     def get_positive_actions(cls) -> list[int]:

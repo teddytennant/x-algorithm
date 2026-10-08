@@ -45,6 +45,12 @@ val postLabels = Map(
       "Post detected by automated systems as likely to contain a link to a malicious site.",
     effect = "Post hidden from recommendations to non-followers.",
   },
+  "BRAZIL_ELECTION_LEGAL" -> {
+    about =
+      "Post detected by automated systems as one that may contain AI generated media related to electoral processes in violation of Brazil local law during silence period, specifically Tribunal Superior Eleitoral Resolution n. 23.610, Art9-B, § 3-A",
+    effect =
+      "In Brazil, post hidden from recommendations.",
+  },
   "DO_NOT_AMPLIFY" -> {
     about =
       "Historically applied to posts detected by automated systems as likely to contain a link to a malicious site. Being replaced by MALICIOUS_URL label and then will be fully removed.",

@@ -4,7 +4,7 @@ import logging
 import random
 import socket
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -26,6 +26,7 @@ class Instance:
     port: int
     weight: float = 1.0
     shard_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __str__(self):
         return f"WilyNS.Instance({', '.join(f'{k}={v}' for k, v in self.__dict__.items())})"
@@ -80,6 +81,7 @@ class WilyNs:
             port=entry["port"],
             weight=entry.get("weight", 1.0),
             shard_id=entry.get("zkMetadata", {}).get("shardId"),
+            metadata=entry.get("zkMetadata", {}).get("metadata", {}),
         )
 
     def _process_context(self, wily_config: WilyConfig) -> str:

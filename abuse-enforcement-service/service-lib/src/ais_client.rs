@@ -126,6 +126,22 @@ impl AisClient {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn unconnected() -> Self {
+        let transcoder = Transcoder::from_schema_bytes(SCHEMA_AIS).expect("AIS thrift schema");
+        let intake = resolve_method(&transcoder, "intakeAction", INTAKE_RESPONSE_TYPE)
+            .expect("intakeAction");
+        let multi = resolve_method(&transcoder, "multiEntityIntakeAction", MULTI_RESPONSE_TYPE)
+            .expect("multiEntityIntakeAction");
+        Self {
+            transcoder: Arc::new(transcoder),
+            mux: Arc::new(ThriftMuxClient::new(ThriftMuxConfig::default())),
+            seq: Arc::new(AtomicI32::new(0)),
+            intake,
+            multi,
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(topic = labels.topic, action = labels.action))]
     pub async fn intake_action(
         &self,

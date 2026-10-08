@@ -27,13 +27,16 @@ struct PipelineSpec {
 };
 
 struct ArenaLayout {
+  size_t block_bytes = 0;
+  size_t index_bytes = 0;
+  size_t accum_bytes = 0;
   size_t token_ids_all = 0;
   size_t lookup_send = 0;
-  size_t lookup_recv = 0;
-  size_t segment_ids_all = 0;
-  size_t update_send = 0;
-  size_t update_recv = 0;
   size_t grad_accum = 0;
+  size_t recv = 0;
+  size_t segment_ids_all = 0;
+  size_t update_stage = 0;
+  size_t unique_tokens = 0;
   size_t row_sq_sums = 0;
   size_t scalars = 0;
   size_t total = 0;
@@ -48,17 +51,14 @@ struct LookupJob {
 };
 
 struct UpdateJob {
-  const __nv_bfloat16* grads;
-  const int32_t* segment_ids;
-  const int32_t* unique_tokens;
   __nv_bfloat16* table;
   int64_t vocab_rows;
 };
 
 struct ReducedGradients {
-  float* row_grads;
+  const float* row_grads;
   const float* row_sq_sums;
-  const float* grad_norm_sq;
+  const int32_t* unique_tokens;
   UpdateScalars* scalars;
   int64_t num_unique;
   int64_t shard_width;
@@ -130,15 +130,20 @@ class AsyncEmbContext : public common::CommContext {
   int8_t* arena() const { return arena_.data(); }
 
   void armLookup(LookupJob job, cudaStream_t main_stream);
+  void stageUpdate(
+      const __nv_bfloat16* grads,
+      const int32_t* segment_ids,
+      const int32_t* unique_tokens,
+      const int32_t* pending,
+      cudaStream_t main_stream
+  );
   void armUpdate(
       UpdateJob job,
-      const int32_t* pending,
       ApplyUpdateRule apply,
       cudaStream_t main_stream,
       const int32_t* logical_step = nullptr
   );
   void warmupUpdateRule(const ApplyUpdateRule& apply);
-  void resetTableBinding();
 
   uint64_t armedStep(Operation operation) const;
   void streamConsumeDone(cudaStream_t stream, Operation operation);
@@ -206,6 +211,7 @@ class AsyncEmbContext : public common::CommContext {
   std::mutex arm_mu_;
   PipelineState lookup_;
   PipelineState update_;
+  bool staged_ = false;
 
   TablePhase last_table_phase_ = TablePhase::None;
   const void* last_table_ = nullptr;

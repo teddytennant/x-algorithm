@@ -39,10 +39,10 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Float32
-from quack import layout_utils
-from quack.cute_dsl_utils import ParamsBase
 
 import xrex.cutedsl.ranker_fa4.utils as utils
+from xrex.cutedsl.quack import layout_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfoQK
 
 

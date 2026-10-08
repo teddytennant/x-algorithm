@@ -51,7 +51,7 @@ public class HammingDist extends FunctionNode2<Runtime, String, String> {
   static long hammingDist(BigInteger x, BigInteger y) throws ArithmeticException {
     long dist = 0L;
     BigInteger value = x.xor(y);
-    while (value.compareTo(BigInteger.ZERO) >= 1) { 
+    while (value.compareTo(BigInteger.ZERO) >= 1) {
       value = value.and(value.subtract(BigInteger.ONE));
       dist = Math.addExact(dist, 1);
     }

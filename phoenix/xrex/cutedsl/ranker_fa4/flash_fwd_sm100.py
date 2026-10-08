@@ -78,10 +78,10 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
-from quack import copy_utils, layout_utils
-from quack.cute_dsl_utils import ParamsBase
 
 import xrex.cutedsl.ranker_fa4.pipeline as pipeline_custom
+from xrex.cutedsl.quack import copy_utils, layout_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import blackwell_helpers as sm100_utils
 from xrex.cutedsl.ranker_fa4 import mma_sm100_desc as sm100_desc
 from xrex.cutedsl.ranker_fa4 import utils

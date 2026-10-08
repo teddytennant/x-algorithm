@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +33,10 @@ pub(crate) struct TwemcacheSource {
     cache: Arc<dyn CacheRead>,
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "KVCacheError belongs to the shared xai-cache client; only its timeout and backpressure errors get their own FallbackReason, and every other error counts as Other, including any the client adds"
+)]
 fn fallback_reason(e: &KVCacheError) -> FallbackReason {
     match e {
         KVCacheError::Timeout(_) => FallbackReason::Timeout,
@@ -73,8 +78,8 @@ impl TwemcacheSource {
 
 #[async_trait]
 impl TwemcacheLookup for TwemcacheSource {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, TwemcacheOutcome> {
-        let mut results = HashMap::with_capacity(ids.len());
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, TwemcacheOutcome> {
+        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
         }
@@ -211,7 +216,7 @@ mod tests {
         }
     }
 
-    async fn get_with_cache(cache: Arc<dyn CacheRead>) -> HashMap<u64, TwemcacheOutcome> {
+    async fn get_with_cache(cache: Arc<dyn CacheRead>) -> FxHashMap<u64, TwemcacheOutcome> {
         TwemcacheSource::with_cache(cache).get(&[42]).await
     }
 
@@ -236,36 +241,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_cache_miss_returns_miss() {
-        let results = get_with_cache(FakeTwemcache::empty()).await;
+    async fn cache_transport_results_select_lookup_outcome() {
+        let cases: Vec<(Arc<dyn CacheRead>, TwemcacheOutcome)> = vec![
+            (FakeTwemcache::empty(), TwemcacheOutcome::Miss),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Io("conn refused".into())),
+                TwemcacheOutcome::FallThrough(FallbackReason::Other),
+            ),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Timeout("get".into())),
+                TwemcacheOutcome::FallThrough(FallbackReason::Timeout),
+            ),
+            (
+                FakeTwemcache::with_per_key_error(KVCacheError::Backpressure),
+                TwemcacheOutcome::FallThrough(FallbackReason::Backpressure),
+            ),
+            (
+                FakeTwemcache::with_missing_response(),
+                TwemcacheOutcome::FallThrough(FallbackReason::MissingResponse),
+            ),
+        ];
 
-        assert!(matches!(results.get(&42), Some(TwemcacheOutcome::Miss)));
-    }
-
-    #[tokio::test]
-    async fn get_per_key_error_returns_other_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Io(
-            "conn refused".into(),
-        )))
-        .await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(FallbackReason::Other))
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_per_key_timeout_returns_timeout_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_per_key_error(KVCacheError::Timeout(
-            "get".into(),
-        )))
-        .await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(FallbackReason::Timeout))
-        ));
+        for (cache, expected) in cases {
+            let results = get_with_cache(cache).await;
+            assert_eq!(results.get(&42), Some(&expected));
+        }
     }
 
     #[tokio::test]
@@ -275,18 +275,6 @@ mod tests {
         assert!(matches!(
             results.get(&42),
             Some(TwemcacheOutcome::FallThrough(FallbackReason::Decode))
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_missing_response_returns_fallback() {
-        let results = get_with_cache(FakeTwemcache::with_missing_response()).await;
-
-        assert!(matches!(
-            results.get(&42),
-            Some(TwemcacheOutcome::FallThrough(
-                FallbackReason::MissingResponse
-            ))
         ));
     }
 }

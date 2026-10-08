@@ -26,5 +26,6 @@ pub mod self_reply_chain_filter;
 pub mod self_tweet_filter;
 pub mod topic_ids_filter;
 pub mod vf_filter;
+pub mod video_carousel_filter;
 pub mod video_filter;
 pub mod viewer_muted_keyword_filter;

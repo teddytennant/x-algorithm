@@ -295,6 +295,9 @@ pub fn tombstone_resname_and_link(
         R::SENSITIVE_VIEWER_AGE_VERIFICATION => {
             ("tombstone.age_verification", links::AGE_ASSURANCE)
         }
+        R::UPDATE_APP_IOS => ("tombstone.update_ios", links::AGE_ASSURANCE),
+        R::UPDATE_APP_ANDROID => ("tombstone.update_android", links::AGE_ASSURANCE),
+        R::LOCAL_REGULATIONS => ("tombstone.local_regulations", links::NOTICES_ON_TWITTER),
         R::DEVELOPMENT_ONLY => ("tombstone.development_only", links::NOTICES_ON_TWITTER),
         R::UNSPECIFIED => ("tombstone.unavailable", links::NOTICES_ON_TWITTER),
         _ => return None,

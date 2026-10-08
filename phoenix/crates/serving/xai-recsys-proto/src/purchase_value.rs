@@ -4,11 +4,167 @@ use crate::{ContinuousActionName, PredictNextActionsRequest, PurchaseValueBaseli
 
 pub const ACTION_INDEX: usize = ContinuousActionName::AdsWebCtPurchaseValue as usize;
 
+pub const MAX_EVENT_USD: f64 = 100_000.0;
+
+pub fn is_countable_usd(usd: f64) -> bool {
+    usd.is_finite() && usd > 0.0 && usd <= MAX_EVENT_USD
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueEvent {
+    Purchase,
+    ContentView,
+    AddToCart,
+}
+
+impl ValueEvent {
+    pub const ALL: [ValueEvent; 3] = [Self::Purchase, Self::ContentView, Self::AddToCart];
+
+    pub const fn conversion_type(self) -> i32 {
+        match self {
+            Self::Purchase => 2,
+            Self::ContentView => 19,
+            Self::AddToCart => 12,
+        }
+    }
+
+    pub const fn clickhouse_name(self) -> &'static str {
+        match self {
+            Self::Purchase => "PURCHASE",
+            Self::ContentView => "CONTENT_VIEW",
+            Self::AddToCart => "ADD_TO_CART",
+        }
+    }
+
+    pub const fn snake_name(self) -> &'static str {
+        match self {
+            Self::Purchase => "purchase",
+            Self::ContentView => "content_view",
+            Self::AddToCart => "add_to_cart",
+        }
+    }
+
+    pub const fn camel_name(self) -> &'static str {
+        match self {
+            Self::Purchase => "Purchase",
+            Self::ContentView => "ContentView",
+            Self::AddToCart => "AddToCart",
+        }
+    }
+
+    pub fn from_snake_name(name: &str) -> Option<ValueEvent> {
+        Self::ALL
+            .into_iter()
+            .find(|event| event.snake_name() == name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValueLevel {
+    ClickThrough,
+    ViewThrough,
+}
+
+impl ValueLevel {
+    pub const fn clickhouse_name(self) -> &'static str {
+        match self {
+            Self::ClickThrough => "CLICK_THROUGH",
+            Self::ViewThrough => "VIEW_THROUGH",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ValueTarget {
+    pub event: ValueEvent,
+    pub level: ValueLevel,
+}
+
+impl ValueTarget {
+    pub const PURCHASE_CT: ValueTarget = Self::new(ValueEvent::Purchase, ValueLevel::ClickThrough);
+    pub const PURCHASE_VT: ValueTarget = Self::new(ValueEvent::Purchase, ValueLevel::ViewThrough);
+
+    pub const fn new(event: ValueEvent, level: ValueLevel) -> Self {
+        Self { event, level }
+    }
+
+    pub const ALL: [ValueTarget; 6] = [
+        Self::PURCHASE_CT,
+        Self::PURCHASE_VT,
+        Self::new(ValueEvent::ContentView, ValueLevel::ClickThrough),
+        Self::new(ValueEvent::AddToCart, ValueLevel::ClickThrough),
+        Self::new(ValueEvent::ContentView, ValueLevel::ViewThrough),
+        Self::new(ValueEvent::AddToCart, ValueLevel::ViewThrough),
+    ];
+
+    pub const PUBLISHED: [ValueTarget; 6] = Self::ALL;
+
+    pub const REQUIRED: [ValueTarget; 2] = [Self::PURCHASE_CT, Self::PURCHASE_VT];
+
+    pub const fn target_definition(self) -> &'static str {
+        match (self.event, self.level) {
+            (ValueEvent::Purchase, ValueLevel::ClickThrough) => "web_ct_purchase",
+            (ValueEvent::Purchase, ValueLevel::ViewThrough) => "web_vt_purchase",
+            (ValueEvent::ContentView, ValueLevel::ClickThrough) => "web_ct_content_view",
+            (ValueEvent::ContentView, ValueLevel::ViewThrough) => "web_vt_content_view",
+            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => "web_ct_add_to_cart",
+            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => "web_vt_add_to_cart",
+        }
+    }
+
+    pub fn from_target_definition(name: &str) -> Option<ValueTarget> {
+        Self::ALL
+            .into_iter()
+            .find(|target| target.target_definition() == name)
+    }
+
+    pub fn mean(self, baseline: &PurchaseValueBaseline) -> Option<f64> {
+        usable_mean(*self.field(baseline))
+    }
+
+    pub fn set_mean(self, baseline: &mut PurchaseValueBaseline, mean: f64) {
+        *self.field_mut(baseline) = mean;
+    }
+
+    fn field(self, b: &PurchaseValueBaseline) -> &f64 {
+        match (self.event, self.level) {
+            (ValueEvent::Purchase, ValueLevel::ClickThrough) => &b.mean_value_usd_28d,
+            (ValueEvent::Purchase, ValueLevel::ViewThrough) => &b.mean_value_usd_28d_vt,
+            (ValueEvent::ContentView, ValueLevel::ClickThrough) => &b.mean_content_view_usd_28d,
+            (ValueEvent::ContentView, ValueLevel::ViewThrough) => &b.mean_content_view_usd_28d_vt,
+            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => &b.mean_add_to_cart_usd_28d,
+            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => &b.mean_add_to_cart_usd_28d_vt,
+        }
+    }
+
+    fn field_mut(self, b: &mut PurchaseValueBaseline) -> &mut f64 {
+        match (self.event, self.level) {
+            (ValueEvent::Purchase, ValueLevel::ClickThrough) => &mut b.mean_value_usd_28d,
+            (ValueEvent::Purchase, ValueLevel::ViewThrough) => &mut b.mean_value_usd_28d_vt,
+            (ValueEvent::ContentView, ValueLevel::ClickThrough) => &mut b.mean_content_view_usd_28d,
+            (ValueEvent::ContentView, ValueLevel::ViewThrough) => {
+                &mut b.mean_content_view_usd_28d_vt
+            }
+            (ValueEvent::AddToCart, ValueLevel::ClickThrough) => &mut b.mean_add_to_cart_usd_28d,
+            (ValueEvent::AddToCart, ValueLevel::ViewThrough) => &mut b.mean_add_to_cart_usd_28d_vt,
+        }
+    }
+}
+
+fn usable_mean(mean: f64) -> Option<f64> {
+    (mean.is_finite() && mean > 0.0).then_some(mean)
+}
+
+pub fn ct_mean(baseline: &PurchaseValueBaseline) -> Option<f64> {
+    ValueTarget::PURCHASE_CT.mean(baseline)
+}
+
 pub fn is_valid_baseline(baseline: &PurchaseValueBaseline) -> bool {
     baseline.impression_id > 0
         && baseline.advertiser_account_id > 0
-        && baseline.mean_value_usd_28d.is_finite()
-        && baseline.mean_value_usd_28d > 0.0
+        && ValueTarget::ALL
+            .iter()
+            .any(|target| target.mean(baseline).is_some())
 }
 
 pub fn find_baseline(
@@ -33,6 +189,7 @@ mod tests {
             impression_id,
             advertiser_account_id,
             mean_value_usd_28d: 10.0,
+            ..Default::default()
         }
     }
 
@@ -41,7 +198,7 @@ mod tests {
         assert_eq!(ACTION_INDEX, 5);
         assert_eq!(ContinuousActionName::DwellTime as u32, 1);
         assert_eq!(ContinuousActionName::ClickDwellTime as u32, 2);
-        assert_eq!(ContinuousActionName::ActiveSecs5mResidualNorm as u32, 3);
+        assert_eq!(ContinuousActionName::HomeVideoContinuationSecs as u32, 3);
         assert_eq!(ContinuousActionName::BridgeProbability as u32, 4);
     }
 
@@ -79,10 +236,24 @@ mod tests {
         assert_eq!(bytes[2], 0x10);
         assert_eq!(bytes[4], 0x19);
         assert_eq!(bytes.len(), 5 + 8);
+        for (i, target) in ValueTarget::ALL.iter().enumerate() {
+            let mut b = PurchaseValueBaseline::default();
+            target.set_mean(&mut b, 1.0);
+            let bytes = b.encode_to_vec();
+            assert_eq!(bytes.len(), 9, "{target:?}");
+            assert_eq!(bytes[0], ((3 + i as u8) << 3) | 1, "{target:?} tag");
+        }
+        let mut full = baseline(1_900_000_000_000_000_000, 4_503_599_700_000_000);
+        for target in ValueTarget::ALL {
+            target.set_mean(&mut full, 12.5);
+        }
+        assert_eq!(full.encode_to_vec().len(), 73);
+        let decoded = PurchaseValueBaseline::decode(full.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, full);
     }
 
     #[test]
-    fn valid_baseline_requires_positive_ids_and_positive_finite_mean() {
+    fn valid_baseline_requires_positive_ids_and_at_least_one_positive_finite_mean() {
         assert!(is_valid_baseline(&baseline(1, 2)));
         assert!(!is_valid_baseline(&baseline(0, 2)));
         assert!(!is_valid_baseline(&baseline(1, 0)));
@@ -90,7 +261,57 @@ mod tests {
         for mean in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut b = baseline(1, 2);
             b.mean_value_usd_28d = mean;
-            assert!(!is_valid_baseline(&b), "mean {mean} must be invalid");
+            assert!(
+                !is_valid_baseline(&b),
+                "ct mean {mean} alone must be invalid"
+            );
+            assert_eq!(ct_mean(&b), None);
+            b.mean_content_view_usd_28d = 3.0;
+            assert!(
+                is_valid_baseline(&b),
+                "another usable mean carries the entry"
+            );
+        }
+        assert_eq!(ct_mean(&baseline(1, 2)), Some(10.0));
+    }
+
+    #[test]
+    fn target_table_round_trips_names_and_fields() {
+        for target in ValueTarget::ALL {
+            assert_eq!(
+                ValueTarget::from_target_definition(target.target_definition()),
+                Some(target)
+            );
+            let mut b = baseline(1, 2);
+            assert_eq!(
+                target.mean(&b),
+                (target == ValueTarget::PURCHASE_CT).then_some(10.0)
+            );
+            target.set_mean(&mut b, 4.0);
+            assert_eq!(target.mean(&b), Some(4.0));
+        }
+        assert_eq!(ValueTarget::from_target_definition("web_ct_checkout"), None);
+        assert!(
+            ValueTarget::REQUIRED
+                .iter()
+                .all(|t| ValueTarget::PUBLISHED.contains(t))
+        );
+        assert!(
+            ValueTarget::PUBLISHED
+                .iter()
+                .all(|t| ValueTarget::ALL.contains(t))
+        );
+        assert_eq!(ValueEvent::Purchase.conversion_type(), 2);
+        assert_eq!(ValueEvent::AddToCart.conversion_type(), 12);
+        assert_eq!(ValueEvent::ContentView.conversion_type(), 19);
+        for event in ValueEvent::ALL {
+            assert_eq!(ValueEvent::from_snake_name(event.snake_name()), Some(event));
+        }
+        assert_eq!(ValueEvent::from_snake_name("checkout"), None);
+        assert_eq!(MAX_EVENT_USD, 100_000.0);
+        assert!(is_countable_usd(0.01) && is_countable_usd(MAX_EVENT_USD));
+        for usd in [0.0, -1.0, MAX_EVENT_USD + 0.01, f64::NAN, f64::INFINITY] {
+            assert!(!is_countable_usd(usd), "{usd}");
         }
     }
 

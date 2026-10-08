@@ -1,10 +1,35 @@
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, CounterVec, Gauge, Histogram,
-    HistogramOpts, HistogramVec, Opts,
+    register_counter_vec, register_gauge, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge_vec, CounterVec, Gauge, Histogram, HistogramOpts,
+    HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
 };
 
 lazy_static! {
+    pub static ref VALUE_MODEL_REQUESTS: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_value_model_requests_total",
+            "Rank requests by scoring mode (passthrough, value_model, fallback)"
+        ),
+        &["mode"]
+    )
+    .unwrap();
+    pub static ref VALUE_MODEL_FALLBACK: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_value_model_fallback_total",
+            "Rank requests that fell back to the upstream candidate score"
+        ),
+        &["reason"]
+    )
+    .unwrap();
+    pub static ref VALUE_MODEL_STAGE: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_value_model_stage_total",
+            "Value-model requests by whether heads were weighted (heads) or the caller supplied every candidate's weighted score and only per-request adjustments ran (cached_weighted)"
+        ),
+        &["stage"]
+    )
+    .unwrap();
     pub static ref SCORE_REQUESTS: CounterVec = register_counter_vec!(
         Opts::new(
             "vm_ranker_requests_total",
@@ -49,7 +74,7 @@ lazy_static! {
         &["value_model_id"]
     )
     .unwrap();
-    pub static ref DPP_SEED_CONTEXT: CounterVec = register_counter_vec!(
+            pub static ref DPP_SEED_CONTEXT: CounterVec = register_counter_vec!(
         Opts::new(
             "vm_ranker_dpp_seed_context_total",
             "Rank requests with a seed_tweet_id, by whether the seed embedding was found"
@@ -57,41 +82,34 @@ lazy_static! {
         &["result"]
     )
     .unwrap();
-    pub static ref DPP_RESCALING: HistogramVec = register_histogram_vec!(
+            pub static ref DPP_RESCALING: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_rescaling",
             "Per-request count of DPP-selected candidates by rescaling direction"
         )
-        .buckets(vec![
-            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 30.0, 50.0
-        ]),
+        .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 30.0, 50.0]),
         &["direction"]
     )
     .unwrap();
-    pub static ref DPP_TOP_K_OVERLAP: HistogramVec = register_histogram_vec!(
+        pub static ref DPP_TOP_K_OVERLAP: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_top_k_overlap",
             "Overlap count between DPP-selected items and original top-K (by input score)"
         )
-        .buckets(vec![
-            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 30.0, 50.0
-        ]),
+        .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 30.0, 50.0]),
         &["k"]
     )
     .unwrap();
-    pub static ref DPP_SELECTED_COUNT: HistogramVec = register_histogram_vec!(
+            pub static ref DPP_SELECTED_COUNT: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_selected_count",
             "Number of items selected by greedy DPP per request"
         )
-        .buckets(vec![
-            0.0, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 48.0, 50.0, 55.0,
-            75.0, 100.0
-        ]),
+        .buckets(vec![0.0, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 48.0, 50.0, 55.0, 75.0, 100.0]),
         &["top_k"]
     )
     .unwrap();
-    pub static ref DPP_LOG_DET: HistogramVec = register_histogram_vec!(
+            pub static ref DPP_LOG_DET: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_log_det",
             "Log-determinant of the DPP-selected subset (measures diversity volume)"
@@ -100,19 +118,16 @@ lazy_static! {
         &["top_k"]
     )
     .unwrap();
-    pub static ref DPP_AVG_SIMILARITY: HistogramVec = register_histogram_vec!(
+                pub static ref DPP_AVG_SIMILARITY: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_avg_similarity",
             "Average pairwise cosine similarity before/after DPP (lower = more diverse)"
         )
-        .buckets(vec![
-            -1.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5,
-            0.7, 1.0
-        ]),
+        .buckets(vec![-1.0, -0.5, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.7, 1.0]),
         &["stage"]
     )
     .unwrap();
-    pub static ref DPP_TERMINAL_CV: HistogramVec = register_histogram_vec!(
+                    pub static ref DPP_TERMINAL_CV: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_terminal_cv",
             "Conditional variance of the best unchosen item when DPP stopped selecting"
@@ -123,38 +138,106 @@ lazy_static! {
         &["reason"]
     )
     .unwrap();
-    pub static ref DPP_POOL_SIZE: HistogramVec = register_histogram_vec!(
+                pub static ref DPP_POOL_SIZE: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_pool_size",
             "Number of candidates in the DPP pool after pre-filtering"
         )
-        .buckets(vec![
-            0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 100.0, 150.0, 200.0, 300.0
-        ]),
+        .buckets(vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 75.0, 100.0, 150.0, 200.0, 300.0]),
         &["max_selected_rank"]
     )
     .unwrap();
-    pub static ref DPP_POOL_SCORES: HistogramVec = register_histogram_vec!(
+                    pub static ref DPP_POOL_SCORES: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_pool_scores",
             "Score distribution summary of candidates in the DPP pool"
         )
         .buckets(vec![
-            -10.0, -5.0, -1.0, -0.5, -0.1, 0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0,
-            50.0, 100.0, 500.0, 1000.0,
+            -10.0, -5.0, -1.0, -0.5, -0.1, 0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0,
+            10.0, 20.0, 50.0, 100.0, 500.0, 1000.0,
         ]),
         &["stat"]
     )
     .unwrap();
-    pub static ref DPP_EMBEDDING_MISS_RATIO: HistogramVec = register_histogram_vec!(
+            pub static ref DPP_EMBEDDING_MISS_RATIO: HistogramVec = register_histogram_vec!(
         HistogramOpts::new(
             "vm_ranker_dpp_embedding_miss_ratio",
             "Fraction of DPP candidate pool items with missing embeddings (zero vector)"
         )
-        .buckets(vec![
-            0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0
-        ]),
+        .buckets(vec![0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0]),
         &["pool_size"]
+    )
+    .unwrap();
+    pub static ref CONFIG_SYNC_LAST_SUCCESS_SECS: Gauge = register_gauge!(
+        "vm_ranker_config_sync_last_success_timestamp_seconds",
+        "Unix time of the last successful config poll (fetch succeeded, files current)"
+    )
+    .unwrap();
+    pub static ref CONFIG_SYNC_HEAD_AGE_SECS: Gauge = register_gauge!(
+        "vm_ranker_config_sync_head_age_seconds",
+        "Age of the served config revision's commit at the last successful poll"
+    )
+    .unwrap();
+    pub static ref CONFIG_SYNC_FAILURES: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_config_sync_failures_total",
+            "Config poll failures by stage"
+        ),
+        &["stage"]
+    )
+    .unwrap();
+    pub static ref CONFIG_SYNC_APPLIED: IntCounter = register_int_counter!(
+        "vm_ranker_config_sync_applied_total",
+        "Config revisions applied (files replaced and feature switches reloaded)"
+    )
+    .unwrap();
+    pub static ref CONFIG_SYNC_REVISION: IntGaugeVec = register_int_gauge_vec!(
+        Opts::new(
+            "vm_ranker_config_sync_revision",
+            "1 for the config-repo revision currently served"
+        ),
+        &["revision"]
+    )
+    .unwrap();
+    pub static ref PARAMS_RESOLVED: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_params_resolved_total",
+            "Rank requests by whether ranking parameters were resolved from the viewer context"
+        ),
+        &["outcome"]
+    )
+    .unwrap();
+    pub static ref AUTHOR_EXPLORATION_CANDIDATES: IntCounterVec = register_int_counter_vec!(
+        Opts::new(
+            "vm_ranker_author_exploration_candidates_total",
+            "Value-model candidates by whether their author has a non-zero exploration bonus"
+        ),
+        &["bonus"]
+    )
+    .unwrap();
+    pub static ref SAMPLED_CANDIDATES: IntCounter = register_int_counter!(
+        "vm_ranker_sampled_candidates_total",
+        "Candidates with Phoenix heads in sampled value-model requests"
+    )
+    .unwrap();
+    pub static ref HEAD_PREDICTION_SUM: CounterVec = register_counter_vec!(
+        Opts::new(
+            "vm_ranker_head_prediction_sum",
+            "Sum of Phoenix head predictions over sampled candidates"
+        ),
+        &["head"]
+    )
+    .unwrap();
+    pub static ref CANDIDATE_SCORE: HistogramVec = register_histogram_vec!(
+        HistogramOpts::new(
+            "vm_ranker_candidate_score",
+            "Per-candidate value-model scores in sampled requests: weighted (offset base) and ranked (after cold start, author diversity and OON, before DPP)"
+        )
+        .buckets(vec![
+            0.0, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2,
+            0.3, 0.5, 0.75, 1.0, 2.0, 5.0, 10.0,
+        ]),
+        &["stage"]
     )
     .unwrap();
 }

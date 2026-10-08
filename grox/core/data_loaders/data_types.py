@@ -215,6 +215,15 @@ class VideoInfo(BaseModel):
         return max(bitrates) if bitrates else None
 
 
+class RankingQuery(BaseModel):
+    model_config = {"frozen": True}
+
+    name: str
+    frame_instruction: str
+    positive_query: str
+    negative_query: str
+
+
 class Video(BaseModel):
     id: str | None = None
     url: str | None = None
@@ -222,6 +231,7 @@ class Video(BaseModel):
     animatedGifInfo: VideoInfo | None = None
     convo_video: ConvoVideo | None = None
     crop_seconds: float | None = None
+    key_frames_ranking: RankingQuery | None = None
 
     @classmethod
     def from_thrift_model(cls, media_entity: t.MediaEntity) -> "Video":

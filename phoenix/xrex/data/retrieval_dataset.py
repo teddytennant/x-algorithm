@@ -13,6 +13,11 @@ import numpy as np
 import pyarrow.parquet as pq
 
 from xrex import settings
+from xrex.data.cold_pool_filter import (
+    cold_pool_mask,
+    default_cold_pool_metadata_path,
+    fresh_post_mask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +277,8 @@ class RetrievalDataset(Enum):
         settings.DPA_INDEX_URI,
         settings.DPA_INDEX_URI,
     )
+    HOME_COLD = (13, *_sid_window("1fav_1day.parquet"))
+    HOME_HOT = (14, *_sid_window("1fav_1day.parquet"))
 
     def __new__(cls, value: int, path: str | None = None, backup_path: str | None = None):
         obj = object.__new__(cls)
@@ -279,6 +286,36 @@ class RetrievalDataset(Enum):
         obj.path = path
         obj.backup_path = backup_path
         return obj
+
+    @classmethod
+    def home_slices(cls) -> tuple[RetrievalDataset, RetrievalDataset]:
+        return (cls.HOME_COLD, cls.HOME_HOT)
+
+    @classmethod
+    def expand_home_to_cold_hot(cls, datasets: list[RetrievalDataset]) -> list[RetrievalDataset]:
+        out: list[RetrievalDataset] = []
+        for ds in datasets:
+            if ds is cls.HOME:
+                out.extend(cls.home_slices())
+            else:
+                out.append(ds)
+        return out
+
+    @classmethod
+    def mask_values(cls, ds_value: int) -> tuple[int, ...]:
+        if ds_value == cls.HOME.value:
+            return (cls.HOME_COLD.value, cls.HOME_HOT.value, cls.HOME.value)
+        return (ds_value,)
+
+    @classmethod
+    def home_union_range(cls, ranges: dict[int, tuple[int, int]]) -> tuple[int, int] | None:
+        cold = ranges.get(cls.HOME_COLD.value)
+        hot = ranges.get(cls.HOME_HOT.value)
+        if cold is not None and hot is not None:
+            if cold[1] == hot[0]:
+                return (cold[0], hot[1])
+            return ranges.get(cls.HOME.value)
+        return ranges.get(cls.HOME.value) or cold or hot
 
     def _get_valid_path(self) -> str | None:
         for p in (self.path, self.backup_path):
@@ -358,26 +395,84 @@ class RetrievalDataset(Enum):
         *,
         read_post_sid: bool = False,
         sid_num_levels: int = 6,
+        cold_pool_metadata_path: str | Path | None = None,
+        cold_start_max_age_seconds: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         start = time.time()
         post_ids_list, author_ids_list, types_list, sids_list = [], [], [], []
         any_sid_loaded = False
+        home_source: tuple[np.ndarray, np.ndarray, np.ndarray | None] | None | bool = False
 
-        for ds in datasets:
-            if (
-                result := ds.load(read_post_sid=read_post_sid, sid_num_levels=sid_num_levels)
-            ) is None:
-                continue
-            pids, aids, sids = result
+        def _append(
+            pids: np.ndarray,
+            aids: np.ndarray,
+            sids: np.ndarray | None,
+            ds_value: int,
+        ) -> None:
+            nonlocal any_sid_loaded
             post_ids_list.append(pids)
             author_ids_list.append(aids)
-            types_list.append(np.full(len(pids), ds.value, dtype=np.int32))
+            types_list.append(np.full(len(pids), ds_value, dtype=np.int32))
             if read_post_sid:
                 if sids is None:
                     sids_list.append(np.full((len(pids), sid_num_levels), -1, dtype=np.int32))
                 else:
                     sids_list.append(sids)
                     any_sid_loaded = True
+
+        def _load_home_source() -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
+            nonlocal home_source
+            if home_source is False:
+                home_source = cls.HOME.load(
+                    read_post_sid=read_post_sid, sid_num_levels=sid_num_levels
+                )
+            return None if home_source is False else home_source
+
+        for ds in datasets:
+            if ds in cls.home_slices():
+                result = _load_home_source()
+                if result is None:
+                    continue
+                pids, aids, sids = result
+                meta_path = cold_pool_metadata_path or default_cold_pool_metadata_path()
+                mask = cold_pool_mask(pids, meta_path)
+                if mask is None:
+                    keep = (
+                        np.ones(len(pids), dtype=bool)
+                        if ds is cls.HOME_HOT
+                        else np.zeros(len(pids), dtype=bool)
+                    )
+                    logger.warning(
+                        "%s: cold-pool metadata missing; %s",
+                        ds.name,
+                        "keeping all HOME rows" if ds is cls.HOME_HOT else "emitting 0 rows",
+                    )
+                else:
+                    cold_keep = mask & fresh_post_mask(pids, cold_start_max_age_seconds)
+                    keep = cold_keep if ds is cls.HOME_COLD else ~cold_keep
+                n_keep = int(np.count_nonzero(keep))
+                logger.info(
+                    "%s: %s/%s posts after cold-pool split",
+                    ds.name,
+                    f"{n_keep:,}",
+                    f"{len(pids):,}",
+                )
+                if n_keep == 0:
+                    continue
+                _append(
+                    pids[keep],
+                    aids[keep],
+                    None if sids is None else sids[keep],
+                    ds.value,
+                )
+                continue
+
+            if (
+                result := ds.load(read_post_sid=read_post_sid, sid_num_levels=sid_num_levels)
+            ) is None:
+                continue
+            pids, aids, sids = result
+            _append(pids, aids, sids, ds.value)
 
         if not post_ids_list:
             raise FileNotFoundError("No dataset files found")

@@ -127,13 +127,13 @@ impl VMRankerClient for ProdVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if result.is_ok() { "success" } else { "failure" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(METRIC_NAME, &scope, 1);
             receiver.observe(
                 METRIC_NAME,
-                &[("cluster", cluster_label.as_str())],
+                &[("vm_cluster", cluster_label.as_str())],
                 latency_ms,
                 HistogramBuckets::Bucket500To1000,
             );
@@ -270,7 +270,7 @@ impl XdsVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if built { "built" } else { "skipped" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(XDS_BUILD_METRIC_NAME, &scope, 1);
@@ -292,7 +292,7 @@ impl XdsVMRankerClient {
                 if let Some(receiver) = global_stats_receiver() {
                     receiver.gauge(
                         XDS_ENDPOINTS_METRIC_NAME,
-                        &[("cluster", cluster_label.as_str())],
+                        &[("vm_cluster", cluster_label.as_str())],
                         count as f64,
                     );
                 }
@@ -332,13 +332,13 @@ impl VMRankerClient for XdsVMRankerClient {
             let cluster_label = format!("{cluster:?}");
             let result_label = if result.is_ok() { "success" } else { "failure" };
             let scope = [
-                ("cluster", cluster_label.as_str()),
+                ("vm_cluster", cluster_label.as_str()),
                 ("result", result_label),
             ];
             receiver.incr(XDS_METRIC_NAME, &scope, 1);
             receiver.observe(
                 XDS_METRIC_NAME,
-                &[("cluster", cluster_label.as_str())],
+                &[("vm_cluster", cluster_label.as_str())],
                 latency_ms,
                 HistogramBuckets::Bucket500To1000,
             );

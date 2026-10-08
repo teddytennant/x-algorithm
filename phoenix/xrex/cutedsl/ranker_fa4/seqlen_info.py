@@ -37,7 +37,8 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
-from quack import copy_utils
+
+from xrex.cutedsl.quack import copy_utils
 
 
 @dataclass(frozen=True)

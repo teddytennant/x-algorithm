@@ -36,8 +36,8 @@ This repository contains the core code that determines which posts a viewer sees
 
 Notable updates:
 
-- **How weights work.** There's a common misconception about how weights related to actions (e.g. Like, Share, Block, Report, etc) work in ranking. The weights scale the predicted probabilities of such actions (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior. We've [added comments](home-mixer/params/param.rs) [to the code](home-mixer/scorers/ranking_scorer.rs) so that LLMs or people reading it are more likely to understand it correctly.
-- **Brazil 2026 Elections.** As [announced by X](https://x.com/XBR/status/2088341967864320507?s=20), in accordance with Brazilian electoral law, For You now runs `Brazil2026ElectionFilter`, which removes posts from accounts reported to Brazil's Electoral Court for the 2026 election, unless the viewer explicitly follows the account. *(Account list updated August 27, 2026.)* A benefit of open-source is that you can see that changes like this exist, and exactly how they work — take a [look at the code](home-mixer/filters/brazil_2026_election_filter.rs).
+- **How weights work.** There's a common misconception about how weights related to actions (e.g. Like, Share, Block, Report, etc) work in ranking. The weights scale the predicted probabilities of such actions (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior. We've [added comments](home-mixer/params/param.rs) [to the code](xai-value-model/scoring.rs) so that LLMs or people reading it are more likely to understand it correctly.
+- **Brazil 2026 Elections.** As [announced by X](https://x.com/XBR/status/2088341967864320507?s=20), in accordance with Brazilian electoral law, For You now runs `Brazil2026ElectionFilter`, which removes posts from accounts reported to Brazil's Electoral Court for the 2026 election, unless the viewer explicitly follows the account. *(Account list updated September 29, 2026.)* A benefit of open-source is that you can see that changes like this exist, and exactly how they work — take a [look at the code](home-mixer/filters/brazil_2026_election_filter.rs).
 
 ### August 13th, 2026
 
@@ -65,7 +65,7 @@ This update is also paired with a new [**Under the Hood**](#under-the-hood-label
 The For You feed is assembled per request. Posts come from two places:
 
 1. **In-Network** — [`thunder/`](thunder/) keeps recent posts from the accounts a viewer follows in memory
-2. **Out-of-Network** — [`phoenix/`](phoenix/) retrieval and [`simclusters/`](simclusters/) find posts from accounts the viewer does not follow
+2. **Out-of-Network** — [`phoenix/`](phoenix/) retrieval and [`simclusters/`](simclusters/) find posts from accounts the viewer does not follow. [`popular_posts_source`](home-mixer/sources/popular_posts_source.rs) adds a shared list of popular recent posts.
 
 Both are ranked together by the same model. **Phoenix** reads the viewer's recent engagement history and predicts, for each post, how likely the viewer is to take each action on it. Those predictions are combined into one score using weights held in the code — see [Scoring and Ranking](#scoring-and-ranking).
 
@@ -105,7 +105,7 @@ Ranking sets the order. Whether a post can be shown at all is decided separately
 │  │    │ IN-NETWORK                    │ │ OUT-OF-NETWORK                         │    │  │
 │  │    │ <a href="thunder/">Thunder</a>                       │ │ <a href="phoenix/">Phoenix retrieval</a>   retrieval model    │    │  │
 │  │    │   recent posts from the       │ │ <a href="simclusters/">SimClusters</a>         cluster similarity │    │  │
-│  │    │   accounts the viewer follows │ │                                        │    │  │
+│  │    │   accounts the viewer follows │ │ <a href="home-mixer/sources/popular_posts_source.rs">Popular posts</a>       shared list        │    │  │
 │  │    └───────────────────────────────┘ └────────────────────────────────────────┘    │  │
 │  └────────────────────────────────────────────────────────────────────────────────────┘  │
 │                                            ▼                                             │
@@ -125,7 +125,7 @@ Ranking sets the order. Whether a post can be shown at all is decided separately
 │  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
 │  │ 5. SCORING                                                                         │  │
 │  │    <a href="home-mixer/scorers/phoenix_scorer.rs">PhoenixScorer</a>   a probability for each action the viewer might take             │  │
-│  │    <a href="home-mixer/scorers/ranking_scorer.rs">RankingScorer</a>   weighted sum, then repeated-author decay, an                    │  │
+│  │    <a href="home-mixer/scorers/value_model.rs">RankingScorer</a>   weighted sum, then repeated-author decay, an                    │  │
 │  │                    out-of-network discount, a new-author boost                     │  │
 │  │    <a href="home-mixer/scorers/vm_ranker.rs">VMRanker</a>        calls the reranking service in <a href="vm-ranker/">vm-ranker/</a>                       │  │
 │  └────────────────────────────────────────────────────────────────────────────────────┘  │
@@ -192,6 +192,7 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 │                                                                                          │
 │    <a href="abuse-enforcement-service/">abuse-enforcement-service/</a>  reads model scores about an account. Its                  │
 │       rules label the account or its posts, challenge it, or suspend it.                 │
+│       It does not re-apply an action overturned on appeal (<a href="abuse-ledger-service/">abuse-ledger-service/</a>).       │
 │                                                                                          │
 │    <a href="safety-label-user-agg/">safety-label-user-agg/</a>  labels an account for what its posts collected.               │
 │                                                                                          │
@@ -203,9 +204,10 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
                                              ▼
 ┌───────────────────  4. VISIBILITY FILTERING   <a href="visibility-filtering/">visibility-filtering/</a>  ────────────────────┐
 │                                                                                          │
-│    for each post and viewer, one of three answers:                                       │
+│    for each post and viewer, one of four answers:                                        │
 │                                                                                          │
 │       ALLOW          show the post normally                                              │
+│       NOTICE         show the post with a notice attached to it                          │
 │       INTERSTITIAL   show it behind an interstitial the viewer can tap                   │
 │                      through, e.g. for adult or graphic media                            │
 │       DROP           do not show it                                                      │
@@ -226,6 +228,8 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 │               itself dropped                                                             │
 │    interstitial  ──►  the post stays in the feed; nothing in this                        │
 │               repository draws the interstitial                                          │
+│    notice  ──►  the post stays in the feed; nothing in this                              │
+│               repository draws the notice                                                │
 │                                                                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 </pre>
@@ -252,11 +256,12 @@ Stages can be switched on and off individually, with defaults in [`home-mixer/pa
 ### Candidate Sources
 
 
-| Component                        | What it does                                                                                              |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| [`thunder/`](thunder/)           | Holds recent posts in memory as they are published, and returns those from the accounts a viewer follows. |
-| [`phoenix/`](phoenix/) retrieval | Embeds the viewer and each post as vectors, and returns the posts nearest the viewer.                     |
-| [`simclusters/`](simclusters/)   | Clusters accounts and posts by who engages with what, then uses the clusters to find candidates.          |
+| Component                                                               | What it does                                                                                              |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| [`thunder/`](thunder/)                                                  | Holds recent posts in memory as they are published, and returns those from the accounts a viewer follows. |
+| [`phoenix/`](phoenix/) retrieval                                        | Embeds the viewer and each post as vectors, and returns the posts nearest the viewer.                     |
+| [`simclusters/`](simclusters/)                                          | Clusters accounts and posts by who engages with what, then uses the clusters to find candidates.          |
+| [`popular_posts_source.rs`](home-mixer/sources/popular_posts_source.rs) | A shared list of popular recent posts, initially from the most-followed active accounts.                                     |
 
 
 
@@ -312,9 +317,10 @@ These produce the scores and labels that Visibility Filtering reads.
 | [`botmaker/`](botmaker/)                                       | That rule engine: the language rules are written in, its compiler, and its runtime.                                                                                                                           |
 | [`botmaker-rules/`](botmaker-rules/)                           | The rules `scarecrow` loads. To reduce the risk of gaming to circumvent these systems, some rules aren't currently in this repository.                                                                        |
 | [`abuse-enforcement-service/`](abuse-enforcement-service/)     | Acts on model scores about an account rather than on events: labels it or its posts, challenges it, or suspends it.                                                                                           |
+| [`abuse-ledger-service/`](abuse-ledger-service/)               | Answers whether an account has an active appeal hold: when an enforcement is overturned on appeal, `abuse-enforcement-service` does not re-apply that action for a fixed period, set per appeal queue.        |
 | [`safety-label-user-agg/`](safety-label-user-agg/)             | Labels an account for what its posts collected.                                                                                                                                                               |
 | [`visibility-filtering-client/`](visibility-filtering-client/) | The client callers use to reach visibility filtering, and the post safety-label types it answers with.                                                                                                        |
-| [`under-the-hood/`](under-the-hood/)                           | Builds the per-account [Under the Hood](#under-the-hood-label-transparency-tool) report: daily jobs collect the labels applied to an account and its posts, which the serving layer aggregates over a period. |
+| [`under-the-hood/`](under-the-hood/)                           | Builds the per-account [Under the Hood](#under-the-hood-label-transparency-tool) report: daily jobs collect the labels applied to an account and its posts, which the serving layer aggregates over a period, and displays as a [page](under-the-hood/jetfuel/) or JSON file. |
 | [`takedowns/`](takedowns/)                                     | Produces the takedown-reason list that [`rules/context.rs`](visibility-filtering/rules/context.rs) applies: the tweet entity service merges a post's own reasons with its author's account-level ones. |
 
 
@@ -333,7 +339,7 @@ Phoenix predicts a probability for each action:
 ```
 Engagement    favorite · reply · repost · quote · share · share via DM · share via copy link
 Clicks        post · profile · link · photo expand · video open · quoted post
-Attention     video quality view · dwell · dwell time · click dwell time · active seconds
+Attention     video quality view · dwell · dwell time · click dwell time · video continuation seconds · profile visit seconds
 Author        follow author
 Negative      not interested · mute author · block author · report · not dwelled
 ```
@@ -344,7 +350,7 @@ Negative      not interested · mute author · block author · report · not dwe
 Final Score = Σ (weight_i × P(action_i))
 ```
 
-Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`home-mixer/scorers/ranking_scorer.rs`](home-mixer/scorers/ranking_scorer.rs).
+Positive actions carry positive weights, negative actions negative ones. The weights are in [`home-mixer/params/param.rs`](home-mixer/params/param.rs); the arithmetic is in [`xai-value-model/scoring.rs`](xai-value-model/scoring.rs).
 
 There is a common misconception to be aware of about the weights: they scale the predicted probabilities (or predicted continuous values, e.g. dwell time) — they do *not* scale the raw engagement counts, so e.g. it'd be incorrect to see that a report has 468 times higher weight than a like and conclude that e.g. "1 report cancels out 468 likes". The weights are a multiple on your own predicted probability of Liking, Reporting, etc, which is substantially driven by your own behavior.
 
@@ -376,10 +382,12 @@ Three adjustments follow:
 | `PreviouslyServedPostsFilter`     | Posts already served earlier in the session                                                       |
 | `MutedKeywordFilter`              | Posts matching the viewer's muted keywords                                                        |
 | `AuthorSocialgraphFilter`         | Posts from accounts the viewer blocks or mutes                                                    |
+| `Brazil2026ElectionFilter`        | Posts from accounts reported to Brazil's Electoral Court — see [Notable Updates](#august-14th-2026) |
 | `VideoFilter`                     | Video posts, when the request excludes video                                                      |
 | `TopicIdsFilter`                  | Posts outside the requested topics, and posts in excluded topics                                  |
 | `NewUserMinEngagementFilter`      | For new accounts, out-of-network posts below an engagement threshold                              |
 | `InventoryHoldoutFilter`          | A configured percentage of posts, chosen deterministically per post and viewer                    |
+| `FavHoldoutFilter`                | A percentage of posts set by each post's like count, chosen deterministically per post and viewer |
 
 
 Already-seen posts are handled twice over: `ThunderSource` is passed the list and leaves them out, the other sources are not, so their repeats are caught by the filters above.
@@ -445,7 +453,7 @@ The focus of the repository is transparency into the code that affects post visi
 
 We're piloting a new transparency tool that lets people see aggregate statistics about the visibility-impacting labels on their account and posts. Paired with the code in this repository, we believe this gives people valuable insight into the visibility of their posts.
 
-The tool is [available here](https://x.com/i/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/).
+The tool is [available here](https://x.com/i/jf/under_the_hood) — we'll be shaping it based on your feedback and expanding availability over time. The jobs and serving code that build the report are in [`under-the-hood/`](under-the-hood/). The page that renders it is in [`under-the-hood/jetfuel/`](under-the-hood/jetfuel/).
 
 ---
 

@@ -52,6 +52,6 @@ public class ListOperator extends FunctionNode<Runtime> {
 
   @Override
   protected Object apply(Context<Runtime> context, List<Object> args) {
-    return args; 
+    return args;
   }
 }

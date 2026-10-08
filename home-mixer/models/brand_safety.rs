@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use xai_ads_injection_proto::ads_injected_timeline::SafetyLabelType as AuthorLabel;
 use xai_x_thrift::tweet_safety_label::{SafetyLabel, SafetyLabelSource, SafetyLabelType};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10,6 +11,63 @@ pub enum BrandSafetyVerdict {
     LowRisk = 2,
     MediumRisk = 3,
     HighRisk = 4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorBrandSafetyFallback {
+    Sfa,
+    NsfaLimited,
+    Nsfa,
+}
+
+impl AuthorBrandSafetyFallback {
+    pub fn from_proto(label: AuthorLabel) -> Option<Self> {
+        match label {
+            AuthorLabel::GrokSfa => Some(Self::Sfa),
+            AuthorLabel::GrokNsfaLimited => Some(Self::NsfaLimited),
+            AuthorLabel::GrokNsfa => Some(Self::Nsfa),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sfa => "sfa",
+            Self::NsfaLimited => "nsfa_limited",
+            Self::Nsfa => "nsfa",
+        }
+    }
+
+    pub fn grok_label(&self) -> SafetyLabelType {
+        match self {
+            Self::Sfa => SafetyLabelType::GROK_SFA,
+            Self::NsfaLimited => SafetyLabelType::GROK_NSFA_LIMITED,
+            Self::Nsfa => SafetyLabelType::GROK_NSFA,
+        }
+    }
+}
+
+pub(crate) fn with_author_fallback(
+    labels: &HashMap<SafetyLabelType, SafetyLabel>,
+    fallback: AuthorBrandSafetyFallback,
+) -> HashMap<SafetyLabelType, SafetyLabel> {
+    let mut labels = labels.clone();
+    labels.insert(fallback.grok_label(), SafetyLabel::default());
+    labels
+}
+
+pub(crate) const GROK_LABELS: &[SafetyLabelType] = &[
+    SafetyLabelType::GROK_SFA,
+    SafetyLabelType::GROK_NSFA_LIMITED,
+    SafetyLabelType::GROK_NSFA,
+    SafetyLabelType::GROK_SFA_V2,
+    SafetyLabelType::GROK_NSFA_LIMITED_V2,
+    SafetyLabelType::GROK_NSFA_V2,
+    SafetyLabelType::GROK_NSFA_EXPANDED_V2,
+];
+
+pub(crate) fn has_grok_label(labels: &HashMap<SafetyLabelType, SafetyLabel>) -> bool {
+    GROK_LABELS.iter().any(|l| labels.contains_key(l))
 }
 
 pub(crate) const HIGH_RISK_LABELS: &[SafetyLabelType] = &[
@@ -45,6 +103,7 @@ const PTOS_CUTOFF_TWEET_ID: u64 = 2_054_275_414_225_846_272;
 pub fn compute_verdict(
     labels: &HashMap<SafetyLabelType, SafetyLabel>,
     tweet_id: u64,
+    require_ptos_review: bool,
 ) -> BrandSafetyVerdict {
     if HIGH_RISK_LABELS.iter().any(|l| labels.contains_key(l)) {
         return BrandSafetyVerdict::HighRisk;
@@ -60,7 +119,7 @@ pub fn compute_verdict(
         return BrandSafetyVerdict::MediumRisk;
     }
 
-    if tweet_id >= PTOS_CUTOFF_TWEET_ID && !labels.contains_key(&SafetyLabelType::PTOS_REVIEWED) {
+    if require_ptos_review && fails_ptos_review(labels, tweet_id) {
         return BrandSafetyVerdict::MediumRisk;
     }
 
@@ -99,9 +158,10 @@ const V2_WRITTEN_LABELS: &[SafetyLabelType] = &[
 pub(crate) fn compute_verdict_v2(
     labels: &HashMap<SafetyLabelType, SafetyLabel>,
     tweet_id: u64,
+    require_ptos_review: bool,
 ) -> BrandSafetyVerdict {
     if !V2_WRITTEN_LABELS.iter().any(|l| labels.contains_key(l)) {
-        return compute_verdict(labels, tweet_id);
+        return compute_verdict(labels, tweet_id, require_ptos_review);
     }
     if HIGH_RISK_LABELS.iter().any(|l| labels.contains_key(l)) {
         return BrandSafetyVerdict::HighRisk;
@@ -116,7 +176,7 @@ pub(crate) fn compute_verdict_v2(
         return BrandSafetyVerdict::MediumRisk;
     }
 
-    if tweet_id >= PTOS_CUTOFF_TWEET_ID && !labels.contains_key(&SafetyLabelType::PTOS_REVIEWED) {
+    if require_ptos_review && fails_ptos_review(labels, tweet_id) {
         return BrandSafetyVerdict::MediumRisk;
     }
 
@@ -125,6 +185,10 @@ pub(crate) fn compute_verdict_v2(
     }
 
     BrandSafetyVerdict::Safe
+}
+
+fn fails_ptos_review(labels: &HashMap<SafetyLabelType, SafetyLabel>, tweet_id: u64) -> bool {
+    tweet_id >= PTOS_CUTOFF_TWEET_ID && !labels.contains_key(&SafetyLabelType::PTOS_REVIEWED)
 }
 
 pub fn worst_verdict(a: &BrandSafetyVerdict, b: &BrandSafetyVerdict) -> BrandSafetyVerdict {
@@ -176,7 +240,7 @@ mod tests {
     fn safe_with_grok_sfa_only() {
         let labels = labels_with(&[SafetyLabelType::GROK_SFA]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::Safe
         );
     }
@@ -188,7 +252,7 @@ mod tests {
             SafetyLabelType::NSFW_HIGH_PRECISION,
         ]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::HighRisk
         );
     }
@@ -197,7 +261,7 @@ mod tests {
     fn medium_risk_with_grok_nsfa() {
         let labels = labels_with(&[SafetyLabelType::GROK_SFA, SafetyLabelType::GROK_NSFA]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
     }
@@ -209,7 +273,7 @@ mod tests {
             SafetyLabelType::NSFA_LIMITED_INVENTORY,
         ]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::LowRisk
         );
     }
@@ -221,7 +285,7 @@ mod tests {
             SafetyLabelType::GROK_NSFA_LIMITED,
         ]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::LowRisk
         );
     }
@@ -233,7 +297,7 @@ mod tests {
             SafetyLabelType::NSFA_LIMITED_INVENTORY,
         ]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::LowRisk
         );
     }
@@ -246,7 +310,7 @@ mod tests {
             SafetyLabelType::NSFW_HIGH_PRECISION,
         ]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::HighRisk
         );
     }
@@ -255,8 +319,21 @@ mod tests {
     fn post_cutoff_medium_risk_without_ptos_reviewed() {
         let labels = labels_with(&[SafetyLabelType::GROK_SFA]);
         assert_eq!(
-            compute_verdict(&labels, POST_CUTOFF_ID),
+            compute_verdict(&labels, POST_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
+        );
+    }
+
+    #[test]
+    fn post_cutoff_grok_sfa_is_safe_without_ptos_review_check() {
+        let labels = labels_with(&[SafetyLabelType::GROK_SFA]);
+        assert_eq!(
+            compute_verdict(&labels, POST_CUTOFF_ID, false),
+            BrandSafetyVerdict::Safe
+        );
+        assert_eq!(
+            compute_verdict_v2(&labels, POST_CUTOFF_ID, false),
+            BrandSafetyVerdict::Safe
         );
     }
 
@@ -264,7 +341,7 @@ mod tests {
     fn post_cutoff_safe_with_grok_sfa_and_ptos_reviewed() {
         let labels = labels_with(&[SafetyLabelType::GROK_SFA, SafetyLabelType::PTOS_REVIEWED]);
         assert_eq!(
-            compute_verdict(&labels, POST_CUTOFF_ID),
+            compute_verdict(&labels, POST_CUTOFF_ID, true),
             BrandSafetyVerdict::Safe
         );
     }
@@ -273,7 +350,7 @@ mod tests {
     fn pre_cutoff_safe_with_grok_sfa_only() {
         let labels = labels_with(&[SafetyLabelType::GROK_SFA]);
         assert_eq!(
-            compute_verdict(&labels, PRE_CUTOFF_ID),
+            compute_verdict(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::Safe
         );
     }
@@ -282,17 +359,17 @@ mod tests {
     fn v2_defers_to_v1_when_v2_has_not_ruled() {
         let v1_safe = labels_with(&[SafetyLabelType::GROK_SFA]);
         assert_eq!(
-            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID),
-            compute_verdict(&v1_safe, PRE_CUTOFF_ID)
+            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID, true),
+            compute_verdict(&v1_safe, PRE_CUTOFF_ID, true)
         );
         assert_eq!(
-            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID),
+            compute_verdict_v2(&v1_safe, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::Safe
         );
 
         let v1_nsfa = labels_with(&[SafetyLabelType::GROK_NSFA]);
         assert_eq!(
-            compute_verdict_v2(&v1_nsfa, PRE_CUTOFF_ID),
+            compute_verdict_v2(&v1_nsfa, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
         let v1_limited = labels_with(&[
@@ -300,18 +377,18 @@ mod tests {
             SafetyLabelType::GROK_NSFA_LIMITED,
         ]);
         assert_eq!(
-            compute_verdict_v2(&v1_limited, PRE_CUTOFF_ID),
+            compute_verdict_v2(&v1_limited, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::LowRisk
         );
 
         assert_eq!(
-            compute_verdict_v2(&labels_with(&[]), PRE_CUTOFF_ID),
+            compute_verdict_v2(&labels_with(&[]), PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
 
         let disagreement = labels_with(&[SafetyLabelType::GROK_SFA, SafetyLabelType::GROK_NSFA_V2]);
         assert_eq!(
-            compute_verdict_v2(&disagreement, PRE_CUTOFF_ID),
+            compute_verdict_v2(&disagreement, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
 
@@ -321,11 +398,11 @@ mod tests {
             SafetyLabelType::GROK_SFA_V2,
         ]);
         assert_eq!(
-            compute_verdict(&freed, PRE_CUTOFF_ID),
+            compute_verdict(&freed, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
         assert_eq!(
-            compute_verdict_v2(&freed, PRE_CUTOFF_ID),
+            compute_verdict_v2(&freed, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::Safe
         );
     }
@@ -372,8 +449,8 @@ mod tests {
             let v2_set = to_v2(v1_set);
             for tweet_id in [PRE_CUTOFF_ID, POST_CUTOFF_ID] {
                 assert_eq!(
-                    compute_verdict(&labels_with(v1_set), tweet_id),
-                    compute_verdict_v2(&labels_with(&v2_set), tweet_id),
+                    compute_verdict(&labels_with(v1_set), tweet_id, true),
+                    compute_verdict_v2(&labels_with(&v2_set), tweet_id, true),
                     "v1 {v1_set:?} vs v2 {v2_set:?} at tweet_id {tweet_id}"
                 );
             }
@@ -384,7 +461,7 @@ mod tests {
             SafetyLabelType::GROK_NSFA_EXPANDED_V2,
         ]);
         assert_eq!(
-            compute_verdict_v2(&labels, PRE_CUTOFF_ID),
+            compute_verdict_v2(&labels, PRE_CUTOFF_ID, true),
             BrandSafetyVerdict::MediumRisk
         );
 

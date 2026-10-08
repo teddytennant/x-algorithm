@@ -5,19 +5,20 @@ import concurrent.futures
 import enum
 import functools
 import gc
+import itertools
 import json
 import logging
 import math
+import operator
 import os
 import pathlib
 import shutil
 import signal
 import sys
-import tempfile
 import time
 import typing
 from dataclasses import dataclass, field, replace
-from typing import Iterator, NamedTuple
+from typing import Iterator, NamedTuple, Sequence
 
 import grpc
 import haiku as hk
@@ -29,14 +30,12 @@ import psutil
 from jax import shard_map
 from jax.experimental import multihost_utils
 from jax.sharding import (
-    Mesh,
     NamedSharding,
 )
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import DictKey, GetAttrKey, SequenceKey
 
 import xai_recsys_engine
-from xai_checkpointing import checksum
 from xai_checkpointing.common import _unsafe_jax2np
 from xai_checkpointing.tree_util import tree_to_dict
 from xai_configlib import configclass
@@ -64,6 +63,7 @@ from xrex.data.recsys.sequence_packing import (
     pack_batch,
 )
 from xrex.data.retrieval_dataset import RetrievalDataset
+from xrex.data.rust_kafka_recsys import RustKafkaDataset
 from xrex.data.streaming.kafkaloader import PhoenixKafkaDataset, report_training_metrics
 from xrex.eval.eval_utils import report_forward_eval_results
 from xrex.eval.metrics_recsys import merge_report_extras
@@ -76,14 +76,15 @@ from xrex.models.recsys_embedding import (
     RecsysEmbeddingsParameter,
     get_recsys_embed_param_to_jax_array,
 )
-from xrex.models.recsys_model import RecsysAggregatedModelConfig
+from xrex.models.recsys_model import (
+    CandidateInputs,
+    RecsysAggregatedModel,
+    RecsysAggregatedModelConfig,
+)
 from xrex.models.sharding_context import make_legacy_sharding_context
 from xrex.optimizers.optim import InjectHyperparamsState, apply_updates
 from xrex.optimizers.recsys import RecsysEmbeddingOptimConfig
-from xrex.optimizers.recsys.async_emb_gradient_update import (
-    AsyncEmbGradientUpdate,
-    AsyncEmbOptimizer,
-)
+from xrex.optimizers.recsys.protocol import AsyncEmbOptimizer
 from xrex.train.misc import (
     CheckpointConfig,
     PostEmbeddings,
@@ -94,12 +95,8 @@ from xrex.train.trainer import (
     Trainer,
     TrainerContext,
 )
-from xrex.utils import cluster, recsys_async_emb_lookup
+from xrex.utils import recsys_async_emb
 from xrex.utils.aot import JittedOrCompiled
-from xrex.utils.checkpoint_cloud import (
-    collect_cloud_upload_files,
-    ensure_orbax_dir_finalized,
-)
 from xrex.utils.checkpointing import wait_until_finished
 from xrex.utils.metrics import norm_metrics
 from xrex.utils.utils import (
@@ -110,182 +107,10 @@ logger = logging.getLogger(__name__)
 rank_logger = logging.getLogger("rank")
 
 
-_filtered_nt_cache: dict[tuple, type] = {}
-
-
-def _deep_filter_nones(tree):
-    _asdict = getattr(tree, "_asdict", None)
-    if _asdict is not None:
-        items = {k: _deep_filter_nones(v) for k, v in _asdict().items() if v is not None}
-        fields = tree._fields
-        if len(items) == len(fields):
-            return type(tree)(**items)
-        cache_key = (type(tree), tuple(items.keys()))
-        NT = _filtered_nt_cache.get(cache_key)
-        if NT is None:
-            NT = NamedTuple("X", [(k, type(v)) for k, v in items.items()])
-            _filtered_nt_cache[cache_key] = NT
-        return NT(**items)
-    return tree
-
-
 OUT_PATH = "/dev/shm"
 
 _DATA_POSITION_FILENAME = "data_position.json"
 _CONFIG_FILENAME = "config.json"
-
-
-def _download_ocdbt_coordinator(cloud_url: str, local_dir: str) -> None:
-    logger.info("[cloud-restore] downloading root metadata from %s", cloud_url)
-    xai_recsys_engine.download_prefix_to_local(
-        cloud_url,
-        local_dir,
-        32,
-        shallow=True,
-    )
-
-    root_d_url = f"{cloud_url.rstrip('/')}/d"
-    root_d_local = os.path.join(local_dir, "d")
-    os.makedirs(root_d_local, exist_ok=True)
-    logger.info("[cloud-restore] downloading root OCDBT data from %s", root_d_url)
-    xai_recsys_engine.download_prefix_to_local(root_d_url, root_d_local, 32)
-
-
-def _find_cross_process_files(local_dir: str, proc_idx: int) -> list[str]:
-    from xrex.utils.ocdbt import load_shard_sources
-
-    def _tensor_name(key: str) -> str:
-        idx = key.find("/c/")
-        if idx != -1:
-            return key[:idx]
-        return key
-
-    proc_dir = os.path.join(local_dir, f"ocdbt.process_{proc_idx}")
-    own_sources = load_shard_sources(proc_dir)
-    own_tensors = {_tensor_name(entry[0]) for entry in own_sources}
-
-    coordinator_sources = load_shard_sources(local_dir)
-
-    my_prefix = f"ocdbt.process_{proc_idx}/"
-    cross_process_files: set[str] = set()
-    for entry in coordinator_sources:
-        if len(entry) != 4:
-            continue
-        key, data_file, _, _ = entry
-        tensor = _tensor_name(key)
-        if tensor in own_tensors:
-            continue
-        if data_file.startswith(my_prefix):
-            continue
-        cross_process_files.add(data_file)
-
-    cross_process_manifests: set[str] = set()
-    for f in cross_process_files:
-        proc_dir_name = f.split("/")[0]
-        cross_process_manifests.add(f"{proc_dir_name}/manifest.ocdbt")
-
-    result = sorted(cross_process_files | cross_process_manifests)
-
-    missing_tensors = set()
-    cross_bytes = 0
-    for entry in coordinator_sources:
-        if len(entry) != 4:
-            continue
-        key, data_file, _, size = entry
-        tensor = _tensor_name(key)
-        if tensor not in own_tensors and data_file in cross_process_files:
-            missing_tensors.add(tensor)
-            cross_bytes += size
-
-    logger.info(
-        "[cloud-restore] proc %d: own db has %d tensors, "
-        "%d replicated tensors need cross-process download: %s "
-        "(%d files, %.1f MB)",
-        proc_idx,
-        len(own_tensors),
-        len(missing_tensors),
-        sorted(missing_tensors),
-        len(result),
-        cross_bytes / (1024 * 1024),
-    )
-    return result
-
-
-def _download_own_process_dir(cloud_url: str, local_dir: str, proc_idx: int) -> None:
-    proc_subdir = f"ocdbt.process_{proc_idx}"
-    proc_url = f"{cloud_url.rstrip('/')}/{proc_subdir}"
-    proc_local = os.path.join(local_dir, proc_subdir)
-    os.makedirs(proc_local, exist_ok=True)
-    logger.info(
-        "[cloud-restore] proc %d downloading own shard data from %s",
-        proc_idx,
-        proc_url,
-    )
-    n_files = xai_recsys_engine.download_prefix_to_local(proc_url, proc_local, 32)
-
-    manifest = os.path.join(proc_local, "manifest.ocdbt")
-    if n_files == 0 or not os.path.isfile(manifest):
-        raise FileNotFoundError(
-            f"[cloud-restore] proc {proc_idx}: own process directory "
-            f"{proc_subdir}/ is missing or incomplete on cloud "
-            f"(downloaded {n_files} files from {proc_url}). "
-            f"The checkpoint may have been saved with fewer processes, "
-            f"or some workers failed to upload their data."
-        )
-
-
-def _download_cross_process_files(
-    cloud_url: str,
-    local_dir: str,
-    proc_idx: int,
-    files: list[str],
-) -> None:
-    for rel_path in files:
-        local_path = os.path.join(local_dir, rel_path)
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-
-    logger.info(
-        "[cloud-restore] proc %d downloading %d cross-process files",
-        proc_idx,
-        len(files),
-    )
-    xai_recsys_engine.download_files_from_storage(
-        cloud_url,
-        files,
-        local_dir,
-        32,
-    )
-
-
-def _count_local_files(directory: str) -> tuple[int, int]:
-    count = 0
-    total_bytes = 0
-    for dirpath, _, filenames in os.walk(directory):
-        for fname in filenames:
-            fpath = os.path.join(dirpath, fname)
-            count += 1
-            total_bytes += os.path.getsize(fpath)
-    return count, total_bytes
-
-
-def _download_ocdbt_from_cloud(cloud_url: str, local_dir: str, proc_idx: int) -> None:
-    start = time.time()
-
-    _download_ocdbt_coordinator(cloud_url, local_dir)
-    _download_own_process_dir(cloud_url, local_dir, proc_idx)
-    cross_files = _find_cross_process_files(local_dir, proc_idx)
-    if cross_files:
-        _download_cross_process_files(cloud_url, local_dir, proc_idx, cross_files)
-
-    num_files, total_bytes = _count_local_files(local_dir)
-    elapsed = time.time() - start
-    logger.info(
-        "[cloud-restore] proc %d download complete: %d files, %.1f MB, %.1fs",
-        proc_idx,
-        num_files,
-        total_bytes / (1024 * 1024),
-        elapsed,
-    )
 
 
 @dataclass(frozen=True)
@@ -339,6 +164,14 @@ def pbroadcast(x, axis_name, source):
     axis_name = tuple(axis_name) if not isinstance(axis_name, tuple) else axis_name
     masked = jnp.where(jax.lax.axis_index(axis_name) == source, x, jnp.zeros_like(x))
     return jax.lax.psum(masked, axis_name)
+
+
+def _num_users(data: RecsysFeaturesBatch) -> int:
+    return math.prod(data["user_hashes"].shape[:-1])
+
+
+def _step_token_ids(token_ids: Sequence[jax.Array], data_axis) -> jax.Array:
+    return jax.lax.with_sharding_constraint(jnp.stack(token_ids), P(None, data_axis, None))
 
 
 def _pad_vocab_for_ep(emb: jax.Array, ep: int, name: str = "emb_table") -> jax.Array:
@@ -413,7 +246,7 @@ class RecsysTrainer(Trainer):
 
     empty_history_user_dropout_rate: float = 0.0
 
-    checkpoint_storage_urls: str = ""
+    split_home_checkpoint: bool = False
 
     export_stablehlo_bundle: bool = False
     export_bundle_bs_per_device: str = "1,2,4"
@@ -430,16 +263,15 @@ class RecsysTrainer(Trainer):
 
     use_async_emb: bool = False
 
+    use_row_emb: bool = False
+    row_emb_recv_factor: float = 2.0
+    num_microbatch: int = 1
+
     _async_emb_context: AsyncEmbContextHandle | None = field(default=None, init=False, repr=False)
     _emb_hash_vocab: int = field(default=0, init=False, repr=False)
     _first_step_embedding_lookup_start_jit: typing.Any = field(default=None, init=False, repr=False)
-    _empty_embedding_grad_update_jit: typing.Any = field(default=None, init=False, repr=False)
-    _apply_deferred_embedding_update_jit: typing.Any = field(default=None, init=False, repr=False)
     _async_emb_step_jit: typing.Any = field(default=None, init=False, repr=False)
     _async_emb_lookup_pin: jax.Array | None = field(default=None, init=False, repr=False)
-    _deferred_emb_grad_update: AsyncEmbGradientUpdate | None = field(
-        default=None, init=False, repr=False
-    )
     _batch_pipeline: BatchPipelineState = field(
         default_factory=BatchPipelineState, init=False, repr=False
     )
@@ -452,6 +284,13 @@ class RecsysTrainer(Trainer):
     _last_history_user_dropout_count: int = field(default=0, init=False, repr=False)
     _last_history_user_dropout_bsz: int = field(default=0, init=False, repr=False)
     _retrieval_post_emb_built: bool = field(default=False, init=False, repr=False)
+    dense_params_ema_decay: float = 0.0
+    dense_params_ema_in_checkpoint: bool = False
+    _dense_params_ema: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_init_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_update_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_gap_jit: typing.Any = field(default=None, init=False, repr=False)
+    _dense_params_ema_as_params_jit: typing.Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if self.using_seqpack and self.seqpack_fixed_length:
@@ -478,9 +317,12 @@ class RecsysTrainer(Trainer):
     _emb_optim: typing.Any = field(init=False, repr=False, compare=False, default=None)
     loss_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
     loss_fn_eval: typing.Any = field(init=False, repr=False, compare=False, default=None)
+    microbatch_loss_fns: typing.Any = field(init=False, repr=False, compare=False, default=None)
     forward_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
     two_tower_forward_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
     two_tower_forward_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
+    mol_side_table_fn: typing.Any = field(init=False, repr=False, compare=False, default=None)
+    mol_side_table_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
     candidate_tower_forward_fn: typing.Any = field(
         init=False, repr=False, compare=False, default=None
     )
@@ -492,10 +334,6 @@ class RecsysTrainer(Trainer):
     update_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
     forward_jit: typing.Any = field(init=False, repr=False, compare=False, default=None)
     candidate_tower_forward_jit: typing.Any = field(
-        init=False, repr=False, compare=False, default=None
-    )
-    _filtered_sharding: typing.Any = field(init=False, repr=False, compare=False, default=None)
-    _compute_checksums_filtered_jit: typing.Any = field(
         init=False, repr=False, compare=False, default=None
     )
     host_state: typing.Any = field(init=False, repr=False, compare=False, default=None)
@@ -524,12 +362,15 @@ class RecsysTrainer(Trainer):
         return batch
 
     def prepare_data(self, batch):
+        return super().prepare_data(self.transform_batch(batch))
+
+    def transform_batch(self, batch: RecsysFeaturesBatch) -> RecsysFeaturesBatch:
         if self.using_seqpack:
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
             batch = pack_batch(
-                batch=typing.cast(RecsysFeaturesBatch, batch),
+                batch=batch,
                 num_devices_per_process=self.parallel_config.num_devices_per_process,
                 num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
                 dist=self.seqpack_distribution,
@@ -537,7 +378,8 @@ class RecsysTrainer(Trainer):
             )
             if self.using_fa4:
                 batch = self.add_block_sparse_layout(batch)
-        return super().prepare_data(batch)
+
+        return batch
 
     def _purchase_value_ema_keys(self) -> dict[str, jax.Array]:
         if not (
@@ -548,6 +390,15 @@ class RecsysTrainer(Trainer):
         return {
             f"purchase_value/{ws}": jnp.zeros((10,), dtype=jnp.float32)
             for ws in self.model_config.purchase_value_smoothing_windows
+        }
+
+    def _conversion_delay_slice_ema_keys(self, state_size: int) -> dict[str, jax.Array]:
+        if not isinstance(self.model_config, RecsysAggregatedModelConfig):
+            return {}
+        return {
+            f"{s.head}/{s.name}/{ws}": jnp.zeros((state_size,), dtype=jnp.float32)
+            for s in self.model_config.conversion_delay_slices()
+            for ws in self.smoothing_windows
         }
 
     def init(self, batch: RecsysFeaturesBatch, rng: jax.Array) -> RecsysTrainingState:
@@ -572,9 +423,25 @@ class RecsysTrainer(Trainer):
             self.dataset.input_vocab_size if is_device else 1,
             self.init_opt_state,
         )
+        if self.use_row_emb:
+            rows = (
+                math.ceil(emb_table.x.shape[0] / self.parallel_config.ep) * self.parallel_config.ep
+            )
+            emb_table = replace(
+                emb_table,
+                x=jnp.pad(emb_table.x, ((0, rows - emb_table.x.shape[0]), (0, 0))),
+                pspec=P("expert", None),
+            )
         if self.emb_optim_config._active() == "rowwise_adagrad":
             sparse_emb_optim = self.emb_optim_config.make_optimizer(self.optim)
             emb_table_state = sparse_emb_optim.init({"table": emb_table})
+            if self.use_row_emb:
+                logical_rows = self.dataset.input_vocab_size
+                emb_table_state = emb_table_state._replace(
+                    row_sum_sq={
+                        "table": emb_table_state.row_sum_sq["table"].at[logical_rows:].set(0)
+                    }
+                )
         emb_table = replace(emb_table, x=emb_table.x.at[0, :].set(0))
         post_embeddings = PostEmbeddings(
             post_ids=jnp.arange(1).astype(jnp.int32),
@@ -584,6 +451,15 @@ class RecsysTrainer(Trainer):
         )
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
             post_embeddings = self.model_config.candidate_tower_config.make_post_embeddings()
+            side_width = self.model_config.mol_side_table_width
+            if side_width:
+                emb = post_embeddings.embeddings
+                post_embeddings = post_embeddings._replace(
+                    mol_side_table=Parameter(
+                        x=jnp.zeros((emb.x.shape[0], side_width), dtype=jnp.float32),
+                        pspec=P(None, None),
+                    )
+                )
 
         packing_layout = batch.get("packing_layout")
         batch = jax.tree.map(jnp.ones_like, batch)
@@ -621,6 +497,7 @@ class RecsysTrainer(Trainer):
                     dummy_3d,
                     dummy,
                     dummy,
+                    trained_candidate_mask=dummy_3d,
                     ads_head_masking=self.model_config.ads_head_masking,
                     enable_platform_metrics=self.model_config.enable_platform_metrics,
                     metric_mask_keys=self.model_config.metric_mask_keys,
@@ -633,6 +510,7 @@ class RecsysTrainer(Trainer):
                 for ws in self.smoothing_windows
             }
             rce_ema.update(self._purchase_value_ema_keys())
+            rce_ema.update(self._conversion_delay_slice_ema_keys(3))
 
         calib_ema = None
         if rce_ema is not None:
@@ -642,6 +520,7 @@ class RecsysTrainer(Trainer):
                 for m in mask_keys
                 for ws in self.smoothing_windows
             }
+            calib_ema.update(self._conversion_delay_slice_ema_keys(2))
 
         state = RecsysTrainingState(
             params=initial_params,
@@ -661,6 +540,25 @@ class RecsysTrainer(Trainer):
     def _lookup(self, embedding_table_param: Parameter, token_ids: jax.Array) -> Parameter:
         data_axis = tuple(self.model_config.model_config.data_axis)
         token_ndim = token_ids.ndim
+        if self.use_row_emb:
+            token_ids = self._row_embedding_token_ids(token_ids)
+
+            @shard_map(
+                mesh=self.mesh,
+                in_specs=(P("expert", None), P(data_axis)),
+                out_specs=P(data_axis, *((None,) * token_ndim)),
+                check_vma=False,
+            )
+            def lookup_rows(table, ids):
+                ids = jax.lax.all_gather(ids, "expert", axis=0, tiled=True)
+                local_ids = ids - jax.lax.axis_index("expert") * table.shape[0]
+                values = jnp.take(table, local_ids, axis=0, mode="clip")
+                values = jnp.where(
+                    ((local_ids >= 0) & (local_ids < table.shape[0]))[..., None], values, 0
+                )
+                return jax.lax.psum_scatter(values, "expert", scatter_dimension=0, tiled=True)
+
+            return replace(embedding_table_param, x=lookup_rows(embedding_table_param.x, token_ids))
 
         in_token_spec = P(data_axis, *((None,) * (token_ndim - 1)))
         out_spec = P(data_axis, *((None,) * token_ndim))
@@ -722,24 +620,12 @@ class RecsysTrainer(Trainer):
     def get_recsys_embeddings(
         self, data: RecsysFeaturesBatch, emb_table: Parameter
     ) -> RecsysEmbeddingsParameter:
-        use_ip = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_ip_address
-        )
-        use_user_embedding = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_user_embedding
-        )
-        use_post_embedding = (
-            isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
-            and self.model_config.use_post_embedding
-        )
         data_axis = tuple(self.model_config.model_config.data_axis)
 
         hash_leaves = self._get_embedding_hash_leaves(data)
 
-        flat_hashes = [x.reshape(self.batch_size, -1) for x in hash_leaves]
-        segment_lengths = [x.shape[1] for x in flat_hashes]
+        users = _num_users(data)
+        flat_hashes = [x.reshape(users, -1) for x in hash_leaves]
         all_hashes = jax.lax.with_sharding_constraint(
             jnp.concatenate(flat_hashes, axis=1), P(data_axis)
         )
@@ -748,54 +634,7 @@ class RecsysTrainer(Trainer):
             all_embeddings,
             x=jax.lax.with_sharding_constraint(all_embeddings.x, P(data_axis, None, None)),
         )
-        splits = jnp.split(all_embeddings.x, np.cumsum(segment_lengths[:-1]), axis=1)
-
-        if self.using_seqpack:
-            emb_splits = [
-                split.reshape(*leaf.shape, all_embeddings.x.shape[-1])
-                for split, leaf in zip(splits, hash_leaves)
-            ]
-        else:
-            emb_splits = list(splits)
-
-        idx = 0
-        if use_user_embedding:
-            user_x = emb_splits[idx]
-            idx += 1
-        else:
-            user_x = None
-        if use_post_embedding:
-            history_post_x = emb_splits[idx]
-            idx += 1
-        else:
-            history_post_x = None
-        history_author_x = emb_splits[idx]
-        idx += 1
-        if use_post_embedding:
-            candidate_post_x = emb_splits[idx]
-            idx += 1
-        else:
-            candidate_post_x = None
-        candidate_author_x = emb_splits[idx]
-        idx += 1
-        user_ip_x = emb_splits[idx] if use_ip else None
-
-        return RecsysEmbeddingsParameter(
-            user_embeddings=(replace(all_embeddings, x=user_x) if user_x is not None else None),
-            history_post_embeddings=(
-                replace(all_embeddings, x=history_post_x) if history_post_x is not None else None
-            ),
-            history_author_embeddings=replace(all_embeddings, x=history_author_x),
-            candidate_post_embeddings=(
-                replace(all_embeddings, x=candidate_post_x)
-                if candidate_post_x is not None
-                else None
-            ),
-            candidate_author_embeddings=replace(all_embeddings, x=candidate_author_x),
-            user_ip_embeddings=(
-                replace(all_embeddings, x=user_ip_x) if user_ip_x is not None else None
-            ),
-        )
+        return self._unflatten_emb_lookup(data, all_embeddings)
 
     def _unflatten_emb_lookup(
         self, data: RecsysFeaturesBatch, table: Parameter
@@ -803,12 +642,13 @@ class RecsysTrainer(Trainer):
         cfg = self.model_config
         has_emb_flags = isinstance(cfg, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
         hash_leaves = self._get_embedding_hash_leaves(data)
-        lengths = [x.reshape(self.batch_size, -1).shape[1] for x in hash_leaves]
-        splits = jnp.split(table.x, np.cumsum(lengths[:-1]), axis=1)
+        lengths = [x.reshape(_num_users(data), -1).shape[1] for x in hash_leaves]
+        splits = jnp.split(table.x, np.cumsum(lengths[:-1]), axis=-2)
 
         if self.using_seqpack:
             splits = [
-                s.reshape(*leaf.shape, table.x.shape[-1]) for s, leaf in zip(splits, hash_leaves)
+                s.reshape(*s.shape[:-3], *leaf.shape, s.shape[-1])
+                for s, leaf in zip(splits, hash_leaves)
             ]
 
         parts = iter(splits)
@@ -823,7 +663,7 @@ class RecsysTrainer(Trainer):
             user_ip_embeddings=segment(has_emb_flags and cfg.use_ip_address),
         )
 
-    def _flatten_emb_grads(self, grads: RecsysEmbeddingsParameter) -> jax.Array:
+    def _flatten_emb_grads(self, grads: RecsysEmbeddingsParameter, users: int) -> jax.Array:
         cfg = self.model_config
         has_emb_flags = isinstance(cfg, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
         enabled = [
@@ -834,13 +674,9 @@ class RecsysTrainer(Trainer):
             (grads.candidate_author_embeddings, True),
             (grads.user_ip_embeddings, has_emb_flags and cfg.use_ip_address),
         ]
-
         segments = [p.x for p, on in enabled if on and p is not None]
         width = segments[0].shape[-1]
-
-        if self.using_seqpack:
-            segments = [s.reshape(self.batch_size, -1, width) for s in segments]
-        return jnp.concatenate(segments, axis=1).reshape(-1, width)
+        return jnp.concatenate([s.reshape(s.shape[0], users, -1, width) for s in segments], axis=2)
 
     def local_global_hack(self, batch):
         batch = multihost_utils.global_array_to_host_local_array(
@@ -893,16 +729,24 @@ class RecsysTrainer(Trainer):
         assert isinstance(self.dataset, PhoenixDataset)
         aug_period = self._empty_history_augmentation_period()
         history_user_drop_rate = self.empty_history_user_dropout_rate
+        microbatches: list[tuple[RecsysFeaturesBatch, dict[int, int] | None]] = []
         for i, (batch, offsets) in enumerate(dataset):
             batch = self._maybe_inject_global_neg_embeddings(batch)
 
             if history_user_drop_rate > 0.0:
-                self._last_history_user_dropout_bsz = batch["user_hashes"].shape[0]
-                self._last_history_user_dropout_count = self._apply_per_history_user_dropout(
+                if i % self.num_microbatch == 0:
+                    self._last_history_user_dropout_bsz = 0
+                    self._last_history_user_dropout_count = 0
+                self._last_history_user_dropout_bsz += batch["user_hashes"].shape[0]
+                self._last_history_user_dropout_count += self._apply_per_history_user_dropout(
                     batch, history_user_drop_rate
                 )
 
-            yield self.local_global_hack(self.prepare_data(batch)), offsets
+            microbatches.append((self.transform_batch(batch), offsets))
+            if len(microbatches) == self.num_microbatch:
+                for packed, packed_offsets in microbatches:
+                    yield self.local_global_hack(super().prepare_data(packed)), packed_offsets
+                microbatches = []
 
             if aug_period > 0 and i % aug_period == 0:
                 for key in list(batch["history_seq"]):
@@ -944,6 +788,12 @@ class RecsysTrainer(Trainer):
         assert isinstance(self.dataset, PhoenixDataset)
         if prepare_data:
             it = self.dataset_with_prepare(dataset)
+            if self.use_async_emb:
+                it = (
+                    (tuple(batch for batch, _ in group), group[-1][1])
+                    for group in itertools.batched(it, self.num_microbatch, strict=False)
+                    if len(group) == self.num_microbatch
+                )
         else:
             it = self.dataset_without_prepare(dataset)
         future = self.dataloading_thread.submit(next, it, stop)
@@ -1020,6 +870,12 @@ class RecsysTrainer(Trainer):
             data_world_size = dataset_metadata.data_world_size
             elapsed_samples = dataset_metadata.elapsed_samples
 
+        if isinstance(self.dataset, RustKafkaDataset) and self.dataset.redistribution_reader_count(
+            data_world_size
+        ):
+            if self.evals or self.empty_history_augmentation_rate > 0:
+                raise ValueError("Redistribution requires one consumed batch per training step")
+
         assert elapsed_samples >= self.dataloader_offset, (
             f"elapsed_samples {elapsed_samples} < dataloader_offset {self.dataloader_offset}"
         )
@@ -1039,8 +895,9 @@ class RecsysTrainer(Trainer):
         rank_logger.info("create_dataset: resume_position=%s", resume_position)
 
         skip_rows = 0 if should_reset_data else max(0, elapsed_samples - self.dataloader_offset)
+        loader_batch_size = self.read_bsz_per_process // self.num_microbatch
         train_dataset = self.dataset.make(
-            batch_size=self.read_bsz_per_process,
+            batch_size=loader_batch_size,
             shard_index=data_rank,
             num_shards=data_world_size,
             server_hosts=ctx.ip_addrs,
@@ -1057,15 +914,18 @@ class RecsysTrainer(Trainer):
 
         if self.stop_at_data_end:
             assert isinstance(self.state, RecsysTrainingState)
-            step = self.state.step
+            step = self.state.step.item()
             data_end = self.dataset.compute_max_steps(
                 num_shards=data_world_size,
-                batch_size=self.read_bsz_per_process,
-                current_step=step.item(),
+                batch_size=loader_batch_size,
+                current_step=step,
                 resume_position=resume_position,
             )
-            if data_end is not None and (self.max_steps is None or data_end < self.max_steps):
-                self.max_steps: int | None = data_end
+            if data_end is not None:
+                remaining_batches = data_end - step + 1
+                data_end = step + remaining_batches // self.num_microbatch - 1
+                if self.max_steps is None or data_end < self.max_steps:
+                    self.max_steps: int | None = data_end
 
         self.train_dataset = self.dataset_thread_iterator(train_dataset)
 
@@ -1080,12 +940,13 @@ class RecsysTrainer(Trainer):
         )
 
         if self.using_seqpack:
-            batch = self.example_data(self.read_bsz_per_process)
+            batch = self.example_data(self.read_bsz_per_process // self.num_microbatch)
 
             assert self.batch_size % self.bs_per_device == 0, (self.batch_size, self.bs_per_device)
-            assert batch["user_hashes"].shape[1] == self.bs_per_device, (
+            assert batch["user_hashes"].shape[1] == self.bs_per_device // self.num_microbatch, (
                 batch["user_hashes"].shape[1],
                 self.bs_per_device,
+                self.num_microbatch,
             )
             assert self.num_devices == self.batch_size // self.bs_per_device, (
                 self.num_devices,
@@ -1153,7 +1014,7 @@ class RecsysTrainer(Trainer):
                 ),
             )
 
-        batch_size = self.batch_size
+        batch_size = self.batch_size // self.num_microbatch
         emb_size = self.model_config.emb_table_width
         user_emb_len = self.model_config.hash_table.num_user_hashes
         history_post_len = (
@@ -1202,6 +1063,10 @@ class RecsysTrainer(Trainer):
             ),
         )
 
+    def _row_embedding_token_ids(self, ids: jax.Array) -> jax.Array:
+        rows = self.dataset.input_vocab_size
+        return jnp.clip(jnp.where(ids < 0, ids + rows, ids), 0, rows - 1)
+
     def get_flattened_token_ids(self, data: RecsysFeaturesBatch) -> jax.Array:
         use_ip = (
             isinstance(self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig))
@@ -1226,7 +1091,9 @@ class RecsysTrainer(Trainer):
         segments.append(data["candidate_seq"]["auth_hashes"])
         if use_ip:
             segments.append(data["user_ip_hashes"])
-        return jnp.concatenate([x.reshape(self.batch_size, -1) for x in segments], axis=1)
+        users = _num_users(data)
+        ids = jnp.concatenate([x.reshape(users, -1) for x in segments], axis=1)
+        return self._row_embedding_token_ids(ids) if self.use_row_emb else ids
 
     def _segment_sum(
         self,
@@ -1428,19 +1295,85 @@ class RecsysTrainer(Trainer):
 
         return new_state, metrics, {}
 
+    def _run_microbatches(
+        self,
+        microbatch_loss_fn: typing.Callable[..., typing.Any],
+        params: Parameter,
+        batches: RecsysFeaturesBatch,
+        embeddings: RecsysEmbeddingsParameter,
+        rngs: jax.Array,
+        candidate_inputs: CandidateInputs,
+        loss_normalizers: dict[str, jax.Array],
+    ):
+        ctx = self._async_emb_context
+        assert ctx is not None
+        rows = batches["user_hashes"].shape[1]
+        leaves = jax.tree.leaves((batches, candidate_inputs))
+        assert all(x.shape[1] == rows for x in leaves), "a leaf without rows"
+        assert all(ctx.mesh.shape[a] == 1 for a in ctx.mesh.axis_names if a not in ctx.data_axis)
+        rows_spec = P(None, ctx.data_axis)
+
+        @shard_map(
+            mesh=ctx.mesh,
+            in_specs=(P(), rows_spec, rows_spec, P(), rows_spec, P()),
+            out_specs=(P(), P(), P(), rows_spec, P(ctx.data_axis)),
+            check_vma=False,
+        )
+        def run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers):
+            def body(gradients, loss_normalizers, rng, batch, embeddings, candidate_inputs):
+                rng = jax.random.fold_in(rng, jax.lax.axis_index(ctx.data_axis))
+                (loss_k, (stats, metric_inputs)), (gradients_k, emb_gradients) = jax.value_and_grad(
+                    functools.partial(microbatch_loss_fn, loss_normalizers=loss_normalizers),
+                    argnums=(0, 3),
+                    has_aux=True,
+                )(params, rng, batch, embeddings, candidate_inputs=candidate_inputs)
+                gradients = jax.tree.map(
+                    lambda a, g: a + g.astype(jnp.float32), gradients, gradients_k
+                )
+                return gradients, (loss_k, stats, emb_gradients, metric_inputs)
+
+            inputs = (rngs, batches, embeddings, candidate_inputs)
+            inputs, loss_normalizers = jax.lax.optimization_barrier((inputs, loss_normalizers))
+            gradients = jax.tree.map(lambda p: jnp.zeros(p.shape, jnp.float32), params)
+            outputs = []
+            for k in range(rngs.shape[0]):
+                if k > 0:
+                    inputs, gradients, outputs[-1] = jax.lax.optimization_barrier(
+                        (inputs, gradients, outputs[-1])
+                    )
+                microbatch = jax.tree.map(operator.itemgetter(k), inputs)
+                gradients, output = body(gradients, loss_normalizers, *microbatch)
+                outputs.append(output)
+            losses, stats, emb_gradients, metric_inputs = jax.tree.map(
+                lambda *xs: jnp.stack(xs), *outputs
+            )
+            gradients = jax.tree.map(lambda g, p: g.astype(p.dtype), gradients, params)
+            loss_sum, stats = jax.tree.map(lambda x: x.sum(0), (losses, stats))
+            joined = jax.tree.map(
+                lambda x: x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]),
+                (metric_inputs, batches),
+            )
+            return (
+                *jax.lax.psum((gradients, loss_sum, stats), ctx.data_axis),
+                emb_gradients,
+                joined,
+            )
+
+        return run(params, batches, embeddings, rngs, candidate_inputs, loss_normalizers)
+
     def async_emb_step(
         self,
         state: RecsysTrainingState,
-        data: RecsysFeaturesBatch,
+        data: tuple[RecsysFeaturesBatch, ...],
         lr: float,
-        next_step_data: RecsysFeaturesBatch,
+        next_step_data: tuple[RecsysFeaturesBatch, ...],
         prev_step_lookup_pin: jax.Array,
-        prev_step_grad_update: AsyncEmbGradientUpdate,
     ):
         assert state.emb_table is not None
         assert state.emb_table_state is not None
         assert state.opt_state is not None
-        assert self._async_emb_context is not None
+        ctx = self._async_emb_context
+        assert ctx is not None
 
         rng, new_rng = jax.random.split(state.rng)
         fprop_params = state.params
@@ -1455,75 +1388,142 @@ class RecsysTrainer(Trainer):
             )
 
         emb_table = state.emb_table
-        flat_prefetched = recsys_async_emb_lookup.lookup_done(
-            self._async_emb_context, prev_step_lookup_pin
-        )
-        prefetched_embeddings = flat_prefetched.reshape(
-            self.batch_size, -1, flat_prefetched.shape[-1]
+        token_ids = _step_token_ids([self.get_flattened_token_ids(b) for b in data], ctx.data_axis)
+        prefetched_embeddings = recsys_async_emb.lookup_done(
+            ctx, prev_step_lookup_pin, token_ids.shape
         )
 
-        prev_update_pins, updating_table, updating_emb_state, emb_optim_metrics = (
+        def dedup_tokens(token_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
+            unique_tokens, segment_ids = compress_token_ids(
+                token_ids, fill_size=ctx.num_unique, fill_value=self._emb_hash_vocab
+            )
+            segment_ids = jax.lax.with_sharding_constraint(
+                segment_ids.reshape(token_ids.shape), P(None, ctx.data_axis, None)
+            )
+            return unique_tokens, segment_ids
+
+        unique_tokens = segment_ids = None
+        if self.num_microbatch == 1 and not self.use_row_emb:
+            fenced_token_ids, _ = jax.lax.optimization_barrier((token_ids, prefetched_embeddings))
+            unique_tokens, segment_ids = dedup_tokens(fenced_token_ids)
+
+        gate = prefetched_embeddings[0, :, 0, :1]
+
+        if self.num_microbatch > 1:
+            loss_inputs_fn, microbatch_loss_fn, metrics_fn = self.microbatch_loss_fns.apply
+            data_shards = math.prod(self.mesh.shape[a] for a in ctx.data_axis)
+            candidate_inputs, loss_normalizers = loss_inputs_fn(
+                {}, None, data, self.num_microbatch * data_shards
+            )
+            batches = jax.tree.map(lambda *x: jnp.stack(x), *data)
+            gate = recsys_async_emb.depend(
+                ctx, gate, jnp.stack(jax.tree.leaves(loss_normalizers)).sum(), on_sharded=False
+            )
+
+        update_start_pin, updating_table, updating_emb_state, emb_optim_metrics = (
             self._emb_optim.gradient_update_start(
-                self._async_emb_context,
-                prev_step_grad_update,
-                emb_table.x,
-                state.emb_table_state,
-                gate=prefetched_embeddings[:, 0, :1],
+                ctx, emb_table.x, state.emb_table_state, gate=gate
             )
         )
 
-        prefetched_embeddings, *prev_update_pins = jax.lax.optimization_barrier(
-            (prefetched_embeddings, *prev_update_pins)
-        )
         embeddings = self._unflatten_emb_lookup(
-            data,
+            data[0],
             replace(
                 emb_table,
                 x=jax.lax.with_sharding_constraint(
-                    prefetched_embeddings, P(self._async_emb_context.data_axis, None, None)
+                    prefetched_embeddings, P(None, ctx.data_axis, None, None)
                 ),
             ),
         )
         embeddings, _ = self._emb_optim.transform_embeddings(
-            embeddings, self.get_flattened_token_ids(data), state.emb_table_state
+            embeddings, token_ids, state.emb_table_state
         )
+        next_step_token_ids = _step_token_ids(
+            [self.get_flattened_token_ids(b) for b in next_step_data], ctx.data_axis
+        ).astype(jnp.int32)
 
-        def loss_fn(params, embeddings):
-            return self.loss_fn.apply(
-                params, rng, data, embeddings, state.rce_ema, rce_alpha, state.calib_ema
+        if self.num_microbatch == 1:
+            embeddings = jax.tree.map(lambda x: x[0], embeddings)
+            candidate_authors = embeddings.candidate_author_embeddings
+            embeddings = replace(
+                embeddings,
+                candidate_author_embeddings=replace(
+                    candidate_authors,
+                    x=recsys_async_emb.depend(
+                        ctx, candidate_authors.x, update_start_pin, on_sharded=False
+                    ),
+                ),
             )
 
-        loss, loss_vjp, stats = jax.vjp(loss_fn, fprop_params, embeddings, has_aux=True)
+            def loss_fn(params, embeddings):
+                return self.loss_fn.apply(
+                    params, rng, data[0], embeddings, state.rce_ema, rce_alpha, state.calib_ema
+                )
 
-        emb_grad_norm, emb_valid_step, grad_update_done_pin = self._emb_optim.gradient_update_done(
-            self._async_emb_context, loss
-        )
-        emb_valid_step = emb_valid_step | jnp.logical_not(prev_step_grad_update.pending)
-        updated_table, updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
-            (updating_table, updating_emb_state, grad_update_done_pin)
-        )
+            loss, loss_vjp, stats = jax.vjp(loss_fn, fprop_params, embeddings, has_aux=True)
 
-        next_step_token_ids, _ = jax.lax.optimization_barrier(
-            (self.get_flattened_token_ids(next_step_data).astype(jnp.int32), loss)
-        )
-        new_emb_table, next_step_lookup_pin = recsys_async_emb_lookup.lookup_start(
-            self._async_emb_context, next_step_token_ids, updated_table, grad_update_done_pin
-        )
-        loss_cotangent, next_step_lookup_pin = jax.lax.optimization_barrier(
-            (jnp.ones_like(loss), next_step_lookup_pin)
-        )
+            (
+                emb_grad_norm,
+                emb_valid_step,
+                emb_update_pending,
+                updated_emb_state,
+                grad_update_done_pin,
+            ) = self._emb_optim.gradient_update_done(ctx, updating_emb_state, loss)
+            updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
+                (updated_emb_state, grad_update_done_pin)
+            )
 
-        token_ids, _ = jax.lax.optimization_barrier(
-            (self.get_flattened_token_ids(data), prefetched_embeddings)
-        )
-        unique_tokens, segment_ids = compress_token_ids(
-            token_ids,
-            fill_size=self._async_emb_context.num_unique,
-            fill_value=self._emb_hash_vocab,
-            output_sharding=P(self._async_emb_context.data_axis),
-        )
-
-        gradients, emb_gradients = loss_vjp(loss_cotangent)
+            next_step_token_ids, _ = jax.lax.optimization_barrier((next_step_token_ids, loss))
+            new_emb_table, next_step_lookup_pin = recsys_async_emb.lookup_start(
+                ctx, next_step_token_ids, updating_table, grad_update_done_pin
+            )
+            loss_cotangent, next_step_lookup_pin = jax.lax.optimization_barrier(
+                (jnp.ones_like(loss), next_step_lookup_pin)
+            )
+            gradients, emb_gradients = loss_vjp(loss_cotangent)
+            emb_gradients = jax.tree.map(lambda x: x[None], emb_gradients)
+        else:
+            new_emb_table, next_step_lookup_pin = recsys_async_emb.lookup_start(
+                ctx, next_step_token_ids, updating_table, update_start_pin
+            )
+            loss_normalizers = recsys_async_emb.depend(
+                ctx, loss_normalizers, next_step_lookup_pin, x_sharded=False
+            )
+            gradients, loss, stats, emb_gradients, (metric_inputs, batch) = self._run_microbatches(
+                microbatch_loss_fn,
+                fprop_params,
+                batches,
+                embeddings,
+                jax.random.split(rng, self.num_microbatch),
+                candidate_inputs,
+                loss_normalizers,
+            )
+            if not self.use_row_emb:
+                token_ids, gradients = jax.lax.optimization_barrier((token_ids, gradients))
+                unique_tokens, segment_ids = dedup_tokens(token_ids)
+                gradients, unique_tokens = jax.lax.optimization_barrier((gradients, unique_tokens))
+            (
+                emb_grad_norm,
+                emb_valid_step,
+                emb_update_pending,
+                updated_emb_state,
+                grad_update_done_pin,
+            ) = self._emb_optim.gradient_update_done(ctx, updating_emb_state, loss)
+            updated_emb_state, grad_update_done_pin = jax.lax.optimization_barrier(
+                (updated_emb_state, grad_update_done_pin)
+            )
+            stats = metrics_fn(
+                {},
+                None,
+                metric_inputs,
+                batch,
+                stats,
+                state.rce_ema,
+                rce_alpha,
+                tuple(self.smoothing_windows) if state.rce_ema is not None else None,
+                state.calib_ema,
+            )
+        emb_valid_step = emb_valid_step | ~emb_update_pending
         if self.precision_level >= 2:
             gradients = jax.tree.map(lambda x: x.astype(jnp.float32), gradients)
 
@@ -1546,7 +1546,7 @@ class RecsysTrainer(Trainer):
         metrics = {
             "step": state.step,
             "loss": loss,
-            "examples_per_batch": np.prod(data["user_hashes"].shape[:-1]),
+            "examples_per_batch": sum(np.prod(batch["user_hashes"].shape[:-1]) for batch in data),
             "valid_step": keep_step,
             "global_grad_norm": grad_norm,
             "learning_rate": lr * new_opt_state.hyperparams["learning_rate"],
@@ -1574,15 +1574,15 @@ class RecsysTrainer(Trainer):
             ("valid_step",): keep_step,
         }
 
-        next_step_grad_update = AsyncEmbGradientUpdate(
-            unique_tokens=unique_tokens,
-            grads=jax.lax.with_sharding_constraint(
-                self._flatten_emb_grads(emb_gradients),
-                P(self._async_emb_context.data_axis, None),
-            ),
-            segment_ids=segment_ids,
-            pending=keep_step,
+        stage_pin = recsys_async_emb.stage_update(
+            self._async_emb_context,
+            self._flatten_emb_grads(emb_gradients, _num_users(data[0])),
+            segment_ids,
+            unique_tokens,
+            keep_step,
+            grad_update_done_pin,
         )
+        next_step_lookup_pin = jnp.minimum(next_step_lookup_pin, stage_pin)
 
         new_state = RecsysTrainingState(
             params=new_params,
@@ -1597,14 +1597,12 @@ class RecsysTrainer(Trainer):
             rce_ema=new_rce_ema,
             calib_ema=new_calib_ema,
         )
-
-        extras = {"grad_update_keepalive": tuple(prev_update_pins)}
-        return new_state, metrics, extras, next_step_lookup_pin, next_step_grad_update
+        return new_state, metrics, {}, next_step_lookup_pin
 
     def async_emb_update(
         self,
         state: RecsysTrainingState,
-        data: RecsysFeaturesBatch,
+        data: tuple[RecsysFeaturesBatch, ...],
         lr: float,
     ):
         assert self._batch_pipeline.reserve is not None
@@ -1613,50 +1611,18 @@ class RecsysTrainer(Trainer):
                 state, self._async_emb_lookup_pin = self._first_step_embedding_lookup_start_jit(
                     state, data
                 )
-                self._deferred_emb_grad_update = self._empty_embedding_grad_update_jit()
 
-            state, metrics, extras, self._async_emb_lookup_pin, self._deferred_emb_grad_update = (
-                self._async_emb_step_jit(
-                    state,
-                    data,
-                    lr,
-                    self._batch_pipeline.reserve.batch,
-                    self._async_emb_lookup_pin,
-                    self._deferred_emb_grad_update,
-                )
+            state, metrics, extras, self._async_emb_lookup_pin = self._async_emb_step_jit(
+                state, data, lr, self._batch_pipeline.reserve.batch, self._async_emb_lookup_pin
             )
         except Exception:
             assert self._async_emb_context is not None
-            async_emb.async_emb_api.abort(self._async_emb_context.context_id)
+            recsys_async_emb.kernel_api(self._async_emb_context).abort(
+                self._async_emb_context.context_id
+            )
             raise
 
         return state, metrics, extras
-
-    def _flush_deferred_embedding_update(self, state: RecsysTrainingState) -> RecsysTrainingState:
-        if self._deferred_emb_grad_update is None or not bool(
-            self._deferred_emb_grad_update.pending
-        ):
-            return state
-
-        assert self._async_emb_context is not None
-        assert state.emb_table is not None
-        try:
-            async_emb.async_emb_api.drain(self._async_emb_context.context_id)
-            state, _keepalive, norm, valid = self._apply_deferred_embedding_update_jit(
-                state, self._deferred_emb_grad_update
-            )
-            jax.block_until_ready(state.emb_table.x)
-            if not bool(valid):
-                rank_logger.warning(
-                    "async_emb: skipped a non-finite deferred update (norm=%s)", float(norm)
-                )
-            async_emb.async_emb_api.reset_table_binding(self._async_emb_context.context_id)
-        except Exception:
-            async_emb.async_emb_api.abort(self._async_emb_context.context_id)
-            raise
-
-        self._deferred_emb_grad_update = self._empty_embedding_grad_update_jit()
-        return state
 
     @property
     def using_seqpack(self) -> bool:
@@ -1694,6 +1660,7 @@ class RecsysTrainer(Trainer):
             if isinstance(self.model_config, RecsysTwoTowerModelConfig)
             else self.model_config
         )
+        cand_slot_lens = getattr(layout, "cand_slot_lens", None)
         block_sparse = build_block_sparse_layout(
             cu_seqlens=layout.cu_seqlens,
             transformer_candidate_seq_len=transformer_candidate_seq_len,
@@ -1701,6 +1668,9 @@ class RecsysTrainer(Trainer):
             packed_seq_len=int(layout.segment_ids.shape[1]),
             padding_mask=layout.padding_mask,
             num_user_prefix_tokens=_mc.num_user_prefix_tokens,
+            candidate_slot_lens=(
+                np.asarray(cand_slot_lens) if cand_slot_lens is not None else None
+            ),
         )
         return {**batch, "packing_layout": replace(layout, block_sparse=block_sparse)}
 
@@ -1723,8 +1693,18 @@ class RecsysTrainer(Trainer):
             return get_device_tuning_config().block_q
         raise ValueError(f"Unexpected attn_impl {attn_impl!r} for seqpack block size")
 
+    def _row_emb_state_sharding(self, state_sharding):
+        emb_state = state_sharding.emb_table_state
+        if emb_state is None:
+            return state_sharding
+        row_sharding = NamedSharding(self.mesh, P("expert"))
+        emb_state = emb_state._replace(row_sum_sq={**emb_state.row_sum_sq, "table": row_sharding})
+        if emb_state.last_step is not None:
+            emb_state = emb_state._replace(last_step={**emb_state.last_step, "table": row_sharding})
+        return state_sharding._replace(emb_table_state=emb_state)
+
     def _create_async_emb_executables(self, init_data, lr_shape, compiler_options) -> None:
-        if async_emb is None:
+        if async_emb is None and not self.use_row_emb:
             raise RuntimeError(
                 "use_async_emb requires the async_emb kernels (xrex.cuda.async_emb), "
                 "which failed to import: no compiled binding was found, or the "
@@ -1746,72 +1726,55 @@ class RecsysTrainer(Trainer):
         emb_width = self.state_shape.emb_table.x.shape[1]
 
         self._emb_hash_vocab = (
-            getattr(self.dataset, "hash_vocab_size", None) or self.state_shape.emb_table.x.shape[0]
+            getattr(self.dataset, "hash_vocab_size", None) or self.dataset.input_vocab_size
         )
-        assert self._emb_hash_vocab >= self.state_shape.emb_table.x.shape[0]
+        assert self.use_row_emb or self._emb_hash_vocab >= self.state_shape.emb_table.x.shape[0]
         assert self._emb_hash_vocab < 2**31
         num_unique_tokens = min(tokens_per_batch, self._emb_hash_vocab) + 1
 
-        self._async_emb_context = async_emb.make_context_handle(
-            self.mesh,
-            ("expert",),
-            data_axis=data_axis,
-            tokens_per_batch=tokens_per_batch,
-            emb_width=emb_width,
-            num_unique=num_unique_tokens,
-            num_devices_per_node=self.parallel_config.num_devices_per_node,
-        )
+        if self.use_row_emb:
+            try:
+                from xrex.cuda.row_emb import row_emb
+            except ImportError as e:
+                raise RuntimeError(f"use_row_emb requires the row_emb kernels: {e}") from e
 
-        replicated = NamedSharding(self.mesh, P())
+            self._async_emb_context = row_emb.make_context_handle(
+                self.mesh,
+                ("expert",),
+                data_axis=data_axis,
+                tokens_per_batch=tokens_per_batch,
+                emb_width=emb_width,
+                vocab_rows=self.state_shape.emb_table.x.shape[0],
+                recv_factor=self.row_emb_recv_factor,
+                num_devices_per_node=self.parallel_config.num_devices_per_node,
+            )
+        else:
+            self._async_emb_context = async_emb.make_context_handle(
+                self.mesh,
+                ("expert",),
+                data_axis=data_axis,
+                tokens_per_batch=tokens_per_batch,
+                emb_width=emb_width,
+                num_unique=num_unique_tokens,
+                num_devices_per_node=self.parallel_config.num_devices_per_node,
+            )
+
         row_sharding = NamedSharding(self.mesh, P(data_axis, None))
-        segment_sharding = NamedSharding(self.mesh, P(data_axis))
-        grad_update_sharding = AsyncEmbGradientUpdate(
-            unique_tokens=replicated,
-            grads=row_sharding,
-            segment_ids=segment_sharding,
-            pending=replicated,
-        )
 
-        def first_step_embedding_lookup_start(state, batch):
-            token_ids = self.get_flattened_token_ids(batch).astype(jnp.int32)
-            emb_table, lookup_pin = recsys_async_emb_lookup.lookup_start(
+        def first_step_embedding_lookup_start(state, data):
+            token_ids = _step_token_ids(
+                [self.get_flattened_token_ids(b) for b in data], data_axis
+            ).astype(jnp.int32)
+            emb_table, lookup_pin = recsys_async_emb.lookup_start(
                 self._async_emb_context,
                 token_ids,
                 state.emb_table.x,
-                gate=token_ids[:1, :1].astype(jnp.float32),
+                gate=token_ids[0, :1, :1].astype(jnp.float32),
             )
             return (state._replace(emb_table=replace(state.emb_table, x=emb_table)), lookup_pin)
 
-        def empty_embedding_grad_update():
-            return AsyncEmbGradientUpdate(
-                unique_tokens=jnp.full((num_unique_tokens,), self._emb_hash_vocab, jnp.int32),
-                grads=jnp.zeros((tokens_per_batch, emb_width), jnp.bfloat16),
-                segment_ids=jnp.zeros((tokens_per_batch,), jnp.int32),
-                pending=jnp.asarray(False),
-            )
-
-        def apply_deferred_embedding_update(state, grad_update):
-            pins, updating_table, updating_emb_state, _ = self._emb_optim.gradient_update_start(
-                self._async_emb_context,
-                grad_update,
-                state.emb_table.x,
-                state.emb_table_state,
-                gate=grad_update.grads[:, :1],
-            )
-            norm, valid, done_pin = self._emb_optim.gradient_update_done(
-                self._async_emb_context, pins[-1]
-            )
-            updated_table, updated_emb_state, _ = jax.lax.optimization_barrier(
-                (updating_table, updating_emb_state, done_pin)
-            )
-            state = state._replace(
-                emb_table=replace(state.emb_table, x=updated_table),
-                emb_table_state=updated_emb_state,
-            )
-            return state, pins, norm, valid
-
-        grad_update_shape = jax.eval_shape(empty_embedding_grad_update)
         lookup_pin_shape = jax.ShapeDtypeStruct((data_shards, 1), jnp.float32)
+        step_data = (init_data,) * self.num_microbatch
 
         self._first_step_embedding_lookup_start_jit = JittedOrCompiled(
             jax.jit(
@@ -1824,26 +1787,7 @@ class RecsysTrainer(Trainer):
         self.register_jit_function(
             self._first_step_embedding_lookup_start_jit,
             self.state_shape,
-            init_data,
-            compiler_options=compiler_options,
-        )
-
-        self._empty_embedding_grad_update_jit = jax.jit(
-            empty_embedding_grad_update, out_shardings=grad_update_sharding
-        )
-
-        self._apply_deferred_embedding_update_jit = JittedOrCompiled(
-            jax.jit(
-                apply_deferred_embedding_update,
-                in_shardings=(self.state_sharding, grad_update_sharding),
-                out_shardings=(self.state_sharding, None, replicated, replicated),
-                donate_argnums=(0, 1),
-            )
-        )
-        self.register_jit_function(
-            self._apply_deferred_embedding_update_jit,
-            self.state_shape,
-            grad_update_shape,
+            step_data,
             compiler_options=compiler_options,
         )
 
@@ -1856,26 +1800,39 @@ class RecsysTrainer(Trainer):
                     None,
                     self.data_sharding,
                     row_sharding,
-                    grad_update_sharding,
                 ),
-                out_shardings=(self.state_sharding, None, None, row_sharding, grad_update_sharding),
-                donate_argnums=(0, 4, 5),
+                out_shardings=(self.state_sharding, None, None, row_sharding),
+                donate_argnums=(0, 4),
             )
         )
         self.register_jit_function(
             self._async_emb_step_jit,
             self.state_shape,
-            init_data,
+            step_data,
             lr_shape,
-            init_data,
+            step_data,
             lookup_pin_shape,
-            grad_update_shape,
             compiler_options=compiler_options,
         )
 
         self.update_jit = self.async_emb_update
 
     def create_executable(self) -> None:
+        if self.num_microbatch < 1 or self.bs_per_device % self.num_microbatch:
+            raise ValueError(
+                f"num_microbatch={self.num_microbatch} must divide "
+                f"bs_per_device={self.bs_per_device}"
+            )
+        if self.num_microbatch > 1:
+            if not self.use_async_emb:
+                raise ValueError("num_microbatch > 1 requires use_async_emb=True")
+            if type(self.model_config) is not RecsysAggregatedModelConfig:
+                raise ValueError("num_microbatch > 1 supports only the ranker")
+            if self.empty_history_augmentation_rate > 0:
+                raise ValueError(
+                    "num_microbatch > 1 does not support empty_history_augmentation_rate"
+                )
+
         self._init_shmem_write_pool()
         self._free_ports()
         self._init_incremental_state()
@@ -1884,6 +1841,12 @@ class RecsysTrainer(Trainer):
             self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
         )
         assert isinstance(self.dataset, PhoenixDataset)
+
+        if self.use_row_emb:
+            if not self.use_async_emb:
+                raise ValueError("use_row_emb requires use_async_emb=True")
+            if self.emb_optim_config._active() != "rowwise_adagrad":
+                raise ValueError("use_row_emb requires the rowwise_adagrad embedding optimizer")
 
         if isinstance(self.model_config, RecsysAggregatedModelConfig):
             ctx = self.model_config.context_features
@@ -1913,26 +1876,33 @@ class RecsysTrainer(Trainer):
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
+            model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
+            smoothing_windows = tuple(self.smoothing_windows) if rce_ema is not None else None
+            if type(model) is RecsysAggregatedModel:
+                loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, True)
+                return loss, model.metrics(
+                    metric_inputs, batch, stats, rce_ema, rce_alpha, smoothing_windows, calib_ema
+                )
             metrics_state_kwargs = {}
             if rce_ema is not None:
                 metrics_state_kwargs = {
                     "rce_ema": rce_ema,
                     "rce_alpha": rce_alpha,
-                    "smoothing_windows": tuple(self.smoothing_windows),
+                    "smoothing_windows": smoothing_windows,
                     "calib_ema": calib_ema,
                 }
-            return self.model_config.make(
-                sharding_context=make_legacy_sharding_context(self.mesh),
-            ).loss(None, batch, recsys_embeddings, is_training=True, **metrics_state_kwargs)
+            return model.loss(None, batch, recsys_embeddings, True, **metrics_state_kwargs)
 
         @hk.transform
         def loss_fn_eval(batch: RecsysFeaturesBatch, recsys_embeddings: RecsysEmbeddingsParameter):
             assert isinstance(
                 self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
             )
-            return self.model_config.make(
-                sharding_context=make_legacy_sharding_context(self.mesh),
-            ).loss(None, batch, recsys_embeddings, is_training=False)
+            model = self.model_config.make(sharding_context=make_legacy_sharding_context(self.mesh))
+            if type(model) is RecsysAggregatedModel:
+                loss, (stats, metric_inputs) = model.loss(batch, recsys_embeddings, False)
+                return loss, model.metrics(metric_inputs, batch, stats)
+            return model.loss(None, batch, recsys_embeddings, is_training=False)
 
         @hk.transform
         def user_forward_fn(
@@ -1946,6 +1916,17 @@ class RecsysTrainer(Trainer):
         self.loss_fn = loss_fn
         self.loss_fn_eval = loss_fn_eval
         self.user_forward_fn: typing.Any = user_forward_fn
+
+        if self.num_microbatch > 1:
+
+            def microbatch_loss_fns():
+                assert isinstance(self.model_config, RecsysAggregatedModelConfig)
+                model = self.model_config.make(
+                    sharding_context=make_legacy_sharding_context(self.mesh)
+                )
+                return model.loss, (model.loss_inputs_and_normalizers, model.loss, model.metrics)
+
+            self.microbatch_loss_fns = hk.multi_transform(microbatch_loss_fns)
 
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
 
@@ -1994,8 +1975,17 @@ class RecsysTrainer(Trainer):
                     head_index=head_index,
                 )
 
+            @hk.transform
+            def mol_side_table_fn(post_table: jax.Array):
+                assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
+                model = self.model_config.make(
+                    sharding_context=make_legacy_sharding_context(self.mesh)
+                )
+                return model.mol_side_table_rows(post_table)
+
             self.two_tower_forward_fn = two_tower_forward_fn
             self.candidate_tower_forward_fn = candidate_tower_forward_fn
+            self.mol_side_table_fn = mol_side_table_fn
 
         @hk.transform
         def forward_fn(
@@ -2013,10 +2003,15 @@ class RecsysTrainer(Trainer):
             rng = jax.ShapeDtypeStruct((2,), jnp.uint32)
             init_data = typing.cast(
                 RecsysFeaturesBatch,
-                super().prepare_data(self.example_data(self.read_bsz_per_process)),
+                super().prepare_data(
+                    self.example_data(self.read_bsz_per_process // self.num_microbatch)
+                ),
             )
         else:
             rng, init_data = self._rng_and_init_data()
+            if self.num_microbatch > 1:
+                assert isinstance(self.dataset, PhoenixDataset)
+                init_data = self.dataset.example_data_shape(self.batch_size // self.num_microbatch)
             init_data = typing.cast(RecsysFeaturesBatch, init_data)
         emb_table_init_data = self.create_embedding_init_data()
 
@@ -2032,6 +2027,8 @@ class RecsysTrainer(Trainer):
             )
 
         self.state_sharding = self.get_sharding(self.state_shape)
+        if self.use_row_emb:
+            self.state_sharding = self._row_emb_state_sharding(self.state_sharding)
         self.data_sharding = NamedSharding(
             self.mesh,
             P(("stage", *self.model_config.model_config.data_axis), ("seq", "model")),
@@ -2070,6 +2067,9 @@ class RecsysTrainer(Trainer):
                 compiler_options=compiler_options,
             )
 
+        if self.dense_params_ema_decay > 0.0:
+            self.update_jit = self._with_dense_params_ema(self.update_jit)
+
         self.forward_jit = JittedOrCompiled(
             jax.jit(
                 self.forward_fn.apply,
@@ -2099,7 +2099,6 @@ class RecsysTrainer(Trainer):
             )
 
         self.create_extra_executables()
-        self._register_recsys_checksum_jit()
         self.maybe_create_eval_executables()
 
     def maybe_create_eval_executables(self):
@@ -2142,36 +2141,6 @@ class RecsysTrainer(Trainer):
                 ),
                 out_shardings=self.data_sharding,
             )
-
-    def _register_recsys_checksum_jit(self):
-        assert isinstance(
-            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
-        )
-
-        self._filtered_sharding = _deep_filter_nones(self.state_sharding)
-        filtered_state_shape = _deep_filter_nones(self.state_shape)
-
-        unwrapped_filtered_shape = unwrap_tree(filtered_state_shape)
-
-        def compute_checksums_filtered(state):
-            return checksum.compute_checksums(state, self._filtered_sharding, self.mesh)
-
-        self._compute_checksums_filtered_jit = JittedOrCompiled(
-            jax.jit(compute_checksums_filtered, in_shardings=(self._filtered_sharding,))
-        )
-        self.register_jit_function(self._compute_checksums_filtered_jit, unwrapped_filtered_shape)
-
-    def checksum_dict(self):
-        assert isinstance(
-            self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
-        )
-        filtered_state = _deep_filter_nones(self.state)
-
-        unwrapped_state = unwrap_tree(filtered_state)
-        checksums = self._compute_checksums_filtered_jit(unwrapped_state)
-        return checksum.get_checksum_dict(
-            unwrapped_state, self._filtered_sharding, self.mesh, checksums
-        )
 
     def _is_copy_port_binder(self) -> bool:
         hostnames = self.ctx.hostnames
@@ -2266,35 +2235,24 @@ class RecsysTrainer(Trainer):
         self,
         ctx: TrainerContext,
         res: tuple[bool, int, int],
-        full_path: str = "",
-        data_pos_raw: str = "",
     ) -> tuple[bool, int, int]:
-        if full_path:
-            if data_pos_raw:
-                self._data_position = json.loads(data_pos_raw)
+        self._data_position = None
+        if res[0] and ctx.checkpoint is not None:
+            ckpt_path = ctx.checkpoint.path
+            pos_path = os.path.join(ckpt_path, _DATA_POSITION_FILENAME)
+            rank_logger.info("Looking for data position at %s", pos_path)
+            if os.path.isfile(pos_path):
+                with open(pos_path) as f:
+                    self._data_position = json.loads(f.read())
                 rank_logger.info(
-                    "Restored data position from storage checkpoint: %s", self._data_position
+                    "Restored data position from filesystem checkpoint: %s, "
+                    "current read_bsz_per_process=%d, data_world_size=%d",
+                    self._data_position,
+                    self.read_bsz_per_process,
+                    self.data_world_size,
                 )
             else:
-                self._data_position = None
-        else:
-            self._data_position = None
-            if res[0] and ctx.checkpoint is not None:
-                ckpt_path = ctx.checkpoint.path
-                pos_path = os.path.join(ckpt_path, _DATA_POSITION_FILENAME)
-                rank_logger.info("Looking for data position at %s", pos_path)
-                if os.path.isfile(pos_path):
-                    with open(pos_path) as f:
-                        self._data_position = json.loads(f.read())
-                    rank_logger.info(
-                        "Restored data position from filesystem checkpoint: %s, "
-                        "current read_bsz_per_process=%d, data_world_size=%d",
-                        self._data_position,
-                        self.read_bsz_per_process,
-                        self.data_world_size,
-                    )
-                else:
-                    rank_logger.info("No data_position.json found at %s", pos_path)
+                rank_logger.info("No data_position.json found at %s", pos_path)
 
         assert isinstance(self.state, RecsysTrainingState)
         if self.state.offset_keys is not None:
@@ -2358,6 +2316,7 @@ class RecsysTrainer(Trainer):
                     dummy_3d,
                     dummy,
                     dummy,
+                    trained_candidate_mask=dummy_3d,
                     ads_head_masking=self.model_config.ads_head_masking,
                     enable_platform_metrics=self.model_config.enable_platform_metrics,
                     metric_mask_keys=self.model_config.metric_mask_keys,
@@ -2373,7 +2332,10 @@ class RecsysTrainer(Trainer):
                             reconciled_rce[key] = loaded_rce[key]
                         else:
                             reconciled_rce[key] = jnp.zeros((3,), dtype=jnp.float32)
-            for key, zeros in self._purchase_value_ema_keys().items():
+            for key, zeros in {
+                **self._purchase_value_ema_keys(),
+                **self._conversion_delay_slice_ema_keys(3),
+            }.items():
                 loaded = loaded_rce.get(key) if loaded_rce else None
                 reconciled_rce[key] = (
                     loaded if loaded is not None and loaded.shape == zeros.shape else zeros
@@ -2389,6 +2351,11 @@ class RecsysTrainer(Trainer):
                             reconciled_calib[key] = loaded_calib[key]
                         else:
                             reconciled_calib[key] = jnp.zeros((2,), dtype=jnp.float32)
+            for key, zeros in self._conversion_delay_slice_ema_keys(2).items():
+                loaded = loaded_calib.get(key) if loaded_calib else None
+                reconciled_calib[key] = (
+                    loaded if loaded is not None and loaded.shape == zeros.shape else zeros
+                )
 
             self.state = self.state._replace(
                 rce_ema=reconciled_rce,
@@ -2410,59 +2377,6 @@ class RecsysTrainer(Trainer):
 
         return res
 
-    def _find_own_cloud_checkpoint(self) -> str | None:
-        if not self.checkpoint_storage_urls:
-            return None
-
-        xai_user = cluster.get_user() or "unknown_user"
-        xai_job_name = cluster.get_job_name() or "local"
-
-        for base_url in self.checkpoint_storage_urls.split(","):
-            base_url = base_url.strip()
-            if not base_url:
-                continue
-            cloud_base = f"{base_url.rstrip('/')}/{xai_user}/{xai_job_name}/{self.name}"
-            rank_logger.info(
-                "[own-checkpoint] searching cloud for own checkpoints at %s",
-                cloud_base,
-            )
-            try:
-                result = xai_recsys_engine.find_latest_storage_checkpoint(
-                    cloud_base,
-                    [],
-                    None,
-                )
-            except Exception as e:
-                rank_logger.warning(
-                    "[own-checkpoint] error searching %s: %s",
-                    cloud_base,
-                    e,
-                )
-                continue
-            if result is not None:
-                checkpoint_subpath = result[0]
-                full_url = f"{cloud_base}/{checkpoint_subpath}"
-                full_url = full_url.removesuffix("/orbax-ckpt")
-                rank_logger.info(
-                    "[own-checkpoint] found own checkpoint at %s",
-                    full_url,
-                )
-                return full_url
-            rank_logger.info(
-                "[own-checkpoint] no checkpoint found at %s",
-                cloud_base,
-            )
-        return None
-
-    def _has_own_local_checkpoint(self) -> bool:
-        from xrex.utils.metadata import checkpoint_dir_or_default
-
-        ckpt_dir = checkpoint_dir_or_default(self.checkpoint_config.checkpoint_dir)
-        own_dir = os.path.join(ckpt_dir, self.name)
-        if not os.path.isdir(own_dir):
-            return False
-        return any(d.startswith("elapsed_samples_") for d in os.listdir(own_dir))
-
     def purge_opt_state_on_load(self, host_state):
         if getattr(self.checkpoint_config, "keep_emb_opt_state", False):
             rank_logger.info("Not loading dense optimizer state (keeping emb_table_state)")
@@ -2474,339 +2388,37 @@ class RecsysTrainer(Trainer):
             return (lambda tree: tree._replace(opt_state=None)), {"opt_state"}
         return super().warm_start_staging_spec()
 
+    def restore_checkpoint_arrays(self, path, arrays, load_mask, rename, tag, on_replaced):
+        if not self.use_row_emb and not isinstance(self.model_config, RecsysAggregatedModelConfig):
+            return {}
+        from xrex.train.row_embedding_restore import restore_row_embeddings
+
+        return restore_row_embeddings(
+            path,
+            arrays,
+            load_mask,
+            rename,
+            tag,
+            on_replaced,
+            logical_rows=self.dataset.input_vocab_size,
+            row_sharded=self.use_row_emb,
+            verify_checksums=self.checkpoint_config.verify_checksums,
+        )
+
     def maybe_load_checkpoint(self, ctx: TrainerContext, tag=None):
         assert isinstance(
             self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
         )
         assert isinstance(self.dataset, PhoenixDataset)
 
-        has_own_local = self._has_own_local_checkpoint()
-
-        if not has_own_local and self.checkpoint_storage_urls:
-            if jax.process_index() == 0:
-                own_cloud_url = self._find_own_cloud_checkpoint()
-            else:
-                own_cloud_url = None
-            buf = np.zeros(10240, dtype=np.uint8)
-            if own_cloud_url:
-                encoded = own_cloud_url.encode("utf-8")
-                buf[: len(encoded)] = list(encoded)
-            buf = multihost_utils.broadcast_one_to_all(buf)
-            own_cloud_url = bytes(buf).rstrip(b"\x00").decode("utf-8") or None
-
-            if own_cloud_url:
-                if self.store_load:
-                    rank_logger.info(
-                        "[own-checkpoint] found own checkpoint on cloud; "
-                        "overriding store_load=%s with %s",
-                        self.store_load,
-                        own_cloud_url,
-                    )
-                self.store_load = own_cloud_url
-        elif has_own_local and self.store_load:
-            rank_logger.info(
-                "[own-checkpoint] own local checkpoint found; ignoring store_load=%s",
-                self.store_load,
-            )
-            self.store_load = None
-
-        if self.store_load and not has_own_local:
-            from xrex.utils.metadata import CheckpointMeta, LoadType
-
-            store_url = self.store_load.rstrip("/")
-
-            elapsed_samples = 0
-            for part in store_url.split("/"):
-                if part.startswith("elapsed_samples_"):
-                    elapsed_samples = int(part.split("_")[-1])
-                    break
-
-            tmp_dir = tempfile.mkdtemp(prefix="orbax_load_")
-            try:
-                ocdbt_url = f"{store_url}/orbax-ckpt"
-                logger.info(
-                    "[cloud-restore] proc %d downloading OCDBT from %s to %s",
-                    jax.process_index(),
-                    ocdbt_url,
-                    tmp_dir,
-                )
-                _download_ocdbt_from_cloud(ocdbt_url, tmp_dir, jax.process_index())
-                load_parent = tempfile.mkdtemp(prefix="orbax_load_parent_")
-                orbax_ckpt_dir = os.path.join(load_parent, "orbax-ckpt")
-                os.rename(tmp_dir, orbax_ckpt_dir)
-                tmp_dir = load_parent
-                load_path = load_parent
-
-                logger.info(
-                    "[cloud-restore] proc %d loading from %s (elapsed_samples=%d)",
-                    jax.process_index(),
-                    load_path,
-                    elapsed_samples,
-                )
-
-                try:
-                    n = xai_recsys_engine.download_prefix_to_local(
-                        store_url, load_parent, 32, shallow=True
-                    )
-                    logger.info(
-                        "[cloud-restore] downloaded %d sidecar files to %s",
-                        n,
-                        load_parent,
-                    )
-                except Exception as e:
-                    logger.info("[cloud-restore] could not download sidecar files: %s", e)
-
-                ctx.checkpoint = CheckpointMeta(
-                    run_id="cloud-restore",
-                    elapsed_samples=elapsed_samples,
-                    checkpoint_index=None,
-                    path=load_path,
-                    load_type=LoadType.MANUAL_LOAD,
-                    source="cloud",
-                    format="orbax",
-                    elapsed_tokens=0,
-                )
-                self.checkpoint_config.from_checkpoint = True
-                res = super().maybe_load_checkpoint(ctx, tag)
-            finally:
-                if tmp_dir is not None:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-            return self._finalize_checkpoint_load(ctx, res)
-
-        full_path = ""
-        data_pos_raw = ""
-
-        checkpoint_path = self.get_checkpoint_path(self.ctx)
-        store = Store.from_path(checkpoint_path)
-
-        use_cloud_load = store != Store.FS or bool(self.store_load)
-        if self.checkpoint_config.copy_port and use_cloud_load:
-            start_all = time.time()
-
-            if not hasattr(self, "host_state") or self.host_state is None:
-                self.host_state = jax.device_put(self.state, self.host_sharding)
-            else:
-                self.state, self.host_state = self.offload_state(self.state, self.host_state)
-
-            host_state = tree_to_dict(unwrap_tree(self.host_state))
-            full_path, checksums = (
-                np.zeros(10240, dtype=np.uint8),
-                np.zeros(102400, dtype=np.uint8),
-            )
-            max_shards = np.zeros(1, dtype=np.int64)
-            data_pos_buf = np.zeros(1024, dtype=np.uint8)
-            if jax.process_index() == 0:
-                result = None
-                if store != Store.FS:
-                    base_path = f"{self.checkpoint_config.checkpoint_dir}/{self.name}"
-                    result = xai_recsys_engine.find_latest_storage_checkpoint(
-                        base_path,
-                        [
-                            (k, host_state[k].nbytes)
-                            for k in host_state
-                            if host_state[k] is not None
-                        ],
-                        None,
-                    )
-                if result is None and self.store_load:
-                    path_stripped = self.store_load.rstrip("/")
-                    parts = path_stripped.split("/")
-                    fixed_prefix = f"{parts[-2]}/{parts[-1]}"
-                    base_path = "/".join(parts[:-2])
-                    result = xai_recsys_engine.find_latest_storage_checkpoint(
-                        base_path,
-                        [
-                            (k, host_state[k].nbytes)
-                            for k in host_state
-                            if host_state[k] is not None
-                        ],
-                        fixed_prefix,
-                    )
-                if result is not None:
-                    p, max_shards_val = result
-                    max_shards[0] = max_shards_val
-                    xai_recsys_engine.load_arrays_from_storage(
-                        f"{base_path}/{p}",
-                        [("checksums.0.json", checksums)],
-                        32,
-                    )
-                    try:
-                        xai_recsys_engine.load_arrays_from_storage(
-                            f"{base_path}/{p}",
-                            [(_DATA_POSITION_FILENAME, data_pos_buf)],
-                            1,
-                        )
-                        rank_logger.info(
-                            "Downloaded %s from %s/%s (%d non-zero bytes)",
-                            _DATA_POSITION_FILENAME,
-                            base_path,
-                            p,
-                            np.count_nonzero(data_pos_buf),
-                        )
-                    except Exception as e:
-                        rank_logger.warning(
-                            "Failed to download %s from %s/%s: %s",
-                            _DATA_POSITION_FILENAME,
-                            base_path,
-                            p,
-                            e,
-                        )
-                    data = f"{base_path}/{p}".encode("utf-8")
-                    full_path[: len(data)] = list(data)
-            res = multihost_utils.broadcast_one_to_all(
-                (full_path, checksums, max_shards, data_pos_buf)
-            )
-            full_path = bytes(res[0]).rstrip(b"\x00").decode("utf-8")
-            checksums = bytes(res[1]).rstrip(b"\x00").decode("utf-8")
-            num_sources = int(res[2][0])
-            data_pos_raw = bytes(res[3]).rstrip(b"\x00").decode("utf-8")
-
-            if self.store_load and not full_path:
-                raise ValueError(
-                    f"store_load='{self.store_load}' was specified but no valid checkpoint was found. "
-                    "Verify that the path exists and contains a valid checkpoint."
-                )
-
-        if not full_path:
-            res = super().maybe_load_checkpoint(ctx, tag)
-        else:
-            start_load = time.time()
-            checksums = json.loads(checksums)["global_checksums"]
-
-            def get_sharded(key, value):
-                if self.parallel_config.ep == 1:
-                    return key in (
-                        "emb_table",
-                        "emb_table_state.inner_state.1.0.mu.table",
-                        "emb_table_state.inner_state.1.0.nu.table",
-                    )
-                shards = value.addressable_shards
-                if len(shards) != 1:
-                    raise NotImplementedError(
-                        f"unsupported sharding in tensor {key}: {len(shards)} != 1 addressable shards"
-                    )
-                shard = shards[0]
-                sharded = [(x.start, x.stop, x.step) != (None,) * 3 for x in shard.index]
-                return any(sharded)
-
-            get_axis = lambda key: 0 if key == "emb_table" else 1
-            name_tensor_pairs = []
-            tensors = {}
-            for key, value in host_state.items():
-                if value is None:
-                    continue
-                any_sharded = get_sharded(key, value)
-                n = num_sources if any_sharded else 1
-                shape = list(value.shape)
-                m = max(1, n // len(jax.devices()))
-                if n > 1:
-                    shape[get_axis(key)] //= n
-                arrs = [np.zeros(shape, value.dtype) for _ in range(m)]
-                tensors[key] = arrs
-                k = max(1, len(jax.devices()) // n)
-                if jax.process_index() % k == 0:
-                    i = jax.process_index() // k
-                    for j, arr in enumerate(arrs):
-                        arr = np.ndarray(shape=arr.nbytes, dtype=np.uint8, buffer=arr)
-                        suffix = [0] * value.ndim
-                        if any_sharded:
-                            suffix[get_axis(key)] = i * m + j
-                        suffix = "".join(f"/{x}" for x in suffix)
-                        name_tensor_pairs.append((f"{key}/c{suffix}", arr))
-
-            xai_recsys_engine.load_arrays_from_storage(full_path, name_tensor_pairs, 256)
-            multihost_utils.sync_global_devices("recsys-load")
-
-            start_reshard = time.time()
-            mesh_params = []
-            for n in 1, num_sources, len(jax.devices()):
-                mesh_shards = min(n, len(jax.devices()))
-                mesh_replicas = max(1, len(jax.devices()) // n)
-                devices = np.array(jax.devices()).reshape(mesh_shards, mesh_replicas)
-                mesh_params.append((Mesh(devices, ("shard", "init_replica")), mesh_replicas))
-
-            state_sharding = tree_to_dict(self.state_sharding)
-
-            def reshard(path, value):
-                key = path_to_dotted(path)
-                any_sharded = get_sharded(key, value)
-                pspec = [None] * value.ndim
-                if any_sharded:
-                    pspec[get_axis(key)] = "shard"
-                mesh, mesh_replicas = mesh_params[1 if any_sharded else 0]
-                source_sharding = NamedSharding(mesh, P(*pspec))
-                arrs = jax.device_put(tensors[key], jax.local_devices()[0])
-                arr = jnp.concatenate(arrs, get_axis(key)) if len(arrs) > 1 else arrs[0]
-                arr = jax.make_array_from_single_device_arrays(value.shape, source_sharding, [arr])
-                axis = get_axis(key) if any_sharded else 0
-                if mesh_replicas > 1:
-                    pspec = [None] * value.ndim
-                    if value.ndim > 0:
-                        pspec[axis] = "shard"
-                    pspec_for_shard_map = P(*pspec)
-
-                    @functools.partial(jax.jit, donate_argnums=(0,))
-                    @functools.partial(
-                        shard_map,
-                        mesh=mesh,
-                        in_specs=(pspec_for_shard_map,),
-                        out_specs=pspec_for_shard_map,
-                        check_vma=False,
-                    )
-                    def broadcast_from_leader(x):
-                        return pbroadcast(x, ("init_replica",), 0)
-
-                    arr = broadcast_from_leader(arr)
-                if any_sharded and self.parallel_config.ep > 1 and axis != 1:
-                    pspec = [None] * value.ndim
-                    pspec[1] = "shard"
-                    arr = jax.device_put(arr, NamedSharding(mesh_params[2][0], P(*pspec)))
-                return jax.device_put(arr, state_sharding[key])
-
-            self.state = jax.tree_util.tree_map_with_path(reshard, self.state)
-
-            start_checksum = time.time()
-            checksum_message = ""
-            if self.checkpoint_config.verify_checksums:
-                checksum_dict = self.checksum_dict()["global_checksums"]
-                unknown_checksums = []
-                count = 0
-                for key in host_state:
-                    if key not in checksums:
-                        unknown_checksums.append(key)
-                    elif checksums[key] != checksum_dict[key]:
-                        raise ValueError(f"Checksum mismatch on {key}")
-                    else:
-                        count += 1
-                if unknown_checksums:
-                    rank_logger.warning(
-                        "The following keys were not found in the checkpoint checksums file and could not be verified: %s",
-                        unknown_checksums,
-                    )
-                checksum_message = f"({count}/{len(host_state)} checksums match) "
-
-            t = time.time()
-            durations = [
-                f"{x:.1f} s"
-                for x in (
-                    start_load - start_all,
-                    start_reshard - start_load,
-                    start_checksum - start_reshard,
-                    t - start_checksum,
-                    t - start_all,
-                )
-            ]
-            rank_logger.info(
-                "Loaded checkpoint %s%s; discovery %s, load %s, reshard %s, checksum %s, total %s",
-                checksum_message,
-                full_path,
-                *durations,
+        if self.store_load:
+            raise ValueError(
+                f"store_load={self.store_load!r} is not supported by the trainer; "
+                "restore from a filesystem checkpoint with load=."
             )
 
-            elapsed_samples = int(full_path.split("/")[-2].split("_")[-1])
-            res = (True, elapsed_samples, 0)
-
-        return self._finalize_checkpoint_load(ctx, res, full_path, data_pos_raw)
+        res = super().maybe_load_checkpoint(ctx, tag)
+        return self._finalize_checkpoint_load(ctx, res)
 
     def next_data_batch(self):
         if self._shmem_write_future is not None and self._shmem_write_future.done():
@@ -2839,7 +2451,9 @@ class RecsysTrainer(Trainer):
         self.offsets_to_commit = self._batch_pipeline.current.offsets
 
         assert self._async_emb_context is not None
-        ready_step = async_emb.async_emb_api.wait_step_ready(self._async_emb_context.context_id)
+        ready_step = recsys_async_emb.kernel_api(self._async_emb_context).wait_step_ready(
+            self._async_emb_context.context_id
+        )
         assert ready_step != 0 or self._async_emb_lookup_pin is None
         return self._batch_pipeline.current.batch
 
@@ -3000,18 +2614,35 @@ class RecsysTrainer(Trainer):
         return time.perf_counter() - start
 
     def save_checkpoint(self, *args, **kwargs):
+        if not self.dense_params_ema_in_checkpoint or self._dense_params_ema is None:
+            return self._save_checkpoint_current_params(*args, **kwargs)
+        live_params = self.state.params
+        self.state = self.state._replace(
+            params=self._dense_params_ema_as_params_jit(self._dense_params_ema, live_params)
+        )
+        try:
+            return self._save_checkpoint_current_params(*args, **kwargs)
+        finally:
+            self.state = self.state._replace(params=live_params)
+
+    def _save_checkpoint_current_params(self, *args, **kwargs):
         dataset = self.dataset
         assert isinstance(dataset, PhoenixDataset), f"Got {type(dataset)}"
         assert isinstance(self.state, RecsysTrainingState), f"Got {type(self.state)}"
 
-        self.state = self._flush_deferred_embedding_update(self.state)
-
-        if self.offsets_to_commit:
+        if self.offsets_to_commit or (
+            isinstance(dataset, RustKafkaDataset)
+            and dataset.redistribution_reader_count(jax.process_count())
+        ):
             items_list = list(self.offsets_to_commit.items())
 
             n_partitions = dataset.num_kafka_partitions
             assert n_partitions is not None, "num_kafka_partitions must be set for Kafka offsets"
             max_size = (n_partitions + jax.process_count() - 1) // jax.process_count()
+            if isinstance(dataset, RustKafkaDataset) and dataset.redistribution_reader_count(
+                jax.process_count()
+            ):
+                max_size = n_partitions
 
             items_padded = items_list + [(-1, 0)] * (max_size - len(items_list))
 
@@ -3019,24 +2650,25 @@ class RecsysTrainer(Trainer):
 
             all_offsets = multihost_utils.process_allgather(items_array, tiled=True)
 
-            u = collections.defaultdict(int)
-            for k, v in all_offsets:
-                u[k] = max(v, u[k])
+            if np.any(all_offsets[:, 0] >= 0):
+                u = collections.defaultdict(int)
+                for k, v in all_offsets:
+                    u[k] = max(v, u[k])
 
-            n = dataset.num_kafka_partitions
-            assert n is not None
-            _k = np.arange(n, dtype=all_offsets.dtype)
-            _v = np.array([u.get(k, 0) for k in range(n)], dtype=all_offsets.dtype)
+                n = dataset.num_kafka_partitions
+                assert n is not None
+                _k = np.arange(n, dtype=all_offsets.dtype)
+                _v = np.array([u.get(k, 0) for k in range(n)], dtype=all_offsets.dtype)
 
-            offset_keys: jax.Array = multihost_utils.host_local_array_to_global_array(
-                _k, self.mesh, P()
-            )
-            offsets_values: jax.Array = multihost_utils.host_local_array_to_global_array(
-                _v, self.mesh, P()
-            )
+                offset_keys: jax.Array = multihost_utils.host_local_array_to_global_array(
+                    _k, self.mesh, P()
+                )
+                offsets_values: jax.Array = multihost_utils.host_local_array_to_global_array(
+                    _v, self.mesh, P()
+                )
 
-            self.state = self.state._replace(offset_keys=offset_keys)
-            self.state = self.state._replace(offset_values=offsets_values)
+                self.state = self.state._replace(offset_keys=offset_keys)
+                self.state = self.state._replace(offset_values=offsets_values)
 
         self.maybe_build_retrieval_post_embeddings()
         self.maybe_build_gen_recs_post_embeddings()
@@ -3092,7 +2724,6 @@ class RecsysTrainer(Trainer):
 
             checkpoint_path = self.get_checkpoint_path(self.ctx)
             prefix = "/".join(checkpoint_path.split("/")[-2:])
-            store = Store.from_path(checkpoint_path)
             wait_until_finished()
             if self._shmem_write_future is not None:
                 self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()
@@ -3104,11 +2735,11 @@ class RecsysTrainer(Trainer):
                 self.host_state = jax.device_put(self.state, self.host_sharding)
             else:
                 self.state, self.host_state = self.offload_state(self.state, self.host_state)
+            jax.block_until_ready(self.host_state)
 
             assert isinstance(self.state, RecsysTrainingState)
             host_state = unwrap_tree(self.host_state)
-            if store == Store.FS:
-                host_state = host_state.purge_opt_state()
+            host_state = host_state.purge_opt_state()
             host_state = tree_to_dict(host_state)
 
             ep = self.mesh.shape["expert"]
@@ -3257,19 +2888,6 @@ class RecsysTrainer(Trainer):
                 bundle_files,
             )
 
-            if store != Store.FS:
-                if should_persist_disk:
-                    self._last_disk_checkpoint_ts = time.time()
-                return None
-
-            if should_persist_disk:
-                if self._shmem_write_future is not None:
-                    self._pending_shmem_ckpt_write_s = self._shmem_write_future.result()
-                    self._shmem_write_future = None
-                host_state.clear()
-                del write_items
-                self.host_state = None
-
         if port and not should_persist_disk:
             return None
 
@@ -3284,81 +2902,6 @@ class RecsysTrainer(Trainer):
                 json.dump(data_pos, f)
             rank_logger.info("Saved data position to %s: %s", pos_path, data_pos)
 
-        if self.checkpoint_storage_urls:
-            xai_user = cluster.get_user() or "unknown_user"
-            xai_job_name = cluster.get_job_name() or "local"
-            tag = "orbax-ckpt"
-            proc_idx = jax.process_index()
-
-            from xrex.utils.checkpointing import get_checkpointer
-
-            _orbax_ckpt = get_checkpointer()
-            local_ckpt_dir = self.get_checkpoint_path(self.ctx)
-
-            upload_targets = []
-            for base_url in self.checkpoint_storage_urls.split(","):
-                base_url = base_url.strip()
-                if not base_url:
-                    continue
-                cloud_path = (
-                    f"{base_url.rstrip('/')}/{xai_user}/{xai_job_name}"
-                    f"/{self.name}/elapsed_samples_{self.elapsed_samples:018d}"
-                )
-                upload_targets.append(cloud_path)
-
-            def _bg_upload():
-                try:
-                    logger.info(
-                        "[cloud-ckpt] proc %d waiting for /data/ save",
-                        proc_idx,
-                    )
-                    _orbax_ckpt.wait_until_finished()
-                    logger.info(
-                        "[cloud-ckpt] proc %d /data/ save done, starting upload",
-                        proc_idx,
-                    )
-
-                    ensure_orbax_dir_finalized(local_ckpt_dir, tag)
-                    file_list = collect_cloud_upload_files(local_ckpt_dir, tag, proc_idx)
-                    my_files = [rel for rel, _ in file_list]
-                    my_bytes = sum(size for _, size in file_list)
-
-                    for cloud_dest in upload_targets:
-                        upload_start = time.time()
-                        logger.info(
-                            "[cloud-ckpt] proc %d uploading %d files (%.1f MB) from %s to %s",
-                            proc_idx,
-                            len(my_files),
-                            my_bytes / (1024 * 1024),
-                            local_ckpt_dir,
-                            cloud_dest,
-                        )
-                        if my_files:
-                            xai_recsys_engine.upload_files_to_storage(
-                                local_ckpt_dir,
-                                my_files,
-                                cloud_dest,
-                            )
-                        logger.info(
-                            "[cloud-ckpt] proc %d upload done in %.1fs to %s",
-                            proc_idx,
-                            time.time() - upload_start,
-                            cloud_dest,
-                        )
-                except Exception:
-                    logger.exception(
-                        "[cloud-ckpt] proc %d upload failed",
-                        proc_idx,
-                    )
-
-            import threading
-
-            threading.Thread(
-                target=_bg_upload,
-                daemon=True,
-                name="cloud-ckpt-upload",
-            ).start()
-
         gc_start = time.perf_counter()
         gc.collect()
         self._pending_gc_collect_s = time.perf_counter() - gc_start
@@ -3372,10 +2915,14 @@ class RecsysTrainer(Trainer):
             super().run()
         finally:
             exception_type = sys.exc_info()[0]
-            if exception_type is None or issubclass(exception_type, StopIteration):
-                self.state = self._flush_deferred_embedding_update(self.state)
-            elif self._async_emb_context is not None:
-                async_emb.async_emb_api.abort(self._async_emb_context.context_id)
+            if (
+                exception_type is not None
+                and not issubclass(exception_type, StopIteration)
+                and self._async_emb_context is not None
+            ):
+                recsys_async_emb.kernel_api(self._async_emb_context).abort(
+                    self._async_emb_context.context_id
+                )
 
             shutdown = getattr(self.dataset, "shutdown", None)
             if callable(shutdown):
@@ -3395,11 +2942,86 @@ class RecsysTrainer(Trainer):
         high_32 = jnp.asarray(post_ids >> 32, dtype=jnp.int32)
         return jnp.stack([low_32, high_32], axis=1)
 
+    def _with_dense_params_ema(self, update_fn):
+        decay = self.dense_params_ema_decay
+        params_sharding = self.state_sharding.params
+
+        def ema_init(params):
+            return jax.tree.map(lambda p: jnp.copy(p.astype(jnp.float32)), params)
+
+        def ema_update(ema, params):
+            return jax.tree.map(
+                lambda e, p: decay * e + (1.0 - decay) * p.astype(jnp.float32), ema, params
+            )
+
+        def ema_gap(ema, params):
+            pairs = zip(jax.tree.leaves(ema), jax.tree.leaves(params))
+            gap_sq = sum(jnp.sum(jnp.square(e - p.astype(jnp.float32))) for e, p in pairs)
+            norm_sq = sum(
+                jnp.sum(jnp.square(p.astype(jnp.float32))) for p in jax.tree.leaves(params)
+            )
+            return jnp.sqrt(gap_sq), jnp.sqrt(norm_sq)
+
+        self._dense_params_ema_init_jit = jax.jit(
+            ema_init, in_shardings=(params_sharding,), out_shardings=params_sharding
+        )
+        self._dense_params_ema_update_jit = jax.jit(
+            ema_update,
+            in_shardings=(params_sharding, params_sharding),
+            out_shardings=params_sharding,
+            donate_argnums=(0,),
+        )
+        self._dense_params_ema_gap_jit = jax.jit(
+            ema_gap, in_shardings=(params_sharding, params_sharding)
+        )
+        self._dense_params_ema_as_params_jit = jax.jit(
+            lambda ema, params: jax.tree.map(lambda e, p: jnp.copy(e).astype(p.dtype), ema, params),
+            in_shardings=(params_sharding, params_sharding),
+            out_shardings=params_sharding,
+        )
+
+        def update_with_dense_params_ema(state, *args):
+            state, metrics, extras = update_fn(state, *args)
+            if self._dense_params_ema is None:
+                self._dense_params_ema = self._dense_params_ema_init_jit(state.params)
+                num_params = sum(int(np.prod(p.shape)) for p in jax.tree.leaves(state.params))
+                rank_logger.info(
+                    f"dense params EMA started: decay {decay}, {num_params:,} params "
+                    f"({num_params * 4 / 2**30:.2f} GiB in float32)"
+                )
+            else:
+                self._dense_params_ema = self._dense_params_ema_update_jit(
+                    self._dense_params_ema, state.params
+                )
+            return state, metrics, extras
+
+        return update_with_dense_params_ema
+
     def eval(self, soft_step: int):
+        if self._dense_params_ema is None:
+            return self._eval_current_params(soft_step)
+        live_params = self.state.params
+        gap, norm = self._dense_params_ema_gap_jit(self._dense_params_ema, live_params)
+        self.state = self.state._replace(
+            params=jax.tree.map(lambda e, p: e.astype(p.dtype), self._dense_params_ema, live_params)
+        )
+        try:
+            metrics = dict(self._eval_current_params(soft_step))
+        finally:
+            self.state = self.state._replace(params=live_params)
+        metrics["dense_params_ema/relative_gap"] = float(gap) / max(float(norm), 1e-12)
+        return metrics
+
+    def _eval_current_params(self, soft_step: int):
         if isinstance(self.model_config, RecsysTwoTowerModelConfig):
             return self.eval_two_tower(soft_step)
 
         raise ValueError("Ranking model eval_every_n is not supported yet.")
+
+    def _split_home_checkpoint(self) -> bool:
+        return bool(self.split_home_checkpoint) or bool(
+            getattr(self.model_config, "split_home_checkpoint", False)
+        )
 
     def maybe_build_retrieval_post_embeddings(self):
         if not isinstance(self.model_config, RecsysTwoTowerModelConfig):
@@ -3419,6 +3041,8 @@ class RecsysTrainer(Trainer):
             target_datasets = [
                 RetrievalDataset[name] for name in self.model_config.checkpoint_dataset_names
             ]
+            if self._split_home_checkpoint():
+                target_datasets = RetrievalDataset.expand_home_to_cold_hot(target_datasets)
             rank_logger.info(
                 f"Loading configured retrieval datasets: {[ds.name for ds in target_datasets]}"
             )
@@ -3430,6 +3054,8 @@ class RecsysTrainer(Trainer):
             target_datasets = (
                 list(eval_target_types) if eval_target_types else [RetrievalDataset.HOME]
             )
+            if self._split_home_checkpoint():
+                target_datasets = RetrievalDataset.expand_home_to_cold_hot(target_datasets)
             rank_logger.info(
                 f"Loading configured retrieval datasets: {[ds.name for ds in target_datasets]}"
             )
@@ -3444,6 +3070,9 @@ class RecsysTrainer(Trainer):
                 max_posts=max_posts,
                 read_post_sid=_use_post_sid,
                 sid_num_levels=_sid_num_levels,
+                cold_start_max_age_seconds=float(
+                    getattr(self.model_config, "cold_start_max_age_seconds", 0.0) or 0.0
+                ),
             )
         else:
             post_ids = np.zeros(max_posts, dtype=np.int64)
@@ -3561,6 +3190,22 @@ class RecsysTrainer(Trainer):
         ).reshape(-1, 1)
 
         original_embeddings = self.state.post_embeddings.embeddings
+        mol_side_table = self.state.post_embeddings.mol_side_table
+        if mol_side_table is not None:
+            if self.mol_side_table_jit is None:
+                self.mol_side_table_jit = jax.jit(
+                    self.mol_side_table_fn.apply,
+                    in_shardings=(self.state_sharding.params, None, self.data_sharding),
+                    out_shardings=NamedSharding(self.mesh, P(None, None)),
+                )
+            t_side = time.time()
+            side_rows = self.mol_side_table_jit(self.state.params, None, candidate_embeddings)
+            mol_side_table = replace(mol_side_table, x=side_rows, pspec=P(None, None))
+            rank_logger.info(
+                "MoL serving side table %s built in %.1fs",
+                tuple(side_rows.shape),
+                time.time() - t_side,
+            )
         post_embeddings = PostEmbeddings(
             post_ids=global_post_ids,
             author_ids=global_author_ids,
@@ -3568,6 +3213,7 @@ class RecsysTrainer(Trainer):
                 original_embeddings, x=candidate_embeddings, pspec=self.data_sharding.spec
             ),
             dataset_types=combined_dataset_types,
+            mol_side_table=mol_side_table,
         )
         self.state = self.state._replace(post_embeddings=post_embeddings)
 

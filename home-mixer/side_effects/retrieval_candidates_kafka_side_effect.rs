@@ -48,6 +48,8 @@ fn candidate_record(
         score: candidate.score,
         status: status.into(),
         rank: Some(rank),
+        weighted_score: candidate.weighted_score,
+        in_network: candidate.in_network,
     }
 }
 
@@ -56,7 +58,16 @@ fn build_batch(
 ) -> pb::RetrievalCandidateBatch {
     let query = &input.query;
     let mut non_selected: Vec<&PostCandidate> = input.non_selected_candidates.iter().collect();
-    non_selected.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    non_selected.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                b.weighted_score
+                    .partial_cmp(&a.weighted_score)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
     let max_candidates = query.params.get(RetrievalCandidatesKafkaMaxCandidates) as usize;
     let candidates = input
         .selected_candidates
@@ -142,6 +153,8 @@ mod tests {
             author_id: 10,
             retweeted_tweet_id: Some(100),
             retweeted_user_id: Some(1000),
+            weighted_score: Some(1.2),
+            in_network: Some(true),
             retrieval_sources: vec![
                 RetrievalSource::from_served_type(ServedType::ForYouInNetwork),
                 RetrievalSource {
@@ -202,6 +215,8 @@ mod tests {
                 score: Some(0.9),
                 status: RetrievalCandidateStatus::RetrievalCandidateSelected.into(),
                 rank: Some(1),
+                weighted_score: Some(1.2),
+                in_network: Some(true),
             },
             batch.candidates[0]
         );

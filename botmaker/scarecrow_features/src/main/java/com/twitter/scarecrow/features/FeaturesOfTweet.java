@@ -44,7 +44,7 @@ import static com.twitter.botmaker.FeatureModifier.REQUIRED;
 
 public class FeaturesOfTweet extends FeatureMapExtractor {
   private final Tweet tweet;
-  private final boolean isTweetEvent; 
+  private final boolean isTweetEvent;
   private final Set<Long> victimIds;
 
   public FeaturesOfTweet(Tweet tweet, boolean isTweetEvent) {
@@ -160,7 +160,7 @@ public class FeaturesOfTweet extends FeatureMapExtractor {
 
     for (MentionEntity mention : mentions) {
       screenNames.add(mention.getScreen_name());
-      ids.add(mention.getUser_id()); 
+      ids.add(mention.getUser_id());
       if (mention.isSetUser_id()) {
         victimIds.add(mention.getUser_id());
       }

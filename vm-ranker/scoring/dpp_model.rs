@@ -1,10 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use half::f16;
 use log::info;
 use rand::Rng;
-use xai_vm_ranker_proto::{RankCandidate, RankRequest, RankedCandidate};
+use xai_vm_ranker_proto::{RankCandidate, RankRequest};
 
 use super::DppContext;
 use crate::dpp::{self, DppInput};
@@ -36,15 +36,35 @@ fn random_unit_embedding(dim: usize) -> Arc<Vec<f16>> {
     Arc::new(emb)
 }
 
-fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
-    let dim = ctx.store.dim();
+#[derive(Default)]
+pub struct EmbeddingMemo(HashMap<u64, (Arc<Vec<f16>>, bool)>);
+
+impl EmbeddingMemo {
+    fn resolve(&mut self, embedding_id: u64, ctx: &DppContext) -> (Arc<Vec<f16>>, bool) {
+        let (embedding, missing) = self.0.entry(embedding_id).or_insert_with(|| {
+            match ctx.store.client.get(embedding_id) {
+                Some(arc) => (arc, false),
+                None => (random_unit_embedding(ctx.store.dim()), true),
+            }
+        });
+        (Arc::clone(embedding), *missing)
+    }
+}
+
+fn build_dpp_inputs(
+    req: &RankRequest,
+    scores: &[Option<f64>],
+    ctx: &DppContext,
+    memo: &mut EmbeddingMemo,
+) -> Vec<DppInput> {
     let max_rank = ctx.config.max_selected_rank;
 
     let mut scored: Vec<(usize, &RankCandidate, f64)> = req
         .candidates
         .iter()
+        .zip(scores)
         .enumerate()
-        .filter_map(|(i, c)| c.score.map(|s| (i, c, s)))
+        .filter_map(|(i, (c, s))| s.map(|s| (i, c, s)))
         .collect();
 
     scored.sort_unstable_by(|(i_a, _, s_a), (i_b, _, s_b)| {
@@ -62,14 +82,11 @@ fn build_dpp_inputs(req: &RankRequest, ctx: &DppContext) -> Vec<DppInput> {
             } else {
                 c.tweet_id
             };
-            let fetched = ctx.store.client.get(embedding_id);
-            let embedding_missing = fetched.is_none();
-            let (embedding, norm) = match fetched {
-                Some(arc) => {
-                    let n = l2_norm(&arc);
-                    (arc, n)
-                }
-                None => (random_unit_embedding(dim), 1.0),
+            let (embedding, embedding_missing) = memo.resolve(embedding_id, ctx);
+            let norm = if embedding_missing {
+                1.0
+            } else {
+                l2_norm(&embedding)
             };
             DppInput {
                 id: c.tweet_id,
@@ -107,8 +124,17 @@ fn build_seed_input(req: &RankRequest, ctx: &DppContext) -> Option<DppInput> {
     }
 }
 
-pub fn rank(req: &RankRequest, ctx: &DppContext) -> Vec<RankedCandidate> {
-    let inputs = build_dpp_inputs(req, ctx);
+pub fn rank(req: &RankRequest, scores: &[Option<f64>], ctx: &DppContext) -> Vec<f64> {
+    rank_with_memo(req, scores, ctx, &mut EmbeddingMemo::default())
+}
+
+pub fn rank_with_memo(
+    req: &RankRequest,
+    scores: &[Option<f64>],
+    ctx: &DppContext,
+    memo: &mut EmbeddingMemo,
+) -> Vec<f64> {
+    let inputs = build_dpp_inputs(req, scores, ctx, memo);
     let seed = build_seed_input(req, ctx);
 
     let results = dpp::rescore(&inputs, seed.as_ref(), &ctx.config, req.viewer_id);
@@ -169,13 +195,13 @@ pub fn rank(req: &RankRequest, ctx: &DppContext) -> Vec<RankedCandidate> {
 
     req.candidates
         .iter()
-        .map(|c| RankedCandidate {
-            tweet_id: c.tweet_id,
-            score: if selected_ids.contains(&c.tweet_id) {
-                c.score.unwrap_or(0.0)
+        .zip(scores)
+        .map(|(c, s)| {
+            if selected_ids.contains(&c.tweet_id) {
+                s.unwrap_or(0.0)
             } else {
                 0.0
-            },
+            }
         })
         .collect()
 }

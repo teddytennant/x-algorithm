@@ -17,6 +17,7 @@ use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsTo
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
 use crate::side_effects::served_candidates_kafka_side_effect::ServedCandidatesKafkaSideEffect;
+use crate::side_effects::served_event_kafka_side_effect::ServedEventKafkaSideEffect;
 use crate::side_effects::truncate_served_history_side_effect::TruncateServedHistorySideEffect;
 use crate::side_effects::update_past_request_timestamps_side_effect::UpdatePastRequestTimestampsSideEffect;
 use crate::side_effects::update_served_history_side_effect::UpdateServedHistorySideEffect;
@@ -56,6 +57,7 @@ impl RankedFollowingCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -83,6 +85,7 @@ impl RankedFollowingCandidatePipeline {
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
             ClientEventsKafkaSideEffect::prod(),
+            ServedEventKafkaSideEffect::prod(),
         );
 
         Self::build(
@@ -95,6 +98,7 @@ impl RankedFollowingCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
         )
     }
 
@@ -109,6 +113,7 @@ impl RankedFollowingCandidatePipeline {
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
         client_events: ClientEventsKafkaSideEffect,
+        served_event: ServedEventKafkaSideEffect,
     ) -> Self {
         let query_hydrators: Vec<Box<dyn QueryHydrator<ScoredPostsQuery>>> = vec![
             Box::new(ServedHistoryQueryHydrator::from_client(Arc::clone(
@@ -135,6 +140,7 @@ impl RankedFollowingCandidatePipeline {
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
                 Box::new(client_events),
+                Box::new(served_event),
                 Box::new(ResponseStatsSideEffect),
                 Box::new(UpdatePastRequestTimestampsSideEffect::new(
                     past_request_timestamps_client,
@@ -169,6 +175,7 @@ impl RankedFollowingCandidatePipeline {
         let publish_seen_ids = PublishSeenIdsToKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
+        let served_event = ServedEventKafkaSideEffect::new(Arc::clone(&mock_kafka));
         Self::build(
             scored_posts_server,
             ad_index_client,
@@ -179,6 +186,7 @@ impl RankedFollowingCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
         )
     }
 }

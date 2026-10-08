@@ -24,34 +24,43 @@ impl PipelineStage {
 }
 
 tokio::task_local! {
-    static ACTIVE: RefCell<PipelineSummary>;
+    static ACTIVE: RefCell<Option<PipelineSummary>>;
 }
 
-pub async fn scope<F: Future>(fut: F) -> F::Output {
-    ACTIVE
-        .scope(RefCell::new(PipelineSummary::default()), fut)
-        .await
+pub async fn scope<F: Future>(
+    pipeline: &'static str,
+    type_name: &'static str,
+    fut: F,
+) -> (F::Output, Option<PipelineTrace>) {
+    let nested = ACTIVE.try_with(|_| ()).is_ok();
+    let (output, trace) = ACTIVE
+        .scope(
+            RefCell::new(Some(PipelineSummary::new(pipeline, type_name))),
+            async {
+                let output = fut.await;
+                let summary = ACTIVE.with(|summary| summary.borrow_mut().take());
+                (output, summary.map(PipelineSummary::finish))
+            },
+        )
+        .await;
+    if nested {
+        with_active(|parent| {
+            if let Some(stage) = parent.trace.stages.last_mut() {
+                stage.nested.extend(trace);
+            }
+        });
+        return (output, None);
+    }
+    (output, trace)
 }
 
 pub fn emit(pipeline: &str, start: Instant, result_size: usize) {
     with_active(|summary| {
         info!(
             latency_ms = start.elapsed().as_millis() as u64,
-            result_size, "{} Summary:{}", pipeline, summary
+            result_size, "{} Summary:{}", pipeline, summary.trace
         );
     });
-}
-
-pub(crate) fn record_source_fetched(name: &str, count: usize) {
-    let recorded = with_active(|summary| {
-        summary
-            .stage_mut(PipelineStage::Source)
-            .fetched_per_source
-            .push((name.to_string(), count));
-    });
-    if !recorded {
-        info!("Fetched {} candidates", count);
-    }
 }
 
 pub struct StageStats {
@@ -61,6 +70,9 @@ pub struct StageStats {
 
 impl StageStats {
     pub fn begin(stage: PipelineStage) -> Self {
+        with_active(|summary| {
+            summary.stage_mut(stage);
+        });
         Self {
             stage,
             start: Instant::now(),
@@ -79,33 +91,28 @@ impl StageStats {
     }
 
     pub fn finish(self) {
-        let latency_ms = self.latency_ms();
+        let latency_us = self.latency_us();
         let recorded = with_active(|summary| {
-            summary.stage_mut(self.stage).latency_ms = Some(latency_ms);
+            summary.stage_mut(self.stage).latency_us = Some(latency_us);
         });
         if !recorded {
-            info!("latency_ms={}", latency_ms);
+            info!("latency_ms={}", latency_us / 1000);
         }
     }
 
     pub fn finish_with_size(self, size: usize) {
-        let latency_ms = self.latency_ms();
+        let latency_us = self.latency_us();
         let recorded = with_active(|summary| {
             let stage = summary.stage_mut(self.stage);
-            stage.latency_ms = Some(latency_ms);
+            stage.latency_us = Some(latency_us);
             stage.size = Some(size);
         });
         if !recorded {
-            info!("latency_ms={} size={}", latency_ms, size);
+            info!("latency_ms={} size={}", latency_us / 1000, size);
         }
     }
 
-    pub fn finish_filters(
-        self,
-        kept: usize,
-        removed: usize,
-        removed_per_filter: Vec<(String, usize)>,
-    ) {
+    pub fn finish_filters(self, kept: usize, removed: usize) {
         let total = kept + removed;
         let rate = if total > 0 {
             removed as f64 / total as f64
@@ -116,62 +123,147 @@ impl StageStats {
         span.record("kept_count", kept);
         span.record("removed_count", removed);
         span.record("filter_rate", format!("{:.3}", rate).as_str());
-        if is_active() {
-            with_active(|summary| {
-                let stage = summary.stage_mut(self.stage);
-                stage.kept = Some(kept);
-                stage.removed = Some(removed);
-                stage.removed_per_filter = removed_per_filter;
-            });
-        } else {
-            info!(
-                "kept {}, removed {} removed_per_filter [{}]",
-                kept,
-                removed,
-                Counts(&removed_per_filter),
-            );
+        let latency_us = self.latency_us();
+        let recorded = with_active(|summary| {
+            let stage = summary.stage_mut(self.stage);
+            stage.latency_us = Some(latency_us);
+            stage.kept = Some(kept);
+            stage.removed = Some(removed);
+        });
+        if !recorded {
+            info!("kept {}, removed {}", kept, removed);
         }
     }
 
-    fn latency_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+    fn latency_us(&self) -> u64 {
+        self.start.elapsed().as_micros() as u64
     }
 }
 
-#[derive(Default)]
-struct PipelineSummary {
-    stages: Vec<StageSummary>,
+pub struct ComponentStats {
+    stage: PipelineStage,
+    component: ComponentTrace,
+    start: Instant,
 }
 
-#[derive(Default)]
-struct StageSummary {
-    name: &'static str,
-    total: usize,
-    enabled: usize,
-    latency_ms: Option<u64>,
-    size: Option<usize>,
-    kept: Option<usize>,
-    removed: Option<usize>,
-    removed_per_filter: Vec<(String, usize)>,
-    fetched_per_source: Vec<(String, usize)>,
+impl ComponentStats {
+    pub fn begin(stage: PipelineStage, name: &'static str, type_name: &'static str) -> Self {
+        Self {
+            stage,
+            component: ComponentTrace {
+                name,
+                type_name,
+                ..Default::default()
+            },
+            start: Instant::now(),
+        }
+    }
+
+    pub fn finish(self) {
+        self.record();
+    }
+
+    pub fn finish_with_input(mut self, input: usize) {
+        self.component.input_count = Some(input);
+        self.record();
+    }
+
+    pub fn finish_source(mut self, fetched: usize) {
+        self.component.fetched = Some(fetched);
+        self.record();
+    }
+
+    pub fn finish_filter(mut self, kept: usize, removed: usize) {
+        self.component.input_count = Some(kept + removed);
+        self.component.kept = Some(kept);
+        self.component.removed = Some(removed);
+        self.record();
+    }
+
+    fn record(mut self) {
+        self.component.latency_us = self.start.elapsed().as_micros() as u64;
+        with_active(|summary| {
+            self.component.offset_us = self.start.duration_since(summary.start).as_micros() as u64;
+            summary
+                .stage_mut(self.stage)
+                .components
+                .push(self.component);
+        });
+    }
+}
+
+struct PipelineSummary {
+    start: Instant,
+    trace: PipelineTrace,
 }
 
 impl PipelineSummary {
-    fn stage_mut(&mut self, stage: PipelineStage) -> &mut StageSummary {
+    fn new(pipeline: &'static str, type_name: &'static str) -> Self {
+        Self {
+            start: Instant::now(),
+            trace: PipelineTrace {
+                pipeline,
+                type_name,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn finish(mut self) -> PipelineTrace {
+        self.trace.latency_us = self.start.elapsed().as_micros() as u64;
+        self.trace
+    }
+
+    fn stage_mut(&mut self, stage: PipelineStage) -> &mut StageTrace {
         let name = stage.summary_name();
-        if let Some(idx) = self.stages.iter().position(|s| s.name == name) {
-            &mut self.stages[idx]
+        if let Some(idx) = self.trace.stages.iter().position(|s| s.name == name) {
+            &mut self.trace.stages[idx]
         } else {
-            self.stages.push(StageSummary {
+            self.trace.stages.push(StageTrace {
                 name,
+                offset_us: self.start.elapsed().as_micros() as u64,
                 ..Default::default()
             });
-            self.stages.last_mut().unwrap()
+            self.trace.stages.last_mut().unwrap()
         }
     }
 }
 
-impl fmt::Display for PipelineSummary {
+#[derive(Default)]
+pub struct PipelineTrace {
+    pub pipeline: &'static str,
+    pub type_name: &'static str,
+    pub latency_us: u64,
+    pub stages: Vec<StageTrace>,
+}
+
+#[derive(Default)]
+pub struct StageTrace {
+    pub name: &'static str,
+    pub total: usize,
+    pub enabled: usize,
+    pub offset_us: u64,
+    pub latency_us: Option<u64>,
+    pub size: Option<usize>,
+    pub kept: Option<usize>,
+    pub removed: Option<usize>,
+    pub components: Vec<ComponentTrace>,
+    pub nested: Vec<PipelineTrace>,
+}
+
+#[derive(Default)]
+pub struct ComponentTrace {
+    pub name: &'static str,
+    pub type_name: &'static str,
+    pub offset_us: u64,
+    pub latency_us: u64,
+    pub input_count: Option<usize>,
+    pub fetched: Option<usize>,
+    pub kept: Option<usize>,
+    pub removed: Option<usize>,
+}
+
+impl fmt::Display for PipelineTrace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for stage in &self.stages {
             write!(
@@ -179,23 +271,29 @@ impl fmt::Display for PipelineSummary {
                 " {}{{total={} enabled={}",
                 stage.name, stage.total, stage.enabled
             )?;
-            if let Some(latency_ms) = stage.latency_ms {
-                write!(f, " latency_ms={}", latency_ms)?;
+            if let Some(latency_us) = stage.latency_us {
+                write!(f, " latency_ms={}", latency_us / 1000)?;
             }
-            if !stage.fetched_per_source.is_empty() {
-                write!(f, " fetched=[{}]", Counts(&stage.fetched_per_source))?;
+            let fetched: Vec<_> = stage
+                .components
+                .iter()
+                .filter_map(|c| c.fetched.map(|n| (c.name, n)))
+                .collect();
+            if !fetched.is_empty() {
+                write!(f, " fetched=[{}]", Counts(&fetched))?;
             }
             if let Some(size) = stage.size {
                 write!(f, " size={}", size)?;
             }
             if let (Some(kept), Some(removed)) = (stage.kept, stage.removed) {
                 write!(f, " kept={} removed={}", kept, removed)?;
-                if !stage.removed_per_filter.is_empty() {
-                    write!(
-                        f,
-                        " removed_per_filter=[{}]",
-                        Counts(&stage.removed_per_filter)
-                    )?;
+                let removed_per_filter: Vec<_> = stage
+                    .components
+                    .iter()
+                    .filter_map(|c| c.removed.filter(|n| *n > 0).map(|n| (c.name, n)))
+                    .collect();
+                if !removed_per_filter.is_empty() {
+                    write!(f, " removed_per_filter=[{}]", Counts(&removed_per_filter))?;
                 }
             }
             write!(f, "}}")?;
@@ -204,7 +302,7 @@ impl fmt::Display for PipelineSummary {
     }
 }
 
-struct Counts<'a>(&'a [(String, usize)]);
+struct Counts<'a>(&'a [(&'a str, usize)]);
 
 impl fmt::Display for Counts<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -218,12 +316,12 @@ impl fmt::Display for Counts<'_> {
     }
 }
 
-fn is_active() -> bool {
-    ACTIVE.try_with(|_| ()).is_ok()
-}
-
 fn with_active(f: impl FnOnce(&mut PipelineSummary)) -> bool {
     ACTIVE
-        .try_with(|summary| f(&mut summary.borrow_mut()))
+        .try_with(|summary| {
+            if let Some(summary) = summary.borrow_mut().as_mut() {
+                f(summary);
+            }
+        })
         .is_ok()
 }

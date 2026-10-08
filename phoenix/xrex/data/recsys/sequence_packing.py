@@ -156,6 +156,85 @@ class SequencePackedLayout:
     padding_mask: np.ndarray
     positions: np.ndarray
     block_sparse: object | None = None
+    cand_slot_lens: np.ndarray | None = None
+
+
+def compact_candidate_layout(
+    batch: RecsysFeaturesBatch,
+    *,
+    num_user_prefix_tokens: int,
+    block_size: int,
+    packed_seq_len: int,
+) -> SequencePackedLayout:
+    layout = batch.get("packing_layout")
+    assert layout is not None
+    cu_full = np.asarray(layout.cu_seqlens)
+    D, bs_plus_1 = cu_full.shape
+    bs = bs_plus_1 - 1
+    hist_hashes = batch["history_seq"]["post_hashes"]
+    cand_hashes = batch["candidate_seq"]["post_hashes"]
+    assert hist_hashes is not None and cand_hashes is not None
+    packed_history_len = hist_hashes.shape[1]
+    cand_total = cand_hashes.shape[1]
+    candidate_seq_len = cand_total // bs
+    prefix = num_user_prefix_tokens
+    history_len = np.diff(cu_full, axis=1) - prefix - candidate_seq_len
+    cand_valid = np.asarray(cand_hashes)[:, :, 0].reshape(D, bs, candidate_seq_len) != 0
+    last_valid = np.where(
+        cand_valid.any(axis=2),
+        candidate_seq_len - np.argmax(cand_valid[:, :, ::-1], axis=2),
+        0,
+    )
+    cand_slot = np.minimum(
+        ((last_valid + block_size - 1) // block_size) * block_size, candidate_seq_len
+    ).astype(np.int32)
+    per = prefix + history_len + cand_slot
+    cu = np.concatenate(
+        [np.zeros((D, 1), np.int32), np.cumsum(per, axis=1, dtype=np.int32)], axis=1
+    )
+    row_end = cu[:, -1]
+    if int(row_end.max()) > packed_seq_len:
+        raise ValueError(
+            f"compact layout needs {int(row_end.max())} tokens > packed_seq_len={packed_seq_len}"
+        )
+
+    seg_full = np.asarray(layout.segment_ids)
+    pos_full = np.asarray(layout.positions)
+    hist_pos_full = np.asarray(layout.history_positions)
+    seg = np.zeros((D, packed_seq_len), np.int32)
+    positions = np.zeros((D, packed_seq_len, 3), np.float32)
+    history_positions = np.zeros((D, packed_history_len), np.int32)
+    candidate_positions = np.zeros((D, bs * candidate_seq_len), np.int32)
+    t = np.arange(candidate_seq_len, dtype=np.int32)
+    for d in range(D):
+        hist_cursor = 0
+        for u in range(bs):
+            hl = int(history_len[d, u])
+            cl = int(cand_slot[d, u])
+            src = int(cu_full[d, u])
+            dst = int(cu[d, u])
+            span = prefix + hl + cl
+            seg[d, dst : dst + span] = seg_full[d, src : src + span]
+            positions[d, dst : dst + span] = pos_full[d, src : src + span]
+            assert prefix > 0, "compact layout relies on 0 marking a padded history slot"
+            hp = hist_pos_full[d, hist_cursor : hist_cursor + hl]
+            history_positions[d, hist_cursor : hist_cursor + hl] = np.where(
+                hp != 0, hp + (dst - src), 0
+            )
+            hist_cursor += hl
+            cand_base = dst + prefix + hl
+            candidate_positions[d, u * candidate_seq_len : (u + 1) * candidate_seq_len] = np.where(
+                t < cl, cand_base + t, max(int(row_end[d]) - 1, 0)
+            )
+    return SequencePackedLayout(
+        cu_seqlens=cu,
+        segment_ids=seg,
+        history_positions=history_positions,
+        candidate_positions=candidate_positions,
+        padding_mask=seg != 0,
+        positions=positions,
+        cand_slot_lens=cand_slot,
+    )
 
 
 def pack_batch(

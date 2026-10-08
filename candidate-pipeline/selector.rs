@@ -1,4 +1,5 @@
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::type_name_of_val;
@@ -37,7 +38,10 @@ where
         non_selected_count = Empty,
     ))]
     fn run(&self, query: &Q, candidates: Vec<C>, stage: PipelineStage) -> SelectResult<C> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
+        let input_count = candidates.len();
         let result = self.select(query, candidates);
+        stats.finish_with_input(input_count);
         let span = Span::current();
         span.record("selected_count", result.selected.len());
         span.record("non_selected_count", result.non_selected.len());

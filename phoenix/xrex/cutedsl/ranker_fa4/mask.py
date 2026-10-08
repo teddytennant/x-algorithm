@@ -39,9 +39,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
 from cutlass.cutlass_dsl import min as dsl_min
-from quack import layout_utils
 
 import xrex.cutedsl.ranker_fa4.utils as utils
+from xrex.cutedsl.quack import layout_utils
 from xrex.cutedsl.ranker_fa4.block_info import BlockInfo
 from xrex.cutedsl.ranker_fa4.seqlen_info import SeqlenInfoQK
 

@@ -53,13 +53,6 @@ class PostRenderer:
         res.append(f'\n{indent_str}User Name: "{post.user.name}"')
         if include_bio and post.user.bio:
             res.append(f'\n{indent_str}User Bio: "{post.user.bio}"')
-        all_media = list(post.media or []) + list(post.url_videos or [])
-        if all_media:
-            res.append(f"\n{indent_str}Media:")
-            if max_media is not None:
-                all_media = all_media[:max_media]
-            for idx, m in enumerate(all_media):
-                res.extend(m.to_convo(idx))
         formatted_text = (
             post.full_text.replace("\n", f"\n{indent_str}") if post.full_text else ""
         )
@@ -77,6 +70,13 @@ class PostRenderer:
         urls = [url for url in post.urls or [] if url]
         if urls:
             res.append(f"\n{indent_str}The Post contains these URLs: {', '.join(urls)}")
+        all_media = list(post.media or []) + list(post.url_videos or [])
+        if all_media:
+            res.append(f"\n{indent_str}Media:")
+            if max_media is not None:
+                all_media = all_media[:max_media]
+            for idx, m in enumerate(all_media):
+                res.extend(m.to_convo(idx))
         if post.broadcast_metadata:
             res.extend(post.broadcast_metadata.to_convo())
         if cards_note_override is not None:

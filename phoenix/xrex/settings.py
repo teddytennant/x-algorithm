@@ -43,6 +43,7 @@ RANKING_DUMP_PATH: str = os.environ.get("XREX_RANKING_DUMP_PATH", "/path/to/offl
 RETRIEVAL_DUMP_PATH: str = os.environ.get("XREX_RETRIEVAL_DUMP_PATH", "/path/to/offline_kafka_dump")
 
 SID_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_GLOBAL_IDS_SNAPSHOT", "")
+SID_VIDEO_GLOBAL_IDS_SNAPSHOT: str = os.environ.get("XREX_SID_VIDEO_GLOBAL_IDS_SNAPSHOT", "")
 
 GEN_RECS_GLOBAL_IDS: str = os.environ.get(
     "XREX_GEN_RECS_GLOBAL_IDS", "/path/to/global_negative_pool.parquet"
@@ -98,9 +99,6 @@ CLICKHOUSE_RUN_URL: str = os.environ.get("XREX_CLICKHOUSE_RUN_URL", "")
 
 RUN_TRACKER_URL: str = os.environ.get("XAI_RUN_TRACKER_URL", "")
 CHECKPOINT_PATH_PREFIX: str = os.environ.get("XAI_CHECKPOINT_PATH_PREFIX", "")
-
-
-COMMIT_HASH_FILE: str = os.environ.get("XREX_COMMIT_HASH_FILE", "")
 
 
 ROCE_FABRIC_CLOUD: str = os.environ.get("XREX_ROCE_FABRIC_CLOUD", "")

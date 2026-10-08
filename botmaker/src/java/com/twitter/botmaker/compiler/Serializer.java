@@ -49,8 +49,8 @@ import com.twitter.scrooge.ThriftStructCodec;
 public abstract class Serializer<T> {
 
   private static final int MIN_BUF_CAPACITY = 65536;
-  private static final int MAX_BUF_CAPACITY = 65536 * 256; 
-  private static final int BUF_CAPACITY = 65536 * 16; 
+  private static final int MAX_BUF_CAPACITY = 65536 * 256;
+  private static final int BUF_CAPACITY = 65536 * 16;
   private static final ThreadLocal<ByteBuffer> BUF =
       ThreadLocal.withInitial(() -> ByteBuffer.allocate(MIN_BUF_CAPACITY));
   private static final UnicodeUnescaper UNICODE_UNESCAPER = new UnicodeUnescaper();

@@ -1,41 +1,28 @@
 pub mod batch;
-pub mod exclusive_content_hydrator;
+pub(crate) mod community_source;
+mod decode;
+mod execute;
 pub(crate) mod fallback_cache;
-pub mod gizmoduck_hydrator;
+mod fetcher;
 pub mod metrics;
-pub mod safety_label_hydrator;
-pub mod socialgraph_hydrator;
-pub mod tes_composite;
-pub mod tes_hydrator;
-pub mod viewer_hydrator;
+pub(crate) mod plan;
+pub(crate) mod sources;
+mod store;
+pub mod tweet_source;
 
-use crate::clients::gizmoduck_client::GizmoduckLookup;
-use crate::clients::socialgraph_client::SocialgraphClient;
 use crate::models::{
-    assemble, resolve_candidates, AuthorFeatures, AuthorId, ExclusiveContentFeatures,
-    HydratedTweetCandidate, RawCandidate, SafetyLabelMap, TweetCandidateInput, TweetFeatures,
-    TweetId, Viewer, ViewerAuthorRelationship, ViewerFeatures,
+    ClientCapability, HydratedTweetCandidate, RawCandidate, TweetId, ViewerFeatures,
 };
-use crate::rules::SafetyLevel;
-use crate::safety_label_source::SafetyLabelSource;
-use batch::{Completeness, Hydrated, TweetHydrationBatch};
-use exclusive_content_hydrator::ExclusiveContentHydrator;
-use fallback_cache::FallbackCache;
-use gizmoduck_hydrator::GizmoduckAuthorHydrator;
-use safety_label_hydrator::{SafetyLabelHydration, SafetyLabelHydrator};
-use socialgraph_hydrator::SocialgraphHydrator;
-use std::collections::{HashMap, HashSet};
+pub(crate) use decode::author::{AuthorFallbackCache, fallback_cache as author_fallback_cache};
+pub(crate) use decode::tweet::{TweetFallbackCache, tweet_fallback_cache};
+pub(crate) use plan::HydrationPlan;
+use rustc_hash::FxHashMap;
+use std::hash::Hash;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tes_composite::TweetForVisibilitySource;
-use tes_hydrator::{AuthorIdFallbackCache, TesHydrator};
-use viewer_hydrator::ViewerHydrator;
-use xai_core_entities::gizmoduck_client::GizmoduckClient;
-use xai_core_entities::tweet_entity_service_client::TESClient;
+use std::time::Duration;
 use xai_visibility_filtering_proto as vf_pb;
 
 pub(crate) const HYDRATION_TIMEOUT: Duration = Duration::from_secs(1);
-pub(crate) const DEFAULT_REQUEST_BUDGET: Duration = Duration::from_millis(400);
 pub(crate) const INBOUND_ALLOWANCE: Duration = Duration::from_millis(10);
 
 pub(crate) fn request_context(
@@ -46,270 +33,225 @@ pub(crate) fn request_context(
         deadline: Some(
             entered
                 + grpc_timeout
-                    .unwrap_or(DEFAULT_REQUEST_BUDGET)
+                    .unwrap_or(HYDRATION_TIMEOUT)
                     .saturating_sub(INBOUND_ALLOWANCE),
         ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(serialize_all = "snake_case")]
+#[repr(u8)]
+pub enum Hydrator {
+    PureCore,
+    Tweet,
+    ConversationControl,
+    TweetSafetyLabels,
+    ViewerProfile,
+    ViewerLabels,
+    AuthorSafety,
+    AuthorLabels,
+    Follows,
+    Blocks,
+    Mutes,
+    MuteRetweets,
+    BlockedByAuthor,
+    BlockedByReplyRoot,
+    SuperFollowsExclusive,
+    RootFollowsViewer,
+    RootFollowsViewerSecondDegree,
+    SuperFollowsRoot,
+    ViewerCountry,
+    CommunityModeration,
+    CommunityModerator,
+    CommunityViewerRemoved,
+    ArticleLifecycle,
+    TrustedFriends,
+    OutsideNarrowcastPlace,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Hydrators(u32);
+
+impl Hydrators {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    #[cfg(test)]
+    pub fn all() -> Self {
+        Self(u32::MAX >> (u32::BITS as usize - <Hydrator as strum::VariantArray>::VARIANTS.len()))
+    }
+
+    pub const fn of(hydrator: Hydrator) -> Self {
+        Self(1 << hydrator as u8)
+    }
+
+    pub const fn with(self, hydrator: Hydrator) -> Self {
+        self.union(Self::of(hydrator))
+    }
+
+    #[cfg(test)]
+    pub const fn without(self, hydrator: Hydrator) -> Self {
+        Self(self.0 & !Self::of(hydrator).0)
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, hydrator: Hydrator) -> bool {
+        self.0 & Self::of(hydrator).0 != 0
+    }
+
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
     }
 }
 
 pub(crate) struct HydrationRequest<'a> {
     viewer_id: Option<u64>,
     country_code: Option<String>,
+    client_capability: ClientCapability,
     raw_candidates: &'a [RawCandidate],
-    safety_level: SafetyLevel,
+    is_expanding_retweet_sources: bool,
 }
 
 impl<'a> HydrationRequest<'a> {
     pub(crate) fn new(
         viewer_id: Option<u64>,
         country_code: Option<String>,
+        client_capability: ClientCapability,
         raw_candidates: &'a [RawCandidate],
-        safety_level: SafetyLevel,
     ) -> Self {
         Self {
             viewer_id,
             country_code,
+            client_capability,
             raw_candidates,
-            safety_level,
+            is_expanding_retweet_sources: false,
+        }
+    }
+
+    pub(crate) fn with_retweet_sources(self, is_expanding_retweet_sources: bool) -> Self {
+        Self {
+            is_expanding_retweet_sources,
+            ..self
         }
     }
 }
 
-struct CandidateFeatures {
-    tweet_features: HashMap<TweetId, TweetFeatures>,
-    author_features: TweetHydrationBatch<Completeness<AuthorFeatures>>,
-    safety_labels: HashMap<TweetId, SafetyLabelMap>,
-    relationships: TweetHydrationBatch<ViewerAuthorRelationship>,
-    exclusive_content: HashMap<TweetId, Completeness<ExclusiveContentFeatures>>,
-}
-
-impl CandidateFeatures {
-    fn assemble(self, candidates: &[TweetCandidateInput]) -> Vec<HydratedTweetCandidate> {
-        candidates
-            .iter()
-            .map(|c| {
-                assemble(
-                    c,
-                    self.tweet_features
-                        .get(&c.tweet_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    self.author_features
-                        .get_or_default(&c.tweet_id)
-                        .into_value(),
-                    self.safety_labels
-                        .get(&c.tweet_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    self.relationships.get_or_default(&c.tweet_id),
-                    self.exclusive_content
-                        .get(&c.tweet_id)
-                        .map(|exclusive| exclusive.value().clone()),
-                )
-            })
-            .collect()
-    }
-}
-
-pub(crate) fn tweets_per_author(candidates: &[TweetCandidateInput]) -> HashMap<AuthorId, usize> {
-    let mut candidate_count_by_key = HashMap::with_capacity(candidates.len());
-    for candidate in candidates {
-        *candidate_count_by_key
-            .entry(candidate.author_id)
-            .or_default() += 1;
+pub(crate) fn candidate_count_by_key<K: Eq + Hash>(
+    keys: impl Iterator<Item = K>,
+) -> FxHashMap<K, usize> {
+    let mut candidate_count_by_key =
+        FxHashMap::with_capacity_and_hasher(keys.size_hint().0, Default::default());
+    for key in keys {
+        *candidate_count_by_key.entry(key).or_default() += 1;
     }
     candidate_count_by_key
 }
 
-pub(crate) fn keyed_by_author<V>(
-    expected: &HashMap<AuthorId, usize>,
-    response: HashMap<u64, V>,
-) -> HashMap<AuthorId, V> {
-    let author_by_raw: HashMap<u64, AuthorId> = expected
-        .keys()
-        .map(|&author| (author.get(), author))
-        .collect();
-    response
-        .into_iter()
-        .filter_map(|(id, value)| author_by_raw.get(&id).map(|&author| (author, value)))
-        .collect()
+pub(crate) struct Hydration {
+    viewer: ViewerFeatures,
+    tweets: FxHashMap<TweetId, HydratedTweet>,
+    has_fetched_sources: bool,
 }
 
-pub(crate) struct HydrationPipeline {
-    viewer_hydrator: ViewerHydrator,
-    tes_hydrator: TesHydrator,
-    gizmoduck_author_hydrator: GizmoduckAuthorHydrator,
-    socialgraph_hydrator: SocialgraphHydrator,
-    safety_label_hydrator: SafetyLabelHydrator,
-    exclusive_content_hydrator: ExclusiveContentHydrator,
+impl Hydration {
+    pub(crate) fn viewer(&self) -> &ViewerFeatures {
+        &self.viewer
+    }
+
+    pub(crate) fn tweet(&self, id: TweetId) -> Option<&HydratedTweet> {
+        self.tweets.get(&id)
+    }
+
+    pub(crate) fn has_fetched_sources(&self) -> bool {
+        self.has_fetched_sources
+    }
 }
 
-pub(crate) struct HydrationOutput {
-    pub(crate) viewer_features: ViewerFeatures,
-    pub(crate) candidates: Vec<HydratedTweetCandidate>,
-    pub(crate) safety_labels: HashMap<TweetId, Arc<vf_pb::SafetyLabelMap>>,
-    pub(crate) failed_ids: HashSet<TweetId>,
+#[expect(
+    clippy::large_enum_variant,
+    reason = "nearly every tweet resolves, so a box would cost an allocation per tweet"
+)]
+pub(crate) enum HydratedTweet {
+    Resolved {
+        candidate: HydratedTweetCandidate,
+        has_failed_node: bool,
+        source_tweet_id: Option<TweetId>,
+        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
+    },
+    Unresolved {
+        reason: Unresolved,
+        safety_labels: Option<Arc<vf_pb::SafetyLabelMap>>,
+    },
 }
 
-impl HydrationPipeline {
-    pub(crate) fn new(
-        tes_client: Arc<dyn TESClient + Send + Sync>,
-        tweet_source: Arc<dyn TweetForVisibilitySource>,
-        gizmoduck_client: Arc<dyn GizmoduckClient + Send + Sync>,
-        socialgraph_client: Arc<dyn SocialgraphClient + Send + Sync>,
-        safety_label_source: Arc<SafetyLabelSource>,
-        fallback_cache: Option<FallbackCache<AuthorId, Completeness<AuthorFeatures>>>,
-        author_id_fallback_cache: Option<AuthorIdFallbackCache>,
-    ) -> Self {
-        Self {
-            viewer_hydrator: ViewerHydrator {
-                gizmoduck_client: gizmoduck_client.clone(),
-            },
-            tes_hydrator: TesHydrator::new(tes_client, tweet_source, author_id_fallback_cache),
-            gizmoduck_author_hydrator: GizmoduckAuthorHydrator::new(
-                GizmoduckLookup::new(gizmoduck_client),
-                fallback_cache,
-            ),
-            socialgraph_hydrator: SocialgraphHydrator {
-                sg_client: socialgraph_client.clone(),
-            },
-            safety_label_hydrator: SafetyLabelHydrator {
-                source: safety_label_source,
-            },
-            exclusive_content_hydrator: ExclusiveContentHydrator {
-                sg_client: socialgraph_client,
-            },
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Unresolved {
+    pub(crate) lookup: Lookup,
+    pub(crate) cause: Cause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Lookup {
+    Tweet,
+    Author,
+    SharedTweet,
+    SharedAuthor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Cause {
+    NotFound,
+    Failed,
+}
+
+impl HydratedTweet {
+    pub(crate) fn candidate(&self) -> Option<&HydratedTweetCandidate> {
+        match self {
+            Self::Resolved { candidate, .. } => Some(candidate),
+            Self::Unresolved { .. } => None,
         }
     }
 
-    pub(crate) async fn hydrate(&self, request: HydrationRequest<'_>) -> HydrationOutput {
-        let HydrationRequest {
-            viewer_id,
-            country_code,
-            raw_candidates,
-            safety_level,
-        } = request;
-        let viewer = viewer_id.map_or(Viewer::LoggedOut, Viewer::LoggedIn);
-        let viewer_hydration = self
-            .viewer_hydrator
-            .hydrate(viewer_id, country_code, safety_level);
-        let candidate_hydration = async {
-            let tweet_ids: Vec<TweetId> = raw_candidates.iter().map(|c| c.tweet_id).collect();
-            let tes_started = Instant::now();
-            let (exclusive_tx, exclusive_rx) = tokio::sync::oneshot::channel();
-            let independent_group = async {
-                tokio::join!(
-                    self.safety_label_hydrator.hydrate(&tweet_ids, safety_level),
-                    async {
-                        let tweets = self
-                            .tes_hydrator
-                            .hydrate_tweets(&tweet_ids, safety_level)
-                            .await;
-                        let tes_elapsed = tes_started.elapsed();
-                        let conversation_authors = tweet_ids
-                            .iter()
-                            .filter_map(|id| {
-                                tweets
-                                    .get(id)?
-                                    .exclusive_conversation_author_id
-                                    .map(|author| (*id, author))
-                            })
-                            .collect();
-                        let _ = exclusive_tx.send(conversation_authors);
-                        (tweets, tes_elapsed)
-                    },
-                    async {
-                        let conversation_authors = exclusive_rx.await.unwrap_or_default();
-                        self.exclusive_content_hydrator
-                            .hydrate(conversation_authors, tweet_ids.len(), viewer, safety_level)
-                            .await
-                    },
-                )
-            };
-
-            let author_hop = async {
-                let pure_core = self
-                    .tes_hydrator
-                    .fetch_pure_core(&tweet_ids, safety_level)
-                    .await;
-                let tes_elapsed = tes_started.elapsed();
-                let candidates = resolve_candidates(
-                    raw_candidates,
-                    &pure_core.core,
-                    &pure_core.recovered_authors,
-                );
-                let (author_features, relationships) = tokio::join!(
-                    self.gizmoduck_author_hydrator
-                        .hydrate(&candidates, safety_level),
-                    self.socialgraph_hydrator
-                        .hydrate(&candidates, viewer, safety_level),
-                );
-                (
-                    pure_core.core,
-                    candidates,
-                    author_features,
-                    relationships,
-                    tes_elapsed,
-                )
-            };
-
-            let (
-                (safety_labels, (tes_tweet_keyed, composite_elapsed), exclusive_content),
-                (core_datas, candidates, author_features, relationships, core_elapsed),
-            ) = tokio::join!(independent_group, author_hop);
-            metrics::record_tes_join_latency(safety_level, core_elapsed.max(composite_elapsed));
-
-            let SafetyLabelHydration {
-                label_types,
-                label_response,
-            } = safety_labels;
-
-            let tweet_features = self.tes_hydrator.assemble_tweet_features(
-                &candidates,
-                &core_datas,
-                &tes_tweet_keyed,
-            );
-
-            let failed_ids: HashSet<TweetId> = candidates
-                .iter()
-                .map(|candidate| candidate.tweet_id)
-                .filter(|id| {
-                    !core_datas.contains_key(id)
-                        || !matches!(
-                            author_features.hydrated(id),
-                            Some(Hydrated::Found(Completeness::Complete(_)) | Hydrated::NotFound)
-                        )
-                        || relationships.is_failed(id)
-                        || tes_tweet_keyed.is_failed(id)
-                        || !label_response.contains_key(id)
-                        || exclusive_content
-                            .get(id)
-                            .is_some_and(|exclusive| !exclusive.is_complete())
-                })
-                .collect();
-            let features = CandidateFeatures {
-                tweet_features,
-                author_features,
-                safety_labels: label_types,
-                relationships,
-                exclusive_content,
-            };
-            let hydrated_candidates = features.assemble(&candidates);
-
-            (hydrated_candidates, label_response, failed_ids)
-        };
-
-        let (viewer, (candidates, safety_labels, mut failed_ids)) =
-            tokio::join!(viewer_hydration, candidate_hydration);
-        if !viewer.is_complete() {
-            failed_ids.extend(candidates.iter().map(|c| TweetId(c.tweet_id)));
+    pub(crate) fn source_tweet_id(&self) -> Option<TweetId> {
+        match self {
+            Self::Resolved {
+                source_tweet_id, ..
+            } => *source_tweet_id,
+            Self::Unresolved { .. } => None,
         }
+    }
 
-        HydrationOutput {
-            viewer_features: viewer.into_value(),
-            candidates,
-            safety_labels,
-            failed_ids,
+    pub(crate) fn source_to_merge(&self) -> Option<TweetId> {
+        match self {
+            Self::Resolved {
+                has_failed_node: false,
+                source_tweet_id,
+                ..
+            } => *source_tweet_id,
+            Self::Resolved {
+                has_failed_node: true,
+                ..
+            }
+            | Self::Unresolved { .. } => None,
+        }
+    }
+
+    pub(crate) fn safety_labels(&self) -> Option<&Arc<vf_pb::SafetyLabelMap>> {
+        match self {
+            Self::Resolved { safety_labels, .. } | Self::Unresolved { safety_labels, .. } => {
+                safety_labels.as_ref()
+            }
         }
     }
 }
@@ -317,102 +259,19 @@ impl HydrationPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::resolve_candidate;
-    use xai_core_entities::entities::PureCoreData;
-
-    fn core(tweet_id: u64, author_id: u64) -> HashMap<TweetId, PureCoreData> {
-        HashMap::from([(
-            TweetId(tweet_id),
-            PureCoreData {
-                author_id,
-                ..Default::default()
-            },
-        )])
-    }
 
     #[test]
-    fn assemble_handles_mismatched_cardinality_without_mispairing() {
-        let resolved = resolve_candidate(&raw(2, None), &core(2, 200), &HashMap::new())
-            .expect("tweet 2 resolves");
-        let candidates = vec![resolved];
+    fn request_context_budget_is_header_or_hang_guard_minus_allowance() {
+        let entered = tokio::time::Instant::now();
 
-        let results = CandidateFeatures {
-            tweet_features: HashMap::from([
-                (TweetId(1), TweetFeatures::default()),
-                (
-                    TweetId(2),
-                    TweetFeatures {
-                        core: crate::models::CoreFeature {
-                            source_tweet_id: Some(2),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    },
-                ),
-            ]),
-            author_features: TweetHydrationBatch::from_results(
-                [TweetId(2)],
-                HashMap::from([(
-                    TweetId(2),
-                    Ok::<_, anyhow::Error>(Some(Completeness::Complete(AuthorFeatures {
-                        is_suspended: true,
-                        ..Default::default()
-                    }))),
-                )]),
-            ),
-            safety_labels: HashMap::from([
-                (TweetId(1), SafetyLabelMap::default()),
-                (TweetId(2), SafetyLabelMap::default()),
-            ]),
-            relationships: TweetHydrationBatch::from_results(
-                [TweetId(2)],
-                HashMap::from([(
-                    TweetId(2),
-                    Ok::<_, anyhow::Error>(Some(ViewerAuthorRelationship {
-                        viewer_follows_author: true,
-                        ..Default::default()
-                    })),
-                )]),
-            ),
-            exclusive_content: HashMap::new(),
-        };
-
-        let assembled = results.assemble(&candidates);
-
-        assert_eq!(assembled.len(), 1);
-        let c = &assembled[0];
-        assert_eq!(c.tweet_id, 2);
-        assert_eq!(c.author_id, 200);
-        assert_eq!(c.tweet_features.core.source_tweet_id, Some(2));
-        assert!(c.author_features.is_suspended);
-        assert!(c.relationship.viewer_follows_author);
-    }
-
-    fn raw(tweet_id: u64, request_author_id: Option<u64>) -> RawCandidate {
-        RawCandidate {
-            tweet_id: TweetId(tweet_id),
-            request_author_id,
-        }
-    }
-
-    #[test]
-    fn author_candidate_counts_deduplicate_shared_authors() {
-        let candidates: Vec<_> = [(1, 10), (2, 10), (3, 20)]
-            .into_iter()
-            .map(|(tweet_id, author_id)| {
-                resolve_candidate(
-                    &raw(tweet_id, Some(author_id)),
-                    &HashMap::new(),
-                    &HashMap::new(),
-                )
-                .unwrap()
-            })
-            .collect();
-
-        let counts: HashMap<u64, usize> = tweets_per_author(&candidates)
-            .into_iter()
-            .map(|(author, count)| (author.get(), count))
-            .collect();
-        assert_eq!(counts, HashMap::from([(10, 2), (20, 1)]));
+        let header = Duration::from_millis(400);
+        assert_eq!(
+            request_context(entered, Some(header)).deadline,
+            Some(entered + header - INBOUND_ALLOWANCE)
+        );
+        assert_eq!(
+            request_context(entered, None).deadline,
+            Some(entered + HYDRATION_TIMEOUT - INBOUND_ALLOWANCE)
+        );
     }
 }

@@ -6,10 +6,10 @@ from typing import Optional, Sequence, Union
 import haiku as hk
 import jax
 import jax.numpy as jnp
-from jax.lax import with_sharding_constraint
 from jax.sharding import PartitionSpec as P
 
 from xrex.models.model_utils import get_parameter
+from xrex.utils.sharding import with_sharding_constraint_unless_manual
 
 
 def rms_norm_fn(
@@ -109,7 +109,7 @@ class RMSNorm(hk.Module):
                 weight_decay_mask=self.weight_decay_mask,
             )
             if self.pspec:
-                scale = with_sharding_constraint(scale, self.pspec)
+                scale = with_sharding_constraint_unless_manual(scale, self.pspec)
             scale = jnp.broadcast_to(scale.astype(jnp.float32), inputs.shape)
             gain = 1.0 + scale if self.reparameterize else scale
         else:

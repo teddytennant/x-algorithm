@@ -6,11 +6,12 @@ use crate::frames;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
     AdsBlenderType, AdsTimeGapClampHi, AdsTimeGapClampLo, AdsTimeGapMinOrganicGap, AdsTimeGapTSec,
-    FEED_SURVEY_POSITION, PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
+    VideoCarouselPosition, FEED_SURVEY_POSITION, PROMPTS_POSITION, WHO_TO_FOLLOW_POSITION,
 };
 use xai_candidate_pipeline::selector::{SelectResult, Selector};
 use xai_home_mixer_proto::{
-    feed_item, FeedItem, FeedSurvey, Frame, Prompt, PushToHomePost, ScoredPost, WhoToFollowModule,
+    feed_item, FeedItem, FeedSurvey, Frame, Prompt, PushToHomePost, ScoredPost,
+    VideoCarouselModule, WhoToFollowModule,
 };
 use xai_recsys_proto::AdIndexInfo;
 
@@ -44,6 +45,7 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             push_to_home,
             frames,
             feed_survey,
+            video_carousel,
         } = partition_feed_items(candidates);
 
         let input_post_count = posts.len();
@@ -67,10 +69,17 @@ impl Selector<ScoredPostsQuery, FeedItem> for BlenderSelector {
             }
             _ => &self.partition_organic_blender,
         };
-        let mut blended = blender.blend(posts, ads);
+        let mut drops = Vec::new();
+        let mut blended = blender.blend(posts, ads, &mut drops);
+        query.ad_drops.extend(drops);
 
         insert_prompts(&mut blended, prompts);
         insert_who_to_follow(&mut blended, wtf_modules);
+        insert_video_carousel(
+            &mut blended,
+            video_carousel,
+            query.params.get(VideoCarouselPosition) as usize,
+        );
         pin_push_to_home(&mut blended, push_to_home);
         insert_frames(&mut blended, frames);
         insert_feed_survey(&mut blended, feed_survey);
@@ -121,6 +130,24 @@ fn insert_who_to_follow(blended: &mut Vec<FeedItem>, wtf_modules: Vec<WhoToFollo
         FeedItem {
             position: WHO_TO_FOLLOW_POSITION as i32,
             item: Some(feed_item::Item::WhoToFollow(wtf)),
+        },
+    );
+}
+
+fn insert_video_carousel(
+    blended: &mut Vec<FeedItem>,
+    video_carousel: Option<VideoCarouselModule>,
+    position: usize,
+) {
+    let Some(carousel) = video_carousel else {
+        return;
+    };
+    let insert_idx = position.saturating_sub(1).min(blended.len());
+    blended.insert(
+        insert_idx,
+        FeedItem {
+            position: position as i32,
+            item: Some(feed_item::Item::VideoCarousel(carousel)),
         },
     );
 }
@@ -200,6 +227,7 @@ struct PartitionedFeedItems {
     push_to_home: Option<PushToHomePost>,
     frames: Vec<Frame>,
     feed_survey: Option<FeedSurvey>,
+    video_carousel: Option<VideoCarouselModule>,
 }
 
 fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
@@ -210,6 +238,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
     let mut push_to_home = None;
     let mut frames = Vec::new();
     let mut feed_survey = None;
+    let mut video_carousel = None;
     for item in items {
         match item.item {
             Some(feed_item::Item::Post(post)) => posts.push(post),
@@ -219,6 +248,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
             Some(feed_item::Item::PushToHome(pth)) => push_to_home = Some(pth),
             Some(feed_item::Item::Frame(f)) => frames.push(f),
             Some(feed_item::Item::FeedSurvey(s)) => feed_survey = Some(s),
+            Some(feed_item::Item::VideoCarousel(c)) => video_carousel = Some(c),
             None => {}
         }
     }
@@ -230,6 +260,7 @@ fn partition_feed_items(items: Vec<FeedItem>) -> PartitionedFeedItems {
         push_to_home,
         frames,
         feed_survey,
+        video_carousel,
     }
 }
 

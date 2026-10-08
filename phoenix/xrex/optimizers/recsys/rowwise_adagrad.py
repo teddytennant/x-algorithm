@@ -14,11 +14,7 @@ from jax.sharding import PartitionSpec as P
 
 from xai_configlib import Config, configclass
 from xrex.models.model_utils import Parameter
-from xrex.optimizers.recsys.async_emb_gradient_update import (
-    AsyncEmbGradientUpdate,
-    AsyncEmbOptimizer,
-)
-from xrex.optimizers.recsys.protocol import RecsysEmbeddingOptimizer, _lookup
+from xrex.optimizers.recsys.protocol import AsyncEmbOptimizer, RecsysEmbeddingOptimizer, _lookup
 
 if TYPE_CHECKING:
     from xrex.cuda.async_emb import (
@@ -94,98 +90,64 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
     def gradient_update_start(
         self,
         context: async_emb.AsyncEmbContextHandle,
-        update: AsyncEmbGradientUpdate,
         table: jax.Array,
         state: RecsysRowwiseAdagradState,
         gate: jax.Array,
-    ) -> tuple[tuple[jax.Array, ...], jax.Array, RecsysRowwiseAdagradState]:
+    ) -> tuple[jax.Array, jax.Array, RecsysRowwiseAdagradState, dict[str, jax.Array]]:
         if self._lazy_decay and (state.step is None or state.last_step is None):
             raise ValueError("fused lazy decay needs timestamped state (step/last_step)")
 
-        if 32 % context.shard_width != 0:
+        from xrex.utils import recsys_async_emb
+
+        async_emb = recsys_async_emb.kernel_bindings(context)
+        row_sharded = recsys_async_emb.is_row_sharded(context)
+        if not row_sharded and 32 % context.shard_width != 0:
             raise ValueError(
                 f"the fused rowwise Adagrad update needs a row shard that divides a warp, "
                 f"got shard_width={context.shard_width} (emb_width={context.emb_width})"
             )
 
-        from xrex.cuda.async_emb import async_emb
-
         metrics: dict[str, jax.Array] = {}
 
+        table_spec = recsys_async_emb.table_spec(context)
+        state_spec = P(context.table_axis) if row_sharded else P()
         if self._lazy_decay:
 
             @shard_map(
                 mesh=context.mesh,
-                in_specs=(
-                    P(context.data_axis, None),
-                    P(context.data_axis),
-                    P(),
-                    P(None, context.table_axis),
-                    P(),
-                    P(),
-                    P(),
-                    P(),
-                    P(context.data_axis, None),
-                ),
-                out_specs=(
-                    P(context.data_axis, None),
-                    P(context.data_axis),
-                    P(),
-                    P(None, context.table_axis),
-                    P(),
-                    P(),
-                ),
+                in_specs=(table_spec, state_spec, state_spec, P(), P(context.data_axis, None)),
+                out_specs=(table_spec, state_spec, state_spec, P()),
                 check_vma=False,
             )
             def start_lazy(
-                grads: jax.Array,
-                segment_ids: jax.Array,
-                unique_tokens: jax.Array,
                 table: jax.Array,
                 accum: jax.Array,
                 last_step: jax.Array,
                 step: jax.Array,
-                pending: jax.Array,
                 gate: jax.Array,
             ) -> tuple[jax.Array, ...]:
-                return tuple(
-                    async_emb.rowwise_adagrad_lazy_update_start(
-                        grads,
-                        segment_ids,
-                        unique_tokens,
-                        table,
-                        accum,
-                        last_step,
-                        step,
-                        pending,
-                        gate,
-                        context,
-                        learning_rate=self._learning_rate,
-                        eps=self._eps,
-                        accum_decay_rate=self._decay_rate or 0.0,
-                        weight_decay_rate=self._weight_decay,
-                    )
+                return async_emb.rowwise_adagrad_lazy_update_start(
+                    table,
+                    accum,
+                    last_step,
+                    step,
+                    gate,
+                    context,
+                    learning_rate=self._learning_rate,
+                    eps=self._eps,
+                    accum_decay_rate=self._decay_rate or 0.0,
+                    weight_decay_rate=self._weight_decay,
                 )
 
             assert state.step is not None and state.last_step is not None
-            grads_pin, segments_pin, tokens_pin, table_out, accum_out, last_step_out = start_lazy(
-                update.grads,
-                update.segment_ids,
-                update.unique_tokens,
-                table,
-                state.row_sum_sq["table"],
-                state.last_step["table"],
-                state.step,
-                update.pending,
-                gate,
+            table_out, accum_out, last_step_out, pin = start_lazy(
+                table, state.row_sum_sq["table"], state.last_step["table"], state.step, gate
             )
-            new_step = state.step + update.pending.astype(jnp.int32).reshape(())
             return (
-                (grads_pin, segments_pin, tokens_pin),
+                pin,
                 table_out,
-                RecsysRowwiseAdagradState(
+                state._replace(
                     row_sum_sq={**state.row_sum_sq, "table": accum_out},
-                    step=new_step,
                     last_step={**state.last_step, "table": last_step_out},
                 ),
                 metrics,
@@ -193,78 +155,52 @@ class RecsysRowwiseAdagradOptimizer(RecsysEmbeddingOptimizer, AsyncEmbOptimizer)
 
         @shard_map(
             mesh=context.mesh,
-            in_specs=(
-                P(context.data_axis, None),
-                P(context.data_axis),
-                P(),
-                P(None, context.table_axis),
-                P(),
-                P(),
-                P(context.data_axis, None),
-            ),
-            out_specs=(
-                P(context.data_axis, None),
-                P(context.data_axis),
-                P(),
-                P(None, context.table_axis),
-                P(),
-            ),
+            in_specs=(table_spec, state_spec, P(context.data_axis, None)),
+            out_specs=(table_spec, state_spec, P()),
             check_vma=False,
         )
-        def start(
-            grads: jax.Array,
-            segment_ids: jax.Array,
-            unique_tokens: jax.Array,
-            table: jax.Array,
-            accum: jax.Array,
-            pending: jax.Array,
-            gate: jax.Array,
-        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-            grads_pin, segments_pin, tokens_pin, table_out, accum_out = (
-                async_emb.rowwise_adagrad_update_start(
-                    grads,
-                    segment_ids,
-                    unique_tokens,
-                    table,
-                    accum,
-                    pending,
-                    gate,
-                    context,
-                    learning_rate=self._learning_rate,
-                    eps=self._eps,
-                    decay_factor=self.decay_factor,
-                    weight_decay_factor=math.exp(-self._weight_decay),
-                )
+        def start(table: jax.Array, accum: jax.Array, gate: jax.Array) -> tuple[jax.Array, ...]:
+            return async_emb.rowwise_adagrad_update_start(
+                table,
+                accum,
+                gate,
+                context,
+                learning_rate=self._learning_rate,
+                eps=self._eps,
+                decay_factor=self.decay_factor,
+                weight_decay_factor=math.exp(-self._weight_decay),
             )
-            return grads_pin, segments_pin, tokens_pin, table_out, accum_out
 
-        grads_pin, segments_pin, tokens_pin, table_out, accum_out = start(
-            update.grads,
-            update.segment_ids,
-            update.unique_tokens,
-            table,
-            state.row_sum_sq["table"],
-            update.pending,
-            gate,
-        )
+        table_out, accum_out, pin = start(table, state.row_sum_sq["table"], gate)
         return (
-            (grads_pin, segments_pin, tokens_pin),
+            pin,
             table_out,
             state._replace(row_sum_sq={**state.row_sum_sq, "table": accum_out}),
             metrics,
         )
 
     def gradient_update_done(
-        self, context: async_emb.AsyncEmbContextHandle, gate: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        from xrex.cuda.async_emb import async_emb
+        self,
+        context: async_emb.AsyncEmbContextHandle,
+        state: RecsysRowwiseAdagradState,
+        gate: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, RecsysRowwiseAdagradState, jax.Array]:
+        from xrex.utils import recsys_async_emb
 
-        @shard_map(mesh=context.mesh, in_specs=(P(),), out_specs=(P(), P(), P()), check_vma=False)
-        def done(gate: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-            norm, valid, done_pin = async_emb.rowwise_adagrad_update_done(gate, context)
-            return norm, valid != 0, done_pin
+        async_emb = recsys_async_emb.kernel_bindings(context)
 
-        return done(gate)
+        @shard_map(
+            mesh=context.mesh, in_specs=(P(),), out_specs=(P(), P(), P(), P()), check_vma=False
+        )
+        def done(gate: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            norm, valid, pending, done_pin = async_emb.rowwise_adagrad_update_done(gate, context)
+            return norm, valid != 0, pending != 0, done_pin
+
+        norm, valid, pending, done_pin = done(gate)
+        if self._lazy_decay:
+            assert state.step is not None
+            state = state._replace(step=state.step + valid.astype(jnp.int32))
+        return norm, valid, pending, state, done_pin
 
     def sparse_update(
         self,

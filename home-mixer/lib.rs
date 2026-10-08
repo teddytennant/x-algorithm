@@ -11,6 +11,8 @@ pub mod frames;
 pub mod models;
 pub mod params;
 mod phoenix_scores_server;
+pub mod popular_authors_job;
+pub mod popular_posts_job;
 mod query_hydrators;
 mod ranked_following_feed_server;
 mod scored_posts_server;

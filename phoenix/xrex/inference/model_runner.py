@@ -3,6 +3,7 @@
 import concurrent.futures
 import json
 import logging
+import math
 import mmap
 import multiprocessing
 import os
@@ -15,6 +16,7 @@ import time
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from dataclasses import replace as dc_replace
 from typing import Any, Generic, Protocol, TypeVar, Union, final
 
 import haiku as hk
@@ -44,8 +46,8 @@ from xrex.data.parquet_recsys import (
     PhoenixDataset,
 )
 from xrex.data.recsys import recsys_batch
-from xrex.data.recsys.recsys_batch import RecsysFeaturesBatch
-from xrex.data.recsys.sequence_packing import pack_batch
+from xrex.data.recsys.recsys_batch import TWITTER_EPOCH_MS, RecsysFeaturesBatch
+from xrex.data.recsys.sequence_packing import compact_candidate_layout, pack_batch
 from xrex.data.retrieval_dataset import PHOENIX_INDEX_BASE, RetrievalDataset
 from xrex.inference import debug_logger, service_registry
 from xrex.inference.h2d import (
@@ -508,6 +510,8 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
 
     inference_batch_size_buckets: tuple[int, ...] = ()
 
+    seqpack_packed_len_fractions: list[float] = field(default_factory=list)
+
     history_seq_len: int = 1000
     candidate_seq_len: int = 1400
 
@@ -600,6 +604,37 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         if not self.inference_batch_size_buckets:
             return (self.inference_batch_size,)
         return tuple(sorted(set(self.inference_batch_size_buckets)))
+
+    @property
+    def compact_candidate_slots(self) -> bool:
+        return bool(self.using_seqpack and self.seqpack_packed_len_fractions)
+
+    def full_packed_seq_len(self, bs: int) -> int:
+        mc = self.model_config
+        bs_per_device = bs // self.parallel_config.num_devices_per_process
+        return bs_per_device * (
+            mc.num_user_prefix_tokens + self.history_seq_len + self.candidate_seq_len
+        )
+
+    def packed_seq_lens(self, bs: int) -> tuple[int, ...]:
+        full = self.full_packed_seq_len(bs)
+        if not self.compact_candidate_slots or bs != max(self.sorted_buckets):
+            return (full,)
+        block = self._seqpack_block_size
+        lens = {full}
+        for frac in self.seqpack_packed_len_fractions:
+            n = int(math.ceil(full * float(frac) / block)) * block
+            if 0 < n < full:
+                lens.add(n)
+        return tuple(sorted(lens))
+
+    def select_packed_seq_len(self, bs: int, used: int) -> int:
+        for n in self.packed_seq_lens(bs):
+            if used <= n:
+                return n
+        raise ValueError(
+            f"packed row uses {used} tokens > full length {self.full_packed_seq_len(bs)}"
+        )
 
     def select_bucket(self, orig_batch_size: int) -> int:
         buckets = self.sorted_buckets
@@ -2100,6 +2135,14 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
                         pspec=emb.pspec,
                     )
                 )
+            side_width = self.model_config.mol_side_table_width
+            if side_width:
+                post_embeddings = post_embeddings._replace(
+                    mol_side_table=Parameter(
+                        x=jnp.zeros((orig, side_width), dtype=jnp.float32),
+                        pspec=P(None, None),
+                    )
+                )
 
         initial_params = self.loss_fn.init(init_rng, batch, emb_table_init_data)
         return RecsysInferenceState(
@@ -2588,19 +2631,38 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
             self.debug_log_path = path
         return path
 
-    def example_data(self, bs: int) -> RecsysFeaturesBatch:
+    def example_data(self, bs: int, packed_seq_len: int | None = None) -> RecsysFeaturesBatch:
         batch = self.dataset.example_data(bs)
         if self.using_seqpack:
-            batch = pack_batch(
-                batch=batch,
-                num_devices_per_process=self.parallel_config.num_devices_per_process,
-                num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                dist=None,
-                rng=None,
-                block_size=self._seqpack_block_size,
-            )
-            if self.using_fa4:
-                batch = self.add_block_sparse_layout(batch)
+            batch = self._pack_inference_batch(batch, packed_seq_len=packed_seq_len)
+        return batch
+
+    def _pack_inference_batch(
+        self, batch: RecsysFeaturesBatch, *, packed_seq_len: int | None = None
+    ) -> RecsysFeaturesBatch:
+        batch = pack_batch(
+            batch=batch,
+            num_devices_per_process=self.parallel_config.num_devices_per_process,
+            num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
+            dist=None,
+            rng=None,
+            block_size=self._seqpack_block_size,
+        )
+        if packed_seq_len is not None:
+            layout = batch.get("packing_layout")
+            assert layout is not None
+            if packed_seq_len != int(layout.segment_ids.shape[1]):
+                batch["packing_layout"] = compact_candidate_layout(
+                    batch,
+                    num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
+                    block_size=self._seqpack_block_size,
+                    packed_seq_len=packed_seq_len,
+                )
+        if self.using_fa4:
+            batch = self.add_block_sparse_layout(batch)
+        layout = batch.get("packing_layout")
+        if layout is not None and getattr(layout, "cand_slot_lens", None) is not None:
+            batch["packing_layout"] = dc_replace(layout, cand_slot_lens=None)
         return batch
 
     def _get_persistent_buffer(
@@ -2823,6 +2885,9 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         except Exception as e:
             logger.warning("NUMA: failed to re-bind nodes: %s", e)
 
+    def create_dataset(self, ctx: TrainerContext) -> None:
+        pass
+
     def create_state(self, ctx: TrainerContext) -> None:
         assert isinstance(
             self.model_config, (RecsysAggregatedModelConfig, RecsysTwoTowerModelConfig)
@@ -2892,6 +2957,7 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
         request: RequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> Union[jax.Array, np.ndarray, tuple[jax.Array, jax.Array, jax.Array]]:
         raise NotImplementedError
 
@@ -3462,25 +3528,24 @@ class BaseModelRunner(RecsysTrainer, Generic[RequestBatch, ModelConfig], ABC):
     def _warmup_buckets(self, rng: jax.Array) -> None:
         assert isinstance(self.state, RecsysInferenceState)
         for bs in self.sorted_buckets:
-            batch = self._get_persistent_buffer(0, bs)
-            if self.using_seqpack:
-                batch = pack_batch(
-                    batch=batch,
-                    num_devices_per_process=self.parallel_config.num_devices_per_process,
-                    num_user_prefix_tokens=self.model_config.num_user_prefix_tokens,
-                    dist=None,
-                    rng=None,
-                    block_size=self._seqpack_block_size,
+            lens: tuple[int | None, ...] = (
+                self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
+            )
+            for n in lens:
+                batch = self._get_persistent_buffer(0, bs)
+                if self.using_seqpack:
+                    batch = self._pack_inference_batch(batch, packed_seq_len=n)
+                out = self.gather_embeddings_and_forward(
+                    self.state, batch, rng, 0, -1, bucket_size=bs, packed_seq_len=n
                 )
-                if self.using_fa4:
-                    batch = self.add_block_sparse_layout(batch)
-            out = self.gather_embeddings_and_forward(self.state, batch, rng, 0, -1, bucket_size=bs)
-            if isinstance(out, jax.Array):
-                out = out.block_until_ready()
-                logger.info(f"Warmup bucket={bs} output shape: {out.shape}")
-            elif isinstance(out, tuple):
-                out = jax.tree.map(lambda x: x.block_until_ready(), out)
-                logger.info(f"Warmup bucket={bs} output shapes: {[x.shape for x in out]}")
+                if isinstance(out, jax.Array):
+                    out = out.block_until_ready()
+                    logger.info(f"Warmup bucket={bs} len={n} output shape: {out.shape}")
+                elif isinstance(out, tuple):
+                    out = jax.tree.map(lambda x: x.block_until_ready(), out)
+                    logger.info(
+                        f"Warmup bucket={bs} len={n} output shapes: {[x.shape for x in out]}"
+                    )
 
     SUPPORTED_MODEL_CONFIGS = (
         RecsysAggregatedModelConfig,
@@ -3895,11 +3960,19 @@ class RankingModelRunner(
     ]
 ):
     forward_jit_by_bs: dict[int, JittedOrCompiled] = field(default_factory=dict, init=False)
+    forward_jit_by_bs_len: dict[tuple[int, int | None], JittedOrCompiled] = field(
+        default_factory=dict, init=False
+    )
 
-    def _rng_and_init_data(self, seq_len: int | None = None, bs: int | None = None):
+    def _rng_and_init_data(
+        self,
+        seq_len: int | None = None,
+        bs: int | None = None,
+        packed_seq_len: int | None = None,
+    ):
         bs = bs or self.inference_batch_size
         if self.using_seqpack:
-            init_data = self.example_data(bs)
+            init_data = self.example_data(bs, packed_seq_len=packed_seq_len)
             rng = jax.ShapeDtypeStruct((2,), jnp.uint32)
         else:
             rng, init_data = super()._rng_and_init_data(seq_len=seq_len)
@@ -4026,6 +4099,7 @@ class RankingModelRunner(
         request: xai_recsys_engine.PredictRequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
@@ -4059,7 +4133,11 @@ class RankingModelRunner(
             batch["candidate_seq"]["embedding"] = candidate_multimodal_embeddings
 
         bs = bucket_size if bucket_size is not None else self.inference_batch_size
-        forward_jit = self.forward_jit_by_bs[bs]
+        forward_jit = (
+            self.forward_jit_by_bs[bs]
+            if packed_seq_len is None
+            else self.forward_jit_by_bs_len[(bs, packed_seq_len)]
+        )
         params = self.state.params if self._live_swap_enabled else state.params
         with jax_profiler.TraceAnnotation(
             "forward_jit/ranking",
@@ -4162,17 +4240,34 @@ class RankingModelRunner(
         self.create_embedding_init_data()
 
         self.forward_jit_by_bs = {}
+        self.forward_jit_by_bs_len = {}
         for bs in self.sorted_buckets:
-            self.forward_jit_by_bs[bs] = self._build_and_register_forward_jit(bs, compiler_options)
+            lens: tuple[int | None, ...] = (
+                self.packed_seq_lens(bs) if self.compact_candidate_slots else (None,)
+            )
+            for n in lens:
+                jit_fn = self._build_and_register_forward_jit(
+                    bs, compiler_options, packed_seq_len=n
+                )
+                self.forward_jit_by_bs_len[(bs, n)] = jit_fn
+            self.forward_jit_by_bs[bs] = jit_fn
         self.forward_jit = self.forward_jit_by_bs[max(self.sorted_buckets)]
+        if self.compact_candidate_slots:
+            logger.info(
+                "compact candidate slots: compiled packed lengths per bucket %s",
+                {bs: self.packed_seq_lens(bs) for bs in self.sorted_buckets},
+            )
 
     def _build_and_register_forward_jit(
-        self, bs: int, compiler_options: dict[str, Any] | None
+        self,
+        bs: int,
+        compiler_options: dict[str, Any] | None,
+        packed_seq_len: int | None = None,
     ) -> JittedOrCompiled:
         assert isinstance(self.model_config, RecsysAggregatedModelConfig)
 
         if self.using_seqpack:
-            trace_batch = self.example_data(bs)
+            trace_batch = self.example_data(bs, packed_seq_len=packed_seq_len)
             _hist_post_seq = int(np.prod(trace_batch["history_seq"]["post_hashes"].shape[1:]))
             _hist_auth_seq = int(np.prod(trace_batch["history_seq"]["auth_hashes"].shape[1:]))
             _cand_post_seq = int(np.prod(trace_batch["candidate_seq"]["post_hashes"].shape[1:]))
@@ -4312,10 +4407,11 @@ class RankingModelRunner(
                 ),
                 out_shardings=(self.data_sharding, self.data_sharding, nan_sharding),
             ),
-            name=f"forward_fn_bs{bs}",
+            name=f"forward_fn_bs{bs}"
+            + (f"_len{packed_seq_len}" if packed_seq_len is not None else ""),
         )
 
-        rng, init_data = self._rng_and_init_data(bs=bs)
+        rng, init_data = self._rng_and_init_data(bs=bs, packed_seq_len=packed_seq_len)
 
         merged_embeddings_init = jnp.zeros(
             (
@@ -4361,9 +4457,12 @@ class RetrievalModelRunner(
     enable_topic_filter: bool = False
     enable_dataset_slice_topk: bool = False
     enable_async_topk: bool = False
+    cold_start_max_age_seconds: float = 0.0
     enable_radix_select_topk: bool = False
     enable_int8_post_table: bool = False
     _int8_post_table_cache: tuple | None = field(default=None, init=False)
+    _mol_side_tables_cache: tuple | None = field(default=None, init=False)
+    _mol_side_tables_fn: Any = field(default=None, init=False)
     _all_topic_bitmaps: dict[int, jax.Array] = field(default_factory=dict)
 
     _mask_pinned_by_bs: dict[int, jax.Array] = field(default_factory=dict)
@@ -4417,11 +4516,97 @@ class RetrievalModelRunner(
             ranges[val] = (int(s), int(e))
         return ranges
 
+    def _trim_ranges_by_post_age(
+        self,
+        ranges: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        max_age_s = float(self.cold_start_max_age_seconds or 0.0)
+        if max_age_s <= 0 or not ranges or post_ids is None:
+            return ranges
+
+        cutoff_ms = int(time.time() * 1000.0 - max_age_s * 1000.0) - TWITTER_EPOCH_MS
+        if cutoff_ms <= 0:
+            return ranges
+        cutoff_id = cutoff_ms << 22
+
+        ids = np.asarray(post_ids).reshape(-1)
+        out: dict[int, tuple[int, int]] = {}
+        for ds_value, (start, end) in ranges.items():
+            out[ds_value] = (start, end)
+            if ds_value != RetrievalDataset.HOME_COLD.value or end - start <= 0:
+                continue
+            window = ids[start:end]
+            if window.size > 1 and not bool(np.all(window[:-1] <= window[1:])):
+                logger.error(
+                    "cold_start_max_age_seconds: HOME_COLD rows [%d:%d) are not "
+                    "sorted by post_id; skipping age trim",
+                    start,
+                    end,
+                )
+                continue
+            offset = int(np.searchsorted(window, cutoff_id, side="left"))
+            new_start = start + offset
+            floor_start = max(start, end - int(self.large_k))
+            clamped = min(new_start, floor_start)
+            if clamped != new_start:
+                logger.warning(
+                    "cold_start_max_age_seconds=%.0fs would leave %d HOME_COLD rows "
+                    "(< large_k=%d); keeping the %d newest instead",
+                    max_age_s,
+                    end - new_start,
+                    self.large_k,
+                    end - clamped,
+                )
+            out[ds_value] = (clamped, end)
+            logger.info(
+                "Age trim (dataset %d, max_age=%.0fs): [%d:%d) -> [%d:%d) (%d of %d rows kept)",
+                ds_value,
+                max_age_s,
+                start,
+                end,
+                clamped,
+                end,
+                end - clamped,
+                end - start,
+            )
+        return out
+
+    def _finalize_serving_ranges(
+        self,
+        raw: dict[int, tuple[int, int]] | None,
+        post_ids: npt.NDArray[np.int64] | None,
+    ) -> dict[int, tuple[int, int]] | None:
+        if not raw:
+            return raw
+        union = RetrievalDataset.home_union_range(raw)
+        trimmed = self._trim_ranges_by_post_age(raw, post_ids)
+        if trimmed is None:
+            return None
+        if union is not None:
+            trimmed = dict(trimmed)
+            trimmed[RetrievalDataset.HOME.value] = union
+        return trimmed
+
+    def _serving_target_dataset_types(
+        self, ranges: dict[int, tuple[int, int]] | None = None
+    ) -> tuple[int, ...]:
+        launch = tuple(ds.value for ds in self.retrieval_dataset_types)
+        table = ranges if ranges is not None else self._dataset_ranges_by_type
+        if not table or getattr(self, "enable_topic_filter", False):
+            return launch
+        home = RetrievalDataset.HOME.value
+        cold = RetrievalDataset.HOME_COLD.value
+        if home in launch and cold in table and cold not in launch:
+            return launch + (cold,)
+        return launch
+
     def _compute_dataset_ranges(self) -> None:
         if self.all_dataset_types is None:
             self._dataset_ranges_by_type = None
             return
         ranges = self._dataset_ranges_from_types(np.asarray(self.all_dataset_types))
+        ranges = self._finalize_serving_ranges(ranges, self.all_post_ids)
         self._dataset_ranges_by_type = ranges
         if ranges is None:
             return
@@ -4553,6 +4738,7 @@ class RetrievalModelRunner(
         author_ids64 = self.two_int32_to_int64(staged_meta["post_embeddings.author_ids"])
         dataset_types = np.asarray(staged_meta["post_embeddings.dataset_types"], dtype=np.int32)
         ranges = self._dataset_ranges_from_types(dataset_types)
+        ranges = self._finalize_serving_ranges(ranges, post_ids64)
         self._precompile_live_two_tower_variants(ranges)
         self._staged_live_retrieval_meta = (post_ids64, author_ids64, dataset_types, ranges)
 
@@ -4591,7 +4777,7 @@ class RetrievalModelRunner(
         self, staged_ranges: dict[int, tuple[int, int]] | None
     ) -> None:
         self._staged_live_forward_compiled = None
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types(staged_ranges or None)
         ranges_tuple = self._get_dataset_ranges(
             target_dataset_types, ranges_override=staged_ranges or {}
         )
@@ -4830,6 +5016,7 @@ class RetrievalModelRunner(
         request: xai_recsys_engine.RetrieveRequestBatch | None = None,
         eligible_mask: jax.Array | None = None,
         bucket_size: int | None = None,
+        packed_seq_len: int | None = None,
     ) -> dict[int, tuple[jax.Array, jax.Array]]:
         if self._live_swap_enabled:
             state = self.state
@@ -4856,7 +5043,7 @@ class RetrievalModelRunner(
                 self.metrics_publisher.model_latency.labels("embedding_lookup").observe(
                     emb_lookup_time
                 )
-        target_dataset_types = tuple(ds.value for ds in self.retrieval_dataset_types)
+        target_dataset_types = self._serving_target_dataset_types()
 
         dataset_ranges = self._get_dataset_ranges(target_dataset_types)
 
@@ -4977,9 +5164,50 @@ class RetrievalModelRunner(
         }
         return results_dict
 
+    @property
+    def _mol_serving_kernel(self) -> bool:
+        mc = self.model_config
+        return (
+            isinstance(mc, RecsysTwoTowerModelConfig)
+            and mc.mol_serving_kernel
+            and mc.mol_item_components > 0
+        )
+
+    def _mol_side_tables(self, state: RecsysInferenceState) -> tuple[jax.Array, jax.Array]:
+        x = state.post_embeddings.embeddings.x
+        cache = self._mol_side_tables_cache
+        if cache is not None and cache[0] is x and cache[1] is state.params:
+            return cache[2], cache[3]
+        if self._mol_side_tables_fn is None:
+            mesh = self.mesh
+
+            @hk.transform
+            def side_tables_fn(post_table: jax.Array):
+                model = self.model_config.make(sharding_context=make_legacy_sharding_context(mesh))
+                return model.mol_side_tables(post_table)
+
+            side_sharding = jax.sharding.NamedSharding(mesh, P(None, self.data_sharding.spec[0]))
+            self._mol_side_tables_fn = jax.jit(
+                side_tables_fn.apply,
+                in_shardings=(self.state_sharding.params, None, self.data_sharding),
+                out_shardings=(side_sharding, side_sharding),
+            )
+        t0 = time.time()
+        norms, ibias = jax.block_until_ready(self._mol_side_tables_fn(state.params, None, x))
+        logger.info(
+            "mol_serving_kernel: built side tables norms%s ibias%s in %.0fms",
+            norms.shape,
+            ibias.shape,
+            (time.time() - t0) * 1e3,
+        )
+        self._mol_side_tables_cache = (x, state.params, norms, ibias)
+        return norms, ibias
+
     def _post_table_forward_arg(self, state: RecsysInferenceState):
         x = state.post_embeddings.embeddings.x
         if not self.enable_int8_post_table:
+            if self._mol_serving_kernel:
+                return (x,) + self._mol_side_tables(state)
             return x
         cache = self._int8_post_table_cache
         if cache is None or cache[0] is not x:
@@ -4992,6 +5220,8 @@ class RetrievalModelRunner(
             )
             cache = (x, q8, scales)
             self._int8_post_table_cache = cache
+        if self._mol_serving_kernel:
+            return (cache[1], cache[2]) + self._mol_side_tables(state)
         return (cache[1], cache[2])
 
     def reply_request(
@@ -5193,8 +5423,16 @@ class RetrievalModelRunner(
         ):
             assert isinstance(self.model_config, RecsysTwoTowerModelConfig)
             post_scales = None
+            mol_side_tables = None
             if isinstance(post_embeddings, tuple):
-                post_embeddings, post_scales = post_embeddings
+                if len(post_embeddings) == 2:
+                    post_embeddings, post_scales = post_embeddings
+                elif len(post_embeddings) == 3:
+                    post_embeddings, norms, ibias = post_embeddings
+                    mol_side_tables = (norms, ibias)
+                else:
+                    post_embeddings, post_scales, norms, ibias = post_embeddings
+                    mol_side_tables = (norms, ibias)
             sl = embedding_slices
 
             if self.using_seqpack:
@@ -5233,6 +5471,7 @@ class RetrievalModelRunner(
                 use_async_topk=self.enable_async_topk,
                 use_radix_select_topk=self.enable_radix_select_topk,
                 post_scales=post_scales,
+                mol_side_tables=mol_side_tables,
             )
 
         if self.enable_int8_post_table:
@@ -5242,6 +5481,16 @@ class RetrievalModelRunner(
             )
         else:
             post_table_in_sharding = self.data_sharding
+        if self._mol_serving_kernel:
+            side_sharding = jax.sharding.NamedSharding(
+                self.data_sharding.mesh, P(None, self.data_sharding.spec[0])
+            )
+            base = (
+                post_table_in_sharding
+                if isinstance(post_table_in_sharding, tuple)
+                else (post_table_in_sharding,)
+            )
+            post_table_in_sharding = base + (side_sharding, side_sharding)
 
         return JittedOrCompiled(
             jax.jit(

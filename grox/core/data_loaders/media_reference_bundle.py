@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 
-from blobstore_http.blobstore import Blobstore
+import boto3
+from botocore.config import Config as BotoConfig
 from grox.config.config import grox_config
 from grox.core.lm.convo import Video as ConvoVideo
 from monitor.metrics import Metrics
@@ -12,7 +14,8 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-BLOBSTORE_ENDPOINT = "https://ton.atla.twitter.com"
+O2_ENDPOINT = "https://o2-https.o2-prod.atla-prod-storage.cluster.kube.int-x.ai"
+_O2_CA_BUNDLE = "/etc/ssl/internal-ca/ca-bundle.crt"
 _RETRY_WHILE_EMPTY_S = 60.0
 _FETCH_TIMEOUT_S = 15.0
 _MAX_VIDEOS = 10
@@ -39,33 +42,63 @@ class MediaReferenceBundle:
     videos: list[ConvoVideo]
 
 
-def blobstore_for(uri: str) -> Blobstore:
-    if not uri.startswith("blobstore://"):
-        raise ValueError(
-            f"media reference bundle uri must be a blobstore:// URI, got {uri!r}"
+class S3Store:
+    def __init__(self, bucket: str, prefix: str):
+        self._bucket = bucket
+        self._prefix = f"{prefix}/" if prefix else ""
+        self._client = boto3.client(
+            "s3",
+            endpoint_url=O2_ENDPOINT,
+            verify=_O2_CA_BUNDLE if os.path.exists(_O2_CA_BUNDLE) else None,
+            config=BotoConfig(
+                connect_timeout=5,
+                read_timeout=10,
+                retries={"total_max_attempts": 1},
+                s3={"addressing_style": "path"},
+            ),
         )
-    namespace, _, subpath = uri[len("blobstore://") :].partition("/")
-    return Blobstore(
-        namespace=namespace,
-        subpath=subpath.strip("/") or None,
-        endpoint=BLOBSTORE_ENDPOINT,
-    )
+
+    async def get(self, key: str) -> bytes:
+        try:
+            return await asyncio.to_thread(self._read, self._prefix + key)
+        except self._client.exceptions.NoSuchKey:
+            raise FileNotFoundError(f"missing bundle object {key!r}") from None
+
+    def _read(self, key: str) -> bytes:
+        return self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+
+    async def put(self, key: str, data: bytes, content_type: str) -> None:
+        await asyncio.to_thread(
+            self._client.put_object,
+            Bucket=self._bucket,
+            Key=self._prefix + key,
+            Body=data,
+            ContentType=content_type,
+        )
 
 
-async def _get_required(store: Blobstore, key: str) -> bytes:
+def store_for(uri: str) -> S3Store:
+    scheme, _, rest = uri.partition("://")
+    bucket, _, prefix = rest.partition("/")
+    if scheme != "s3" or not bucket:
+        raise ValueError(
+            f"media reference bundle uri must be an s3://<bucket>/<prefix> URI, got {uri!r}"
+        )
+    return S3Store(bucket=bucket, prefix=prefix.strip("/"))
+
+
+async def _get_bounded(store: S3Store, key: str) -> bytes:
     data = await store.get(key)
-    if not data:
-        raise FileNotFoundError(f"missing blobstore object {key!r}")
     if len(data) > _MAX_FRAME_BYTES:
         raise ValueError(
-            f"blobstore object {key!r} is {len(data)} bytes, over the {_MAX_FRAME_BYTES} limit"
+            f"bundle object {key!r} is {len(data)} bytes, over the {_MAX_FRAME_BYTES} limit"
         )
     return data
 
 
 async def _fetch_bundle(uri: str) -> MediaReferenceBundle:
-    store = blobstore_for(uri)
-    manifest_bytes = await _get_required(store, "manifest.json")
+    store = store_for(uri)
+    manifest_bytes = await _get_bounded(store, "manifest.json")
     manifest = MediaReferenceManifest.model_validate_json(manifest_bytes)
     if not manifest.videos:
         raise ValueError("manifest lists no reference videos")
@@ -74,7 +107,7 @@ async def _fetch_bundle(uri: str) -> MediaReferenceBundle:
     videos: list[ConvoVideo] = []
     for video in manifest.videos:
         frames = list(
-            await asyncio.gather(*(_get_required(store, name) for name in video.frames))
+            await asyncio.gather(*(_get_bounded(store, name) for name in video.frames))
         )
         for data in frames:
             digest.update(data)

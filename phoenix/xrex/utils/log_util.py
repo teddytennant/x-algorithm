@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
-import json
 import logging
 import os
 import socket
@@ -11,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from xai_logging_utils.structured import format_extra_kv
 from xrex.utils import cluster
 
 if TYPE_CHECKING:
@@ -39,39 +39,6 @@ def set_log_row(record_id: int | None) -> None:
         _LOG_ROW.set("")
     else:
         _LOG_ROW.set(str(record_id))
-
-
-_STANDARD_LOG_RECORD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys())
-_SKIP_ATTRS = _STANDARD_LOG_RECORD_ATTRS | {
-    "message",
-    "asctime",
-    "taskName",
-    "rl_attr",
-}
-
-
-def _stringify(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (str, int, float)):
-        return str(value)
-    return json.dumps(value, default=str, separators=(",", ":"))
-
-
-def _format_extra_kv(record: logging.LogRecord) -> str:
-    items: list[str] = []
-    event: str | None = None
-    for key, value in record.__dict__.items():
-        if key in _SKIP_ATTRS or value is None:
-            continue
-        rendered = _stringify(value)
-        if key == "event":
-            event = rendered
-        else:
-            items.append(f"{key}={rendered}")
-    if event is not None:
-        items.insert(0, f"event={event}")
-    return " ".join(items)
 
 
 def get_formatter(
@@ -116,7 +83,7 @@ def get_formatter(
             if row:
                 attr += f"/row={row}"
             record.rl_attr = attr
-            extra_kv = _format_extra_kv(record)
+            extra_kv = format_extra_kv(record)
             msg = super().format(record)
             if extra_kv:
                 head, sep, tail = msg.partition("\n")

@@ -40,7 +40,7 @@ public abstract class ThriftStructOperator<E, T extends ThriftStruct> extends Fu
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   public Object apply(Context<E> context, List<Object> args) throws Exception {
 
     Map<Object, Object> hashMap = Maps.newHashMap();

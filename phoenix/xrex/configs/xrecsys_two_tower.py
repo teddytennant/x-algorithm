@@ -16,6 +16,7 @@ from xrex.data.recsys.constants import continuous_action_type_map
 from xrex.data.recsys.feature_config import CategoricalFeature
 from xrex.data.recsys.recsys_batch import EMBEDDING_CONFIG
 from xrex.data.recsys.sequence_packing import BetaLengthDistribution
+from xrex.data.retrieval_dataset import RetrievalDataset
 from xrex.models.recsys_attention import RecsysAttentionConfig
 from xrex.models.recsys_embedding import HashKeys, HashTable
 from xrex.models.recsys_feature_prep import FeaturePrepConfig
@@ -293,6 +294,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "head_names": ["home", "immersive"],
         "head_dataset_mapping": {
             "HOME": 0,
+            "HOME_COLD": 0,
+            "HOME_HOT": 0,
             "IMMERSIVE4Day": 1,
             "IMMERSIVE2Day": 1,
             "IMMERSIVENSFW": 1,
@@ -303,6 +306,7 @@ def _xrecsys_two_tower_combined_base() -> dict:
             "IMMERSIVE2Day",
             "IMMERSIVENSFW",
         ],
+        "split_home_checkpoint": True,
         "max_posts": 28_672_000,
         "use_user_embedding": False,
         "use_post_embedding": False,
@@ -313,6 +317,81 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "sid_hash_level": True,
         "sid_cross_attn": True,
         "global_ids_file_path": data_feeds.SID_GLOBAL_IDS_PLACEHOLDER,
+        "use_seqpack": True,
+        "right_anchored_rope": True,
+        "effective_sequence_len": 513,
+        "seqpack_distribution": BetaLengthDistribution(
+            min_len=0,
+            max_len=1023,
+            mean_len=511,
+            alpha=1.0,
+            beta=1.0,
+            block_size=128,
+        ),
+    }
+
+
+def _immersive_only_base() -> dict:
+    return {
+        "history_seq_len": 1023,
+        "enable_user_country_feature": True,
+        "enable_user_language_feature": True,
+        "enable_user_location_feature": True,
+        "enable_user_gender_feature": True,
+        "enable_user_age_feature": True,
+        "enable_user_installed_apps": True,
+        "candidate_seq_len": 64,
+        "num_negatives_per_example": 0,
+        "num_global_negatives_per_example": 64,
+        "num_layers": 8,
+        "emb_size": 1024,
+        "emb_table_width": 1024,
+        "query_heads": 16,
+        "kv_heads": 4,
+        "base_batch_size": 32,
+        "bs_per_device": 480,
+        "ep": 8 * 8,
+        "dp": 1,
+        "total_samples": 1e11,
+        "empty_history_user_dropout_rate": 0.1,
+        "learning_rate": 2e-3,
+        "emb_learning_rate": 0.1,
+        "qk_norm": False,
+        "attn_logit_cap": 80.0,
+        "primer_norm": True,
+        "attn_impl": "pallas_ranker_varlen_attn",
+        "feature_prep_enabled": True,
+        "enable_candidate_tower_linear_proj": False,
+        "apply_u2u_and_i2i_loss": False,
+        "eval_bs_per_device": 8,
+        "eval_every_n": 1000,
+        "target_dataset_type": RetrievalDataset.IMMERSIVE2Day,
+        "checkpoint_dataset_names": [
+            "IMMERSIVE4Day",
+            "IMMERSIVE2Day",
+            "IMMERSIVENSFW",
+            "EVERGREEN",
+        ],
+        "max_posts": 40_960_000,
+        "positive_actions": [
+            recsys_pb2.ActionName.SERVER_TWEET_FAV,
+            recsys_pb2.ActionName.SERVER_TWEET_REPLY,
+            recsys_pb2.ActionName.SERVER_TWEET_QUOTE,
+            recsys_pb2.ActionName.SERVER_TWEET_RETWEET,
+            recsys_pb2.ActionName.CLIENT_TWEET_VIDEO_QUALITY_VIEW,
+            recsys_pb2.ActionName.CLIENT_TWEET_FOLLOW_AUTHOR,
+            recsys_pb2.ActionName.CLIENT_TWEET_BOOKMARK,
+            recsys_pb2.ActionName.CLIENT_TWEET_SHARE,
+        ],
+        "use_user_embedding": False,
+        "use_post_embedding": False,
+        "use_post_sid": True,
+        "sid_embed_dim": 1024,
+        "sid_num_levels": 6,
+        "sid_codebook_size": 256,
+        "sid_hash_level": True,
+        "sid_cross_attn": True,
+        "global_ids_file_path": data_feeds.SID_VIDEO_GLOBAL_IDS_PLACEHOLDER,
         "use_seqpack": True,
         "right_anchored_rope": True,
         "effective_sequence_len": 513,
@@ -387,6 +466,30 @@ MODEL_CFGS = {
         item_hash_vocab_size=100_000_000,
         author_vocab_size=30_000_000,
         ip_vocab_size=0,
+    ),
+    "xrecsys_two_tower_immersive_only": _make_cfg(
+        _immersive_only_base(),
+        user_vocab_size=0,
+        item_vocab_size=0,
+        item_hash_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
+    ),
+    "xrecsys_two_tower_immersive_only_gb300": _make_cfg(
+        {
+            **_immersive_only_base(),
+            "attn_impl": "cutedsl_ranker_varlen_attn",
+            "remat_policy": RematType.SAVE_GB300_RECSYS,
+            "unroll_layer_stack": True,
+            "bs_per_device": 512,
+            "ep": 32,
+            "eval_bs_per_device": 16,
+            "qk_norm": True,
+            "attn_logit_cap": -1,
+        },
+        user_vocab_size=0,
+        item_vocab_size=0,
+        item_hash_vocab_size=100_000_000,
+        author_vocab_size=30_000_000,
     ),
     "xrecsys_two_tower_combined": _make_cfg(
         {**_xrecsys_two_tower_combined_base(), **_H100_OVERRIDES},
@@ -580,6 +683,7 @@ for config in configs:
         precision_level=2,
         reuse_run_id=False,
         evals=evals,
+        split_home_checkpoint=mparams.get("split_home_checkpoint", False),
         eval_every_n=mparams.get("eval_every_n", 1000),
         model_config=RecsysTwoTowerModelConfig(
             num_global_negatives_per_example=mparams["num_global_negatives_per_example"],
@@ -592,8 +696,58 @@ for config in configs:
             logq_correction_scale=mparams.get(
                 "logq_correction_scale", RecsysTwoTowerModelConfig.logq_correction_scale
             ),
+            fixed_temperature=mparams.get(
+                "fixed_temperature", RecsysTwoTowerModelConfig.fixed_temperature
+            ),
+            own_negative_logit_offset=mparams.get(
+                "own_negative_logit_offset", RecsysTwoTowerModelConfig.own_negative_logit_offset
+            ),
+            positive_count_user_weight_power=mparams.get(
+                "positive_count_user_weight_power",
+                RecsysTwoTowerModelConfig.positive_count_user_weight_power,
+            ),
+            mask_in_batch_false_negatives=mparams.get(
+                "mask_in_batch_false_negatives",
+                RecsysTwoTowerModelConfig.mask_in_batch_false_negatives,
+            ),
+            user_query_heads=mparams.get(
+                "user_query_heads", RecsysTwoTowerModelConfig.user_query_heads
+            ),
+            user_query_head_init_std=mparams.get(
+                "user_query_head_init_std", RecsysTwoTowerModelConfig.user_query_head_init_std
+            ),
+            mol_item_components=mparams.get(
+                "mol_item_components", RecsysTwoTowerModelConfig.mol_item_components
+            ),
+            mol_item_adapter_rank=mparams.get(
+                "mol_item_adapter_rank", RecsysTwoTowerModelConfig.mol_item_adapter_rank
+            ),
+            mol_gate_hidden=mparams.get(
+                "mol_gate_hidden", RecsysTwoTowerModelConfig.mol_gate_hidden
+            ),
+            mol_conditioned_gate=mparams.get(
+                "mol_conditioned_gate", RecsysTwoTowerModelConfig.mol_conditioned_gate
+            ),
+            mol_train_user_chunk=mparams.get(
+                "mol_train_user_chunk", RecsysTwoTowerModelConfig.mol_train_user_chunk
+            ),
+            mol_eval_user_chunk=mparams.get(
+                "mol_eval_user_chunk", RecsysTwoTowerModelConfig.mol_eval_user_chunk
+            ),
+            mol_serving_kernel=mparams.get(
+                "mol_serving_kernel", RecsysTwoTowerModelConfig.mol_serving_kernel
+            ),
+            mol_side_table_in_checkpoint=mparams.get(
+                "mol_side_table_in_checkpoint",
+                RecsysTwoTowerModelConfig.mol_side_table_in_checkpoint,
+            ),
             user_features=user_features_config,
             checkpoint_dataset_names=checkpoint_dataset_names,
+            split_home_checkpoint=mparams.get("split_home_checkpoint", False),
+            cold_start_max_age_seconds=mparams.get(
+                "cold_start_max_age_seconds",
+                RecsysTwoTowerModelConfig.cold_start_max_age_seconds,
+            ),
             immersive_positive_actions=mparams.get(
                 "immersive_positive_actions",
                 RecsysTwoTowerModelConfig.__dataclass_fields__[

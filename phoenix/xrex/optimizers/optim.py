@@ -11,7 +11,6 @@ import optax
 
 from xai_configlib import Config, configclass
 from xrex.models.model_utils import Parameter
-
 from xrex.optimizers.schedule import BaseSchedule
 
 
@@ -133,7 +132,7 @@ class OptimConfig(Config):
     weight_decay: float = 0.0
     clip_by_global_norm: float = 1.0
 
-    def make(self):
+    def make(self, mesh: jax.sharding.Mesh | None = None):
         optim = _OPTIM_ALIASES.get(self.optim, self.optim)
         if optim not in ("adam",):
             raise NotImplementedError(f"unknown optim={optim!r}")

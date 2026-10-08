@@ -24,6 +24,7 @@ use crate::side_effects::publish_seen_ids_to_kafka_side_effect::PublishSeenIdsTo
 use crate::side_effects::response_stats_side_effect::ResponseStatsSideEffect;
 use crate::side_effects::served_ad_history_cache_side_effect::ServedAdHistoryCacheSideEffect;
 use crate::side_effects::served_candidates_kafka_side_effect::ServedCandidatesKafkaSideEffect;
+use crate::side_effects::served_event_kafka_side_effect::ServedEventKafkaSideEffect;
 use crate::side_effects::truncate_served_history_side_effect::TruncateServedHistorySideEffect;
 use crate::side_effects::update_past_request_timestamps_side_effect::UpdatePastRequestTimestampsSideEffect;
 use crate::side_effects::update_served_history_side_effect::UpdateServedHistorySideEffect;
@@ -76,6 +77,7 @@ impl ForYouCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -96,6 +98,7 @@ impl ForYouCandidatePipeline {
             PublishSeenIdsToKafkaSideEffect::prod(),
             ServedCandidatesKafkaSideEffect::prod(),
             ClientEventsKafkaSideEffect::prod(),
+            ServedEventKafkaSideEffect::prod(),
             async {
                 Arc::new(
                     ProdServedHistoryClient::new(datacenter)
@@ -156,6 +159,7 @@ impl ForYouCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
             served_history_client,
             who_to_follow_client,
             prompts_client,
@@ -175,6 +179,7 @@ impl ForYouCandidatePipeline {
         publish_seen_ids: PublishSeenIdsToKafkaSideEffect,
         served_candidates: ServedCandidatesKafkaSideEffect,
         client_events: ClientEventsKafkaSideEffect,
+        served_event: ServedEventKafkaSideEffect,
         served_history_client: Arc<dyn ServedHistoryClient>,
         who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync>,
         prompts_client: Arc<dyn PromptsClient + Send + Sync>,
@@ -220,6 +225,7 @@ impl ForYouCandidatePipeline {
                 Box::new(publish_seen_ids),
                 Box::new(served_candidates),
                 Box::new(client_events),
+                Box::new(served_event),
                 Box::new(ResponseStatsSideEffect),
                 Box::new(UpdatePastRequestTimestampsSideEffect::new(
                     past_request_timestamps_client,
@@ -253,6 +259,7 @@ impl ForYouCandidatePipeline {
         let publish_seen_ids = PublishSeenIdsToKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_candidates = ServedCandidatesKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let client_events = ClientEventsKafkaSideEffect::new(Arc::clone(&mock_kafka));
+        let served_event = ServedEventKafkaSideEffect::new(Arc::clone(&mock_kafka));
         let served_history_client: Arc<dyn ServedHistoryClient> = Arc::new(MockServedHistoryClient);
         let who_to_follow_client: Arc<dyn WhoToFollowClient + Send + Sync> =
             Arc::new(MockWhoToFollowClient);
@@ -272,6 +279,7 @@ impl ForYouCandidatePipeline {
             publish_seen_ids,
             served_candidates,
             client_events,
+            served_event,
             served_history_client,
             who_to_follow_client,
             prompts_client,

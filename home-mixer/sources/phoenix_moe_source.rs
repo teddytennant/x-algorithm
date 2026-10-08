@@ -5,6 +5,7 @@ use crate::params::{
     PhoenixMoeColdStartMaxResults, PhoenixRetrievalMOEInferenceClusterId,
     PhoenixXdsRetrievalMaxRetries,
 };
+use crate::sources::sid_source::sid_source_enabled;
 use crate::util::egress::RetrievalDispatch;
 use crate::util::phoenix_request::candidates_from_retrieval_response;
 use tonic::async_trait;
@@ -23,6 +24,7 @@ pub struct PhoenixMOESource {
 impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
     fn enable(&self, query: &ScoredPostsQuery) -> bool {
         query.params.get(EnablePhoenixMOESource)
+            && !sid_source_enabled(query)
             && (!query.is_topic_request() || query.is_bulk_topic_request())
             && !query.in_network_only
             && !query.has_cached_posts
@@ -60,6 +62,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixMOESource {
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 query.params.get(EnablePhoenixRetrievalFallback),
+                vec![],
             )
             .await
             .map_err(|e| format!("PhoenixMOESource: {e}"))?;
@@ -82,6 +85,7 @@ mod tests {
     use xai_feature_switches::{FeatureSwitches, RecipientBuilder};
 
     const ENABLE_FS: &str = "rust_home_mixer_enable_phoenix_moe_source";
+    const SID_SOURCE_FS: &str = "rust_home_mixer_enable_sid_source";
 
     fn source() -> PhoenixMOESource {
         PhoenixMOESource {
@@ -97,6 +101,7 @@ mod tests {
             .unwrap()
             .match_recipient(&RecipientBuilder::new().build());
         results.override_fs(ENABLE_FS.to_string(), "true");
+        results.override_fs(SID_SOURCE_FS.to_string(), "false");
         let decider = kill_switch.map(|killed| {
             Decider::new(DeciderStore::new(HashMap::new()))
                 .with_overrides(HashMap::from([(

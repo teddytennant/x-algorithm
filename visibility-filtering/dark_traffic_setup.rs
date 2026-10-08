@@ -170,9 +170,10 @@ impl ChannelFactory for MirrorChannelFactory {
 }
 
 pub fn resolve_layer() -> DarkLayer {
-    if !std::env::var("DARK_TRAFFIC_ENABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    if !std::env::var(crate::config::ENV_DARK_TRAFFIC_ENABLED)
+        .ok()
+        .as_deref()
+        .is_some_and(dark_traffic_enabled)
     {
         info!("dark_traffic: disabled");
         return Either::Right(tower::layer::util::Identity::new());
@@ -222,6 +223,10 @@ pub fn resolve_layer() -> DarkLayer {
     Either::Left(DarkTrafficLayer::new(config))
 }
 
+pub fn dark_traffic_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
 fn should_mirror(workload: Option<&str>, ordinal: Option<u32>, max_ordinal: Option<u32>) -> bool {
     let Some(workload) = workload else {
         return false;
@@ -243,80 +248,59 @@ mod tests {
     const CANARY: Option<&str> = Some("xai-vf-service-canary");
 
     #[test]
-    fn default_only_pod0() {
-        assert!(should_mirror(PROD, Some(0), None));
-        assert!(!should_mirror(PROD, Some(1), None));
-        assert!(!should_mirror(PROD, Some(99), None));
-    }
-
-    #[test]
-    fn no_ordinal_disables() {
-        assert!(!should_mirror(PROD, None, None));
-        assert!(!should_mirror(PROD, None, Some(3)));
-    }
-
-    #[test]
-    fn max_ordinal_threshold() {
-        assert!(should_mirror(PROD, Some(0), Some(3)));
-        assert!(should_mirror(PROD, Some(1), Some(3)));
-        assert!(should_mirror(PROD, Some(2), Some(3)));
-        assert!(!should_mirror(PROD, Some(3), Some(3)));
-        assert!(!should_mirror(PROD, Some(4), Some(3)));
-    }
-
-    #[test]
-    fn max_ordinal_zero_disables_all() {
-        assert!(!should_mirror(PROD, Some(0), Some(0)));
-    }
-
-    #[test]
-    fn canary_never_mirrors() {
-        assert!(!should_mirror(CANARY, Some(0), Some(11)));
-        assert!(!should_mirror(CANARY, Some(0), Some(u32::MAX)));
-    }
-
-    #[test]
-    fn missing_workload_name_fails_closed() {
-        assert!(!should_mirror(None, Some(0), Some(11)));
+    fn should_mirror_only_selected_prod_ordinals() {
+        for (workload, ordinal, max_ordinal, expected) in [
+            (PROD, Some(0), None, true),
+            (PROD, Some(1), None, false),
+            (PROD, None, None, false),
+            (PROD, None, Some(3), false),
+            (PROD, Some(0), Some(3), true),
+            (PROD, Some(2), Some(3), true),
+            (PROD, Some(3), Some(3), false),
+            (CANARY, Some(0), Some(u32::MAX), false),
+            (None, Some(0), Some(11), false),
+        ] {
+            assert_eq!(should_mirror(workload, ordinal, max_ordinal), expected);
+        }
     }
 
     #[test]
     fn parse_accepts_vf_staging_and_devel_listeners() {
-        for (listener, workload) in [
-            ("xai-vf-service.staging.visibility:grpc", "xai-vf-service"),
+        for (listener, workload, xds_dest) in [
+            (
+                "xai-vf-service.staging.visibility:grpc",
+                "xai-vf-service",
+                "xai-vf-service.staging.visibility:grpc",
+            ),
             (
                 "xai-vf-service.devel.visibility:grpc",
                 "xai-vf-service.devel",
+                "xai-vf-service.devel.visibility:grpc",
             ),
             (
                 "xai-vf-service-pr-123.devel.visibility:grpc",
                 "xai-vf-service-pr-123.devel",
+                "xai-vf-service-pr-123.devel.visibility:grpc",
             ),
             (
                 "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service-pr-123.devel.visibility:grpc?key=val",
                 "xai-vf-service-pr-123.devel",
+                "xai-vf-service-pr-123.devel.visibility:grpc",
             ),
             (
                 "xai-vf-service-user1-foo.staging.visibility:grpc",
                 "xai-vf-service-user1-foo",
+                "xai-vf-service-user1-foo.staging.visibility:grpc",
             ),
             (
                 "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service.staging.visibility:grpc?key=val",
                 "xai-vf-service",
+                "xai-vf-service.staging.visibility:grpc",
             ),
         ] {
             let ep = parse_mirror_listener(listener).expect(listener);
             assert_eq!(ep.name, workload);
-            assert_eq!(
-                ep.xds_dest,
-                listener
-                    .rsplit("/")
-                    .next()
-                    .unwrap()
-                    .split("?")
-                    .next()
-                    .unwrap()
-            );
+            assert_eq!(ep.xds_dest, xds_dest);
         }
     }
 

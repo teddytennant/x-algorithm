@@ -12,9 +12,7 @@ try:
 except ModuleNotFoundError:
     top_k_by_key_api = None
 else:
-    jax.ffi.register_ffi_target(
-        "xrex_top_k_by_key", fn=top_k_by_key_api.top_k_by_key(), platform="CUDA"
-    )
+    jax.ffi.register_ffi_target("top_k_by_key", fn=top_k_by_key_api.top_k_by_key(), platform="CUDA")
 
 try:
     import xrex_cuda_kernels.top_k_by_key_async_api as top_k_by_key_async_api
@@ -22,7 +20,7 @@ except ModuleNotFoundError:
     top_k_by_key_async_api = None
 else:
     jax.ffi.register_ffi_target(
-        "xrex_top_k_by_key_async",
+        "top_k_by_key_async",
         fn=top_k_by_key_async_api.top_k_by_key_async(),
         platform="CUDA",
     )
@@ -33,7 +31,7 @@ except ModuleNotFoundError:
     top_k_by_key_radix_select_api = None
 else:
     jax.ffi.register_ffi_target(
-        "xrex_top_k_by_key_radix_select",
+        "top_k_by_key_radix_select",
         fn=top_k_by_key_radix_select_api.top_k_by_key_radix_select(),
         platform="CUDA",
     )
@@ -87,12 +85,10 @@ def top_k_by_key(
         jax.ShapeDtypeStruct(shape=out_shape, dtype=jnp.int32),
     ]
     if use_radix_select:
-        call = jax.ffi.ffi_call(
-            "xrex_top_k_by_key_radix_select", out_types, vmap_method="broadcast_all"
-        )
+        call = jax.ffi.ffi_call("top_k_by_key_radix_select", out_types, vmap_method="broadcast_all")
         return call(keys, k=k)
     if use_async:
-        call = jax.ffi.ffi_call("xrex_top_k_by_key_async", out_types, vmap_method="broadcast_all")
+        call = jax.ffi.ffi_call("top_k_by_key_async", out_types, vmap_method="broadcast_all")
         return call(keys, k=k)
-    call = jax.ffi.ffi_call("xrex_top_k_by_key", out_types, vmap_method="broadcast_all")
+    call = jax.ffi.ffi_call("top_k_by_key", out_types, vmap_method="broadcast_all")
     return call(keys, k=k, heuristic_pivot_ratio=heuristic_pivot_ratio)

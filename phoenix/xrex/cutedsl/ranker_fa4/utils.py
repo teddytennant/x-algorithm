@@ -40,12 +40,13 @@ from typing import Callable, Optional, Tuple, Type, overload
 
 import cutlass
 import cutlass.cute as cute
-import quack.activation
 from cutlass import Float32, Int32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+
+from xrex.cutedsl.quack import activation as quack_activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -182,6 +183,52 @@ def create_softcap_scoremod_bwd(softcap_val):
         return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)
 
     return scoremod_bwd_fn
+
+
+def create_softsign_scoremod(cap_val):
+    inv_cap = 1.0 / float(cap_val)
+
+    @cute.jit
+    def scoremod_premask_fn(
+        acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = cute.make_rmem_tensor(acc_S_SSA.shape, Float32)
+        scores.store(acc_S_SSA)
+        for i in cutlass.range_constexpr(cute.size(scores.shape)):
+            s = scores[i]
+            scores[i] = s * cute.arch.rcp_approx(1.0 + cute.math.absf(s) * inv_cap)
+        return scores.load()
+
+    return scoremod_premask_fn
+
+
+def create_softsign_scoremod_bwd(cap_val):
+    inv_cap = 1.0 / float(cap_val)
+
+    @cute.jit
+    def scoremod_bwd_fn(
+        grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        grads = cute.make_rmem_tensor(grad_out_SSA.shape, Float32)
+        grads.store(grad_out_SSA)
+        scores = cute.make_rmem_tensor(score_SSA.shape, Float32)
+        scores.store(score_SSA)
+        for i in cutlass.range_constexpr(cute.size(scores.shape)):
+            soft_sign = cute.arch.rcp_approx(1.0 + cute.math.absf(scores[i]) * inv_cap)
+            grads[i] = grads[i] * (soft_sign * soft_sign)
+        return grads.load()
+
+    return scoremod_bwd_fn
+
+
+def create_cap_scoremods(cap, cap_method):
+    if cap is None or cap <= 0.0 or cap_method == "none":
+        return None, None
+    if cap_method == "tanh":
+        return create_softcap_scoremod(cap), create_softcap_scoremod_bwd(cap)
+    if cap_method == "soft_sign":
+        return create_softsign_scoremod(cap), create_softsign_scoremod_bwd(cap)
+    raise ValueError(f"cap_method must be one of [tanh, soft_sign, none], got {cap_method!r}")
 
 
 LOG2_E = math.log2(math.e)
@@ -666,10 +713,10 @@ def ex2_emulation_2(
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = quack_activation.sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = quack_activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)

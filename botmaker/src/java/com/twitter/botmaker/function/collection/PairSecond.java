@@ -47,7 +47,7 @@ public class PairSecond extends FunctionNode1<Runtime, Pair> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(Context<Runtime> context, Pair pair) {
     return pair.getSecond();
   }

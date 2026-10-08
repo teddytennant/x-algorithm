@@ -26,3 +26,7 @@ class SafetyPtosMode(str, Enum):
     @property
     def is_deluxe(self) -> bool:
         return self is SafetyPtosMode.DELUXE
+
+    @property
+    def graceful_classify_errors(self) -> bool:
+        return self is not SafetyPtosMode.BACKFILL

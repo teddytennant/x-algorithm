@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 X.AI Corp.
+[package]
+edition.workspace = true
+name = "xai-recsys-sid-retrieval-proto"
+version = "0.1.0"
+
+[dependencies]
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

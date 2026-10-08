@@ -14,6 +14,7 @@ pub mod copy_manifest;
 pub mod copy_port_client;
 pub mod emb_table;
 pub mod grpc_compression;
+pub mod grpc_server_latency;
 pub mod grpc_util;
 pub mod host_buffer;
 #[cfg(target_os = "linux")]

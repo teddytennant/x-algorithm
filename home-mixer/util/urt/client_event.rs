@@ -15,6 +15,7 @@ const ADS_INJECTION_TYPE_FOLLOWING: &str = "FollowingPromoted";
 const COMPONENT_ADS_RANKED_FOLLOWING: &str = "ranked_following_promoted";
 const ADS_INJECTION_TYPE_RANKED_FOLLOWING: &str = "RankedFollowingPromoted";
 const WTF_INJECTION_TYPE: &str = "WhoToFollow";
+const COMPONENT_VIDEO_CAROUSEL: &str = "video_carousel";
 
 pub(super) fn served_type_component(st: i32) -> String {
     ServedType::try_from(st)
@@ -67,6 +68,30 @@ pub(super) fn post_client_event_info(
     ClientEventInfo {
         component: Some(component.to_string()),
         element: Some(ELEMENT_TWEET.to_string()),
+        details: Some(details),
+        action: None,
+        entity_token: None,
+    }
+}
+
+pub(super) fn video_carousel_item_client_event_info(
+    video: &ScoredPost,
+    position: i32,
+) -> ClientEventInfo {
+    post_client_event_info(COMPONENT_VIDEO_CAROUSEL, video, position)
+}
+
+pub(super) fn video_carousel_module_client_event_info() -> ClientEventInfo {
+    let mut details = empty_details();
+    details.timelines_details = Some(TimelinesDetails {
+        injection_type: Some(upper_snake_to_pascal(COMPONENT_VIDEO_CAROUSEL)),
+        controller_data: None,
+        source_data: None,
+    });
+
+    ClientEventInfo {
+        component: Some(COMPONENT_VIDEO_CAROUSEL.to_string()),
+        element: None,
         details: Some(details),
         action: None,
         entity_token: None,

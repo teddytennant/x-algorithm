@@ -23,6 +23,23 @@ pub struct Cli {
     )]
     pub bootstrap: String,
 
+    #[arg(long, value_enum, default_value_t = KafkaAuthMode::Scram, env = "KAFKA_AUTH")]
+    pub kafka_auth: KafkaAuthMode,
+
+    #[arg(long, env = "KAFKA_CLUSTER")]
+    pub kafka_cluster: Option<String>,
+
+    #[arg(long, env = "KAFKA_ZONE")]
+    pub kafka_zone: Option<String>,
+
+    #[arg(
+        long,
+        default_value = "latest",
+        value_parser = ["latest", "earliest"],
+        env = "KAFKA_AUTO_OFFSET_RESET"
+    )]
+    pub auto_offset_reset: String,
+
     #[arg(long, default_value_t = 12, env = "SEEK_HOURS")]
     pub seek_hours: u64,
 
@@ -98,6 +115,19 @@ impl Cli {
         }
         self.pipeline.default_topic()
     }
+
+    pub fn mtls_cluster(&self) -> anyhow::Result<&str> {
+        self.kafka_cluster
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--kafka-cluster is required with --kafka-auth=mtls"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KafkaAuthMode {
+    Scram,
+    Mtls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
@@ -146,6 +176,8 @@ impl PipelineKind {
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 30),
                 WindowConfig::new("32fav", 24),
+                WindowConfig::new("1fav_reply", 24),
+                WindowConfig::new("32fav_reply", 24),
                 WindowConfig::new("video", 48),
                 WindowConfig::new("video", 96),
                 WindowConfig::new("video", 168),
@@ -172,6 +204,7 @@ impl PipelineKind {
             ],
             Self::Sid => vec![
                 WindowConfig::new("1fav", 24),
+                WindowConfig::new("1fav_reply", 24),
                 WindowConfig::new("1fav_video", 48),
                 WindowConfig::bounded("1fav_video", 24 * 2, 24 * 4),
                 WindowConfig::bounded("1fav_video", 24 * 4, 24 * 14),
@@ -277,7 +310,7 @@ mod tests {
         assert!(names.contains(&"1fav_video_4to30day".to_string()));
         assert!(names.contains(&"1fav_video_2day".to_string()));
         assert!(names.contains(&"1fav_video_2to4day".to_string()));
-        assert_eq!(configs.len(), 17);
+        assert_eq!(configs.len(), 19);
     }
 
     #[test]
@@ -414,5 +447,59 @@ mod tests {
                 "unexpected imagine window {unexpected} in Sid list: {names:?}",
             );
         }
+    }
+
+    const BASE_ARGS: [&str; 7] = [
+        "xai-recsys-rankall",
+        "--pipeline",
+        "main",
+        "--group",
+        "g",
+        "--output-dir",
+        "/tmp/out",
+    ];
+
+    #[test]
+    fn kafka_auth_defaults_to_scram_on_main_2() {
+        let cli = Cli::try_parse_from(BASE_ARGS).unwrap();
+        assert_eq!(cli.kafka_auth, KafkaAuthMode::Scram);
+        assert_eq!(cli.bootstrap, "/s/kafka/main-2:kafka-tls");
+        assert_eq!(cli.auto_offset_reset, "latest");
+        assert!(cli.kafka_cluster.is_none());
+    }
+
+    #[test]
+    fn kafka_auth_mtls_takes_cluster_and_zone() {
+        let args = BASE_ARGS.iter().copied().chain([
+            "--kafka-auth",
+            "mtls",
+            "--kafka-cluster",
+            "phoenix",
+            "--kafka-zone",
+            "atla",
+            "--auto-offset-reset",
+            "earliest",
+        ]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.kafka_auth, KafkaAuthMode::Mtls);
+        assert_eq!(cli.mtls_cluster().unwrap(), "phoenix");
+        assert_eq!(cli.kafka_zone.as_deref(), Some("atla"));
+        assert_eq!(cli.auto_offset_reset, "earliest");
+    }
+
+    #[test]
+    fn kafka_auth_mtls_requires_cluster() {
+        let args = BASE_ARGS.iter().copied().chain(["--kafka-auth", "mtls"]);
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.mtls_cluster().is_err());
+    }
+
+    #[test]
+    fn auto_offset_reset_rejects_unknown_values() {
+        let args = BASE_ARGS
+            .iter()
+            .copied()
+            .chain(["--auto-offset-reset", "smallest"]);
+        assert!(Cli::try_parse_from(args).is_err());
     }
 }

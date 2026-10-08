@@ -6,6 +6,7 @@ use backon::Retryable;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tracing::{info, warn};
+#[allow(deprecated)]
 use xai_strato::Strato;
 
 use crate::allowlist::ManhattanAllowlist;
@@ -15,11 +16,13 @@ use crate::gizmoduck::GizmoduckCoreClient;
 use crate::service::{record_strato_metrics, strato_retry_strategy};
 
 #[derive(Clone)]
+#[allow(deprecated)]
 pub struct CredClients {
     pub high_page_rank: Arc<Strato>,
     pub grey_badge: Arc<Strato>,
 }
 
+#[allow(deprecated)]
 async fn strato_fetch<K, V, T>(
     strato: &Strato,
     key: K,
@@ -138,12 +141,14 @@ pub fn compose_cred(hpr: HighPageRankUser, is_grey_badge: bool) -> CredFacts {
     }
 }
 
+#[allow(deprecated)]
 async fn fetch_hpr_column(strato: &Strato, user_id: i64) -> Result<HighPageRankUser> {
     Ok(strato_fetch(strato, user_id, None::<()>, "high_page_rank")
         .await?
         .unwrap_or_default())
 }
 
+#[allow(deprecated)]
 async fn fetch_grey_column(strato: &Strato, user_id: i64) -> Result<bool> {
     Ok(
         strato_fetch::<_, (), bool>(strato, user_id, None::<()>, "grey_badge")
@@ -181,6 +186,7 @@ pub async fn fetch_cred(clients: &CredClients, user_id: i64) -> Result<CredFacts
 }
 
 #[tracing::instrument(skip(uas_strato), fields(result))]
+#[allow(deprecated)]
 pub async fn fetch_uas(uas_strato: &Strato, user_id: i64) -> Option<String> {
     let resp: Result<Option<serde_json::Value>> =
         strato_fetch(uas_strato, user_id, None::<()>, "uas").await;

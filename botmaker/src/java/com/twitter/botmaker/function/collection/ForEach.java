@@ -150,7 +150,7 @@ public abstract class ForEach extends ASTNode<Runtime> {
     Future<List<Object>> currentCollectedObjectsFuture = Future.collect(batchFuturesList)
         .map(thisBatchObjects -> combine(previousCollectedObjects, thisBatchObjects));
 
-    if (remainingElements == elementsThisRound) { 
+    if (remainingElements == elementsThisRound) {
       return currentCollectedObjectsFuture;
     }
 

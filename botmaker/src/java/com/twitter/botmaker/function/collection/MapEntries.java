@@ -51,7 +51,7 @@ public class MapEntries extends FunctionNode1<Runtime, Map> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(Context<Runtime> context, Map map) {
     ImmutableSet.Builder builder = ImmutableSet.builder();
     for (Map.Entry entry : (Set<Map.Entry>) map.entrySet()) {

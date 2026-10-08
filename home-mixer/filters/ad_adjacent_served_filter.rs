@@ -1,7 +1,9 @@
+use crate::ads::drops::{blocked_ad, dropped_ad};
 use crate::ads::util::{has_avoid, should_drop_bsr_low, should_drop_handle, should_drop_keyword};
 use crate::models::query::ScoredPostsQuery;
 use crate::params::EnableAdAdjacentServedFilter;
 use std::collections::HashSet;
+use xai_ads_injection_proto::ads_injected_timeline::{AdDropReason, DroppedAd};
 use xai_candidate_pipeline::component_library::utils::client_utils::RequestContext;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 use xai_home_mixer_proto::{feed_item, FeedItem, ScoredPost};
@@ -72,6 +74,7 @@ impl Filter<ScoredPostsQuery, FeedItem> for AdAdjacentServedFilter {
         let total_ads = candidates.iter().filter_map(as_ad).count() as u64;
         let mut items = candidates;
         let mut removed: Vec<FeedItem> = Vec::new();
+        let mut drops: Vec<DroppedAd> = Vec::new();
         let mut insert_count: u64 = 0;
         let mut drop_count: u64 = 0;
         let mut acted_ad_ids: HashSet<i64> = HashSet::new();
@@ -87,6 +90,15 @@ impl Filter<ScoredPostsQuery, FeedItem> for AdAdjacentServedFilter {
                 }
                 None => {
                     emit_swap_failure(classify_swap_failure(&items, ad_idx, &served));
+                    let neighbour_idx = match side {
+                        Side::Above => ad_idx - 1,
+                        Side::Below => ad_idx + 1,
+                    };
+                    if let (Some(ad), Some(post)) =
+                        (as_ad(&items[ad_idx]), as_post(&items[neighbour_idx]))
+                    {
+                        drops.push(blocked_ad(ad, AdDropReason::ServedNeighbour, post.tweet_id));
+                    }
                     removed.push(items.remove(ad_idx));
                     drop_count += 1;
                 }
@@ -100,6 +112,9 @@ impl Filter<ScoredPostsQuery, FeedItem> for AdAdjacentServedFilter {
             while items.first().is_some_and(is_ad) {
                 removed.push(items.remove(0));
             }
+            let trimmed = removed[drop_count as usize..].iter().filter_map(as_ad);
+            drops.extend(trimmed.map(|ad| dropped_ad(ad, AdDropReason::Truncated)));
+            query.ad_drops.extend(drops);
         }
 
         if insert_count > 0 || !removed.is_empty() {
@@ -732,6 +747,10 @@ mod tests {
             "fallback must never drop an organic post"
         );
         assert_eq!(kept_post_ids(&result.kept), vec![1, 2, 3]);
+        let drops = query.ad_drops.take();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].drop_reason(), AdDropReason::ServedNeighbour);
+        assert_eq!(drops[0].blocking_tweet_id, 1);
     }
 
     #[test]

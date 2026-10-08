@@ -1,4 +1,3 @@
-
 #include "nanobind/nanobind.h"
 #include "top_k_by_key_kernel.hpp"
 

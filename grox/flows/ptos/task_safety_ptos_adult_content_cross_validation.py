@@ -2,6 +2,7 @@ import logging
 from enum import Enum
 
 from grox.core.data_loaders.data_types import Post
+from grox.core.lm.post import PostRenderer
 from grox.core.schedules.types import TaskContext
 from grox.core.tasks.task import Task, TaskResultCategory, TaskWithPost
 from grox.flows.ptos.classifier import SafetyPtosAdultContentCrossValidationJudge
@@ -36,6 +37,18 @@ class CompareOutcome(str, Enum):
             CompareOutcome.PTOS_ONLY_POSITIVE,
         )
 
+    @classmethod
+    def from_signals(
+        cls, safemodel_positive: bool, ptos_positive: bool
+    ) -> "CompareOutcome":
+        if safemodel_positive and ptos_positive:
+            return cls.BOTH_POSITIVE
+        if not safemodel_positive and not ptos_positive:
+            return cls.BOTH_NEGATIVE
+        if safemodel_positive:
+            return cls.SAFEMODEL_ONLY_POSITIVE
+        return cls.PTOS_ONLY_POSITIVE
+
 
 class TaskSafetyPtosAdultContentCrossValidation(TaskWithPost):
     _judge = SafetyPtosAdultContentCrossValidationJudge()
@@ -52,12 +65,20 @@ class TaskSafetyPtosAdultContentCrossValidation(TaskWithPost):
 
     @classmethod
     async def _run(cls, ctx: TaskContext, post: Post) -> None:
-        state = ctx.state(SafetyPtosState)
-        if not state.safemodel_sex_nudity.scored:
+        if ctx.payload.task_type not in DELUXE_TIER_TASK_TYPES:
+            return
+        if not PostRenderer.has_media(post):
+            Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
+                1, attributes={"reason": "no_media"}
+            )
+            return
+        if await post_is_already_flagged_nsfw(ctx, post):
+            Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
+                1, attributes={"reason": "prior_nsfw"}
+            )
             return
 
-        is_deluxe = ctx.payload.task_type in DELUXE_TIER_TASK_TYPES
-        flow = "deluxe" if is_deluxe else "standard"
+        state = ctx.state(SafetyPtosState)
         safemodel_positive = state.safemodel_sex_nudity.positive
         violations = (
             (state.annotations.violatedPolicies or []) if state.annotations else []
@@ -69,34 +90,17 @@ class TaskSafetyPtosAdultContentCrossValidation(TaskWithPost):
             for v in violations
         )
 
-        outcome = cls._compare_outcome(safemodel_positive, ptos_positive)
+        outcome = CompareOutcome.from_signals(safemodel_positive, ptos_positive)
         Metrics.counter(f"{_METRIC_PREFIX}.compare.count").add(
-            1, attributes={"outcome": outcome.value, "flow": flow}
+            1, attributes={"outcome": outcome.value}
         )
+        if not outcome.is_disagreement:
+            return
         logger.info(
-            f"Post {post.id} ({flow}): safemodel={'positive' if safemodel_positive else 'negative'} "
+            f"Post {post.id}: safemodel={'positive' if safemodel_positive else 'negative'} "
             f"ptos={'positive' if ptos_positive else 'negative'} outcome={outcome.value}"
         )
-
-        if is_deluxe and outcome.is_disagreement:
-            if await post_is_already_flagged_nsfw(ctx, post):
-                Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
-                    1, attributes={"reason": "prior_nsfw"}
-                )
-                return
-            await cls._cross_validate(ctx, post)
-
-    @staticmethod
-    def _compare_outcome(
-        safemodel_positive: bool, ptos_positive: bool
-    ) -> CompareOutcome:
-        if safemodel_positive and ptos_positive:
-            return CompareOutcome.BOTH_POSITIVE
-        if not safemodel_positive and not ptos_positive:
-            return CompareOutcome.BOTH_NEGATIVE
-        if safemodel_positive:
-            return CompareOutcome.SAFEMODEL_ONLY_POSITIVE
-        return CompareOutcome.PTOS_ONLY_POSITIVE
+        await cls._cross_validate(ctx, post)
 
     @classmethod
     async def _cross_validate(cls, ctx: TaskContext, post: Post) -> None:

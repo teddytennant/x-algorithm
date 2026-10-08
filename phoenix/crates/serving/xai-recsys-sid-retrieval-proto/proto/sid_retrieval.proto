@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 X.AI Corp.
+syntax = "proto3";
+
+package sid_retrieval;
+
+service SidRetrievalService {
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+}
+
+message RetrieveRequest {
+  repeated int64 seed_post_ids = 1;
+  uint32 max_results = 2;
+  uint32 max_per_seed = 3;
+  uint32 min_prefix_depth = 4;
+  uint32 max_prefix_depth = 5;
+  string caller = 6;
+}
+
+message RetrieveResponse {
+  repeated Candidate candidates = 1;
+  repeated Seed seeds = 2;
+  int64 snapshot_timestamp_secs = 3;
+  uint64 index_posts = 4;
+}
+
+message Candidate {
+  int64 post_id = 1;
+  int64 author_id = 2;
+  int64 seed_post_id = 3;
+  uint32 shared_prefix_depth = 4;
+}
+
+enum SeedSidSource {
+  SEED_SID_SOURCE_UNSPECIFIED = 0;
+  SEED_SID_SOURCE_INDEX = 1;
+  SEED_SID_SOURCE_SID_SERVICE = 2;
+  SEED_SID_SOURCE_MISSING = 3;
+}
+
+message Seed {
+  int64 post_id = 1;
+  repeated int32 codes = 2;
+  SeedSidSource sid_source = 3;
+  uint32 num_candidates = 4;
+}

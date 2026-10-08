@@ -217,10 +217,6 @@ fn insert_cluster_scores(
         ("pdwell", s.post_unexplored_score),
         ("dwell_time", s.dwell_time),
         ("click_dwell_time", s.click_dwell_time),
-        (
-            "active_secs_5m_residual_norm",
-            s.active_secs_5m_residual_norm,
-        ),
     ];
     for (name, score) in score_fields {
         if let Some(value) = score {

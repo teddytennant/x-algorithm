@@ -72,7 +72,7 @@ public abstract class Constant extends ASTNode<Runtime> {
   private Constant(String exprText, Object value) throws SemanticCheckFailure {
     super(exprText, ImmutableList.of());
     this.value = value;
-    this.futureValue = Future.value(value); 
+    this.futureValue = Future.value(value);
   }
 
   public static Constant of(String exprText, Long longValue) throws SemanticCheckFailure {

@@ -43,10 +43,10 @@ from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
-from quack import copy_utils, layout_utils, sm90_utils
-from quack.cute_dsl_utils import ParamsBase
-from quack.sm90_utils import gemm_w_idx, gemm_zero_init
 
+from xrex.cutedsl.quack import copy_utils, layout_utils, sm90_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
+from xrex.cutedsl.quack.sm90_utils import gemm_w_idx, gemm_zero_init
 from xrex.cutedsl.ranker_fa4 import barrier, pipeline, utils
 from xrex.cutedsl.ranker_fa4.block_info import BlockInfo
 from xrex.cutedsl.ranker_fa4.block_sparse_utils import (

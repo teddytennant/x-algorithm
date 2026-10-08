@@ -55,6 +55,7 @@ fn build_ad_index_request(query: &ScoredPostsQuery) -> AdIndexRequest {
         user_id: query.user_id as i64,
         product_surface: product_surface as i32,
         dsp_client_context,
+        client_seen_post_ids: query.seen_ids.iter().map(|&id| id as i64).collect(),
         client_context: Some(ClientContext {
             user_id: query.user_id as i64,
             app_id: query.client_app_id as i64,
@@ -92,6 +93,19 @@ mod tests {
             ..Default::default()
         };
         assert!(!ads_source().enable(&query));
+    }
+
+    #[test]
+    fn forwards_seen_ids_into_ad_index_request() {
+        let query = ScoredPostsQuery {
+            user_id: 42,
+            seen_ids: vec![7, 9],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_ad_index_request(&query).client_seen_post_ids,
+            vec![7, 9]
+        );
     }
 
     #[test]

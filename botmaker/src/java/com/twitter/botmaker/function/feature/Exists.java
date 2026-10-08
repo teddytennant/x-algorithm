@@ -21,7 +21,7 @@ public abstract class Exists extends ASTNode<Runtime> {
   private final String inputFeatureName;
 
   private Exists(String exprText, String inputFeatureName) throws SemanticCheckFailure {
-    super(exprText, ImmutableList.of()); 
+    super(exprText, ImmutableList.of());
     this.inputFeatureName = inputFeatureName;
   }
 

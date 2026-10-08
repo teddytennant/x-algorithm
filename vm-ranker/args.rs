@@ -32,4 +32,25 @@ pub struct Args {
 
     #[arg(long, default_value_t = false)]
     pub enable_profiling: bool,
+
+    #[arg(long, default_value_t = false)]
+    pub config_sync_enabled: bool,
+
+    #[arg(long, default_value = "https://config-git.twitter.biz/ro/config")]
+    pub config_sync_remote: String,
+
+    #[arg(long, default_value = "master")]
+    pub config_sync_branch: String,
+
+    #[arg(long, default_value = "/var/lib/vm-ranker/config")]
+    pub config_sync_root: std::path::PathBuf,
+
+    #[arg(long, default_value_t = 30)]
+    pub config_sync_interval_secs: u64,
+
+    #[arg(long, default_value_t = 300)]
+    pub config_sync_initial_timeout_secs: u64,
+
+    #[arg(long)]
+    pub fs_impressions_datacenter: Option<String>,
 }

@@ -23,6 +23,9 @@ from grox.core.data_loaders.strato_loader import UserStratoLoader
 from strato_http.queries.data_types import (
     ReplyRankingScore,
 )
+from grox.flows.reply_spam.constants import (
+    RISKY_HIGH_VIZ_REPLY_EXEMPT_MIN_PAGE_RANK_SCORE,
+)
 from grox.flows.reply_spam.strato_loader import ReplyRankingScoreStratoLoader
 
 
@@ -33,6 +36,15 @@ _strato_apply_label_from_grox = StratoApplyLabelFromGrox()
 _strato_is_test_user = StratoIsTestUser()
 
 
+async def _is_label_exempt_high_page_rank(author_id: int) -> bool:
+    info = await UserStratoLoader.fetch_high_page_rank_v2(author_id)
+    if info is None:
+        return False
+    if info.userCredScore is None:
+        return info.isHighPageRankUser
+    return info.userCredScore >= RISKY_HIGH_VIZ_REPLY_EXEMPT_MIN_PAGE_RANK_SCORE
+
+
 async def _apply_reply_spam_label(post_id: str, author_id: int | None) -> None:
     if author_id is None:
         Metrics.counter("task.apply_label_from_grox.skipped.count").add(
@@ -40,7 +52,7 @@ async def _apply_reply_spam_label(post_id: str, author_id: int | None) -> None:
         )
         return
     is_high_page_rank, is_grey_badge = await asyncio.gather(
-        UserStratoLoader.is_high_page_rank_v2_user(author_id),
+        _is_label_exempt_high_page_rank(author_id),
         UserStratoLoader.is_grey_badge_user(author_id),
     )
     if is_high_page_rank or is_grey_badge:

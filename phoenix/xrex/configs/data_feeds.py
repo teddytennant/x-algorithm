@@ -49,6 +49,13 @@ SID_GLOBAL_IDS_SNAPSHOT = (
     if settings.SID_GLOBAL_IDS_SNAPSHOT
     else _SID_GLOBAL_IDS_PLACEHOLDER
 )
+SID_VIDEO_GLOBAL_IDS_PLACEHOLDER = "/path/to/post_sid_video_global_ids.parquet"
+_SID_VIDEO_GLOBAL_IDS_PLACEHOLDER = Path(SID_VIDEO_GLOBAL_IDS_PLACEHOLDER)
+SID_VIDEO_GLOBAL_IDS_SNAPSHOT = (
+    Path(settings.SID_VIDEO_GLOBAL_IDS_SNAPSHOT)
+    if settings.SID_VIDEO_GLOBAL_IDS_SNAPSHOT
+    else _SID_VIDEO_GLOBAL_IDS_PLACEHOLDER
+)
 
 _RANKING_DUMP_PATH = settings.RANKING_DUMP_PATH
 _RETRIEVAL_DUMP_PATH = settings.RETRIEVAL_DUMP_PATH
@@ -63,6 +70,8 @@ GROUP_IDS: dict[str, str] = {
     "xrecsys_two_tower": "user_action_sequence_xrecsys_two_tower",
     "xrecsys_two_tower_combined": "user_action_sequence_xrecsys_two_tower_combined",
     "xrecsys_two_tower_combined_gb300": "user_action_sequence_xrecsys_two_tower_combined",
+    "xrecsys_two_tower_immersive_only": "user_action_sequence_xrecsys_two_tower_immersive_only",
+    "xrecsys_two_tower_immersive_only_gb300": "user_action_sequence_xrecsys_two_tower_immersive_only",
     "xrecsys_two_tower_nano": "user_action_sequence_xrecsys_two_tower_nano",
     "xrecsys_sid_gen_rec": "sid_gen_rec",
 }
@@ -99,6 +108,8 @@ def _group_id(config_name: str) -> str:
 def resolve_global_ids_file_path(global_ids_file_path: Path | None) -> Path | None:
     if global_ids_file_path == _SID_GLOBAL_IDS_PLACEHOLDER:
         return SID_GLOBAL_IDS_SNAPSHOT
+    if global_ids_file_path == _SID_VIDEO_GLOBAL_IDS_PLACEHOLDER:
+        return SID_VIDEO_GLOBAL_IDS_SNAPSHOT
     return global_ids_file_path
 
 
@@ -124,6 +135,8 @@ def _ranking_aggregated_kafka(mparams, hash_table, use_post_sid, sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ads_head_masking=mparams.get("ads_head_masking", False),
+        search_negative_clear_word_match=mparams.get("search_negative_clear_word_match", False),
     )
 
 
@@ -150,6 +163,7 @@ def _ranking_rust_kafka(mparams, hash_table, use_post_sid, sid_num_levels, confi
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
         exclude_required_columns=mparams.get("exclude_required_columns", ""),
+        ads_head_masking=mparams.get("ads_head_masking", False),
     )
 
 
@@ -180,6 +194,7 @@ def _ranking_kafka_dispatcher(mparams, hash_table, use_post_sid, sid_num_levels,
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
+        ads_head_masking=mparams.get("ads_head_masking", False),
     )
 
 
@@ -200,6 +215,7 @@ def _ranking_offline_kafka_dump(mparams, hash_table, use_post_sid, sid_num_level
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
+        ads_head_masking=mparams.get("ads_head_masking", False),
     )
 
 
@@ -220,6 +236,7 @@ def _ranking_rust_parquet(mparams, hash_table, use_post_sid, sid_num_levels, con
         sid_num_levels=sid_num_levels,
         compute_post_unexplored_label=mparams.get("compute_post_unexplored_label", False),
         enable_stale_post=mparams.get("enable_stale_post", False),
+        ads_head_masking=mparams.get("ads_head_masking", False),
     )
 
 
@@ -244,6 +261,7 @@ def _ranking_grpc_recsys(mparams, hash_table, use_post_sid, sid_num_levels, conf
         multimodal_embedding_type=mparams.get("multimodal_embedding_type"),
         use_post_sid=use_post_sid,
         sid_num_levels=sid_num_levels,
+        ads_head_masking=mparams.get("ads_head_masking", False),
     )
 
 

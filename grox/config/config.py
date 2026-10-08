@@ -118,6 +118,16 @@ class MediaHydrationConfig(BaseModel):
     deluxe_video_max_frames: int = 30
     deluxe_video_tile_size: int = 600
     deluxe_image_tile_size: int = 600
+    use_key_frames: bool = False
+    shot_key_frames_window_seconds: float = 3.0
+    shot_key_frames_max_fps: float = 15.0
+    shot_key_frames_max: int = 3
+    key_frames_video_max_frames: int = 0
+    embedding_ranked_key_frames: bool = False
+    embedding_ranked_key_frames_max_seconds: float = 5.0
+    embedding_ranked_key_frames_model: str = "recsys-v5-embedding"
+    embedding_ranked_key_frames_embed_size: int = 336
+    embedding_ranked_key_frames_min_score: float | None = None
 
 
 class GroxKafkaLoaderConfig(BaseModel):

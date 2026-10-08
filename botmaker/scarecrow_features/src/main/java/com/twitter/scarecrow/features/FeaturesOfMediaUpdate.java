@@ -105,7 +105,7 @@ public class FeaturesOfMediaUpdate extends FeatureMapExtractor {
               highRecall = true;
             }
           }
-          String featureKeySuffix = ("xx".equals(tagLabel.toLowerCase())) ? 
+          String featureKeySuffix = ("xx".equals(tagLabel.toLowerCase())) ?
             "Nsfw" : tagLabel;
           builder.putValue(OPTIONAL, HIGH_PRECISION_FEATURE_KEY + featureKeySuffix, highPrecision);
           builder.putValue(OPTIONAL, HIGH_RECALL_FEATURE_KEY + featureKeySuffix, highRecall);

@@ -38,7 +38,8 @@ from typing import Callable, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
-from quack import copy_utils
+
+from xrex.cutedsl.quack import copy_utils
 
 from xrex.cutedsl.ranker_fa4.block_sparsity import BlockSparseTensors
 from xrex.cutedsl.ranker_fa4.named_barrier import NamedBarrierBwd

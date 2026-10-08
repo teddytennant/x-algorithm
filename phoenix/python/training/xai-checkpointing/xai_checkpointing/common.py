@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
 import functools
+import os
 import queue
 import time
 from typing import TypeVar
@@ -12,6 +13,35 @@ from jax.sharding import PartitionSpec as P
 
 T = TypeVar("T")
 PyTree = dict[str, "PyTree[T]"] | list["PyTree[T]"] | T | None
+
+
+@functools.cache
+def _affinity_numa_node() -> int | None:
+    try:
+        cpus = os.sched_getaffinity(0)
+        nodes = set()
+        for entry in os.listdir("/sys/devices/system/node"):
+            if not (entry.startswith("node") and entry[4:].isdigit()):
+                continue
+            with open(f"/sys/devices/system/node/{entry}/cpulist") as f:
+                cpulist = f.read().strip()
+            node_cpus = set()
+            for part in filter(None, cpulist.split(",")):
+                lo, _, hi = part.partition("-")
+                node_cpus.update(range(int(lo), int(hi or lo) + 1))
+            if cpus & node_cpus:
+                nodes.add(int(entry[4:]))
+    except (OSError, ValueError):
+        return None
+    return nodes.pop() if len(nodes) == 1 else None
+
+
+def node_lock_path(base: str, scope_env: str) -> str:
+    if os.getenv(scope_env, "node").lower() == "numa":
+        node = _affinity_numa_node()
+        if node is not None:
+            return f"{base}.numa{node}"
+    return base
 
 
 def _ready(futures, timeout, q=queue.SimpleQueue()):

@@ -1,0 +1,15 @@
+query UserUnderTheHoodReport {
+  user_under_the_hood_report(safety_level: FilterAll) {
+    report_json
+    report_info {
+      report_period
+      eligibility_checks {
+        key
+        value
+      }
+      note {
+        ...TimelineRichText
+      }
+    }
+  }
+}

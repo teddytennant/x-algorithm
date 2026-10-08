@@ -35,7 +35,7 @@ public final class Parser {
       String extraMsg = "";
       if (e.getCause() instanceof RecognitionException) {
         RecognitionException re = (RecognitionException) e.getCause();
-        if (re.token != null) { 
+        if (re.token != null) {
           String unexpectedTok = "<EOF>";
           if (re.getUnexpectedType() >= 0) {
             unexpectedTok = BotMakerParser.tokenNames[re.getUnexpectedType()];
@@ -45,7 +45,7 @@ public final class Parser {
               re.token.getLine(), re.token.getCharPositionInLine() + 1,
               re.token.getText(), unexpectedTok
           );
-        } else if (re.line != 0) { 
+        } else if (re.line != 0) {
           extraMsg = String.format(": line %d col %d", re.line, re.charPositionInLine + 1);
         }
       }
@@ -83,7 +83,7 @@ public final class Parser {
       String extraMsg = "";
       if (e.getCause() instanceof RecognitionException) {
         RecognitionException re = (RecognitionException) e.getCause();
-        if (re.token != null) { 
+        if (re.token != null) {
           String unexpectedTok = "<EOF>";
           if (re.getUnexpectedType() >= 0) {
             unexpectedTok = BotMakerParser.tokenNames[re.getUnexpectedType()];
@@ -93,7 +93,7 @@ public final class Parser {
               re.token.getLine(), re.token.getCharPositionInLine() + 1,
               re.token.getText(), unexpectedTok
           );
-        } else if (re.line != 0) { 
+        } else if (re.line != 0) {
           extraMsg = String.format(": line %d col %d", re.line, re.charPositionInLine + 1);
         }
       }

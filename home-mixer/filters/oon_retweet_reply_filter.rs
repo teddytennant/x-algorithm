@@ -1,5 +1,7 @@
+use crate::candidate_hydrators::phoenix_reply_ancestors_hydrator::is_phoenix_home_retrieval;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
+use crate::params::EnablePhoenixOonReplies;
 use xai_candidate_pipeline::filter::{Filter, FilterResult};
 
 pub struct OONRetweetReplyFilter;
@@ -7,13 +9,16 @@ pub struct OONRetweetReplyFilter;
 impl Filter<ScoredPostsQuery, PostCandidate> for OONRetweetReplyFilter {
     fn filter(
         &self,
-        _query: &ScoredPostsQuery,
+        query: &ScoredPostsQuery,
         candidates: Vec<PostCandidate>,
     ) -> FilterResult<PostCandidate> {
+        let allow_phoenix_oon_replies = query.params.get(EnablePhoenixOonReplies);
         let (removed, kept): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| {
             let is_reply = c.in_reply_to_tweet_id.is_some();
             let is_retweet = c.retweeted_tweet_id.is_some();
-            (c.in_network == Some(false) && (is_retweet || is_reply))
+            let oon_reply_dropped =
+                is_reply && !(allow_phoenix_oon_replies && is_phoenix_home_retrieval(c));
+            (c.in_network == Some(false) && (is_retweet || oon_reply_dropped))
                 || (is_reply && c.ancestors.is_empty())
         });
 

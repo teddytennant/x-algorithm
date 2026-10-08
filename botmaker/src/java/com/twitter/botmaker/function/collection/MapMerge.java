@@ -57,7 +57,7 @@ public class MapMerge extends FunctionNode<Runtime> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(Context<Runtime> context, List<Object> args) {
     HashMap result = Maps.newHashMap();
     for (Object arg : args) {

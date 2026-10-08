@@ -2901,6 +2901,15 @@ impl RecsysRetrievalPredictorImpl {
 impl pb::recsys_retrieval_predictor_server::RecsysRetrievalPredictor
     for RecsysRetrievalPredictorImpl
 {
+    async fn score_posts(
+        &self,
+        _request: Request<pb::ScorePostsRequest>,
+    ) -> tonic::Result<Response<pb::ScorePostsResponse>> {
+        Err(Status::unimplemented(
+            "post action scores are served by the Rust host only",
+        ))
+    }
+
     async fn retrieve_top_k_candidates(
         &self,
         request: Request<pb::RetrieveTopKCandidatesRequest>,

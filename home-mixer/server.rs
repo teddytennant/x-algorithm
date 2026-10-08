@@ -52,7 +52,9 @@ pub struct RequestContext {
 
 pub(crate) struct PipelineOutput {
     pub scored_posts: Vec<ScoredPost>,
+    pub video_carousel: Option<pb::VideoCarouselModule>,
     pub pipeline_result: PipelineResult<ScoredPostsQuery, PostCandidate>,
+    pub pipeline_trace: Option<pb::PipelineTrace>,
 }
 
 pub struct HomeMixerConfig {
@@ -157,6 +159,8 @@ impl QueryBuilder {
         query.request_type = request_type;
         query.resurrection_time_ms = resurrection_time_ms;
         query.fs_recipient_inputs = Some(fs_recipient_inputs);
+        query.is_under_the_hood_request =
+            proto_query.is_under_the_hood_request && query.params.get(params::EnableUnderTheHood);
 
         query.dsp_client_context = proto_query.dsp_client_context;
 
@@ -312,6 +316,7 @@ impl pb::scored_posts_service_server::ScoredPostsService for ScoredPostsServer {
         let mut response = Response::new(DebugScoredPostsResponse {
             scored_posts: output.scored_posts,
             debug_json,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -349,6 +354,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)
@@ -444,6 +450,7 @@ impl pb::for_you_feed_service_server::ForYouFeedService for ForYouFeedServer {
 
         let mut response = Response::new(ForYouFeedResponse {
             items: output.items,
+            pipeline_trace: output.pipeline_trace,
         });
         b3_info.inject_trace_response_header(&mut response);
         Ok(response)

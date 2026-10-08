@@ -1,4 +1,5 @@
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::{type_name_of_val, Any};
@@ -36,8 +37,10 @@ where
         candidates: &[C],
         stage: PipelineStage,
     ) -> Vec<Result<C, String>> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         let hydrated = self.hydrate_for_stage(query, candidates, stage).await;
         let expected_len = candidates.len();
+        stats.finish_with_input(expected_len);
         if hydrated.len() == expected_len {
             hydrated
         } else {

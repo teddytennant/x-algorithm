@@ -2,6 +2,7 @@ use std::any::{type_name_of_val, Any};
 use tonic::async_trait;
 
 use crate::candidate_pipeline::{PipelineQuery, PipelineStage};
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use tracing::error;
@@ -17,8 +18,11 @@ where
 
     #[xai_stats_macro::receive_stats]
     #[tracing::instrument(level = SPAN_LEVEL, skip_all, name = "query_hydrator", fields(name = self.name()))]
-    async fn run(&self, query: &Q, _stage: PipelineStage) -> Result<Q, String> {
-        match self.hydrate(query).await {
+    async fn run(&self, query: &Q, stage: PipelineStage) -> Result<Q, String> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
+        let result = self.hydrate(query).await;
+        stats.finish();
+        match result {
             Ok(hydrated) => Ok(hydrated),
             Err(err) => {
                 error!("{} Failed: {}", self.name(), err);

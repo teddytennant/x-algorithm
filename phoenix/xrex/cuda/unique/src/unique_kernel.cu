@@ -1,4 +1,3 @@
-
 #include <thrust/adjacent_difference.h>
 #include <thrust/binary_search.h>
 #include <thrust/device_vector.h>

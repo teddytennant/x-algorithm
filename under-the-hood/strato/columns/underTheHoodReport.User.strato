@@ -12,6 +12,7 @@ type UthDayCount = com.twitter.visibility.under_the_hood.UthDayCount
 type UthUserMonthKey = com.twitter.visibility.under_the_hood.UthUserMonthKey
 type UthDaysIncluded = com.twitter.visibility.under_the_hood.UthDaysIncluded
 type User = com.twitter.gizmoduck.User
+type RichText = com.twitter.timelines.render.RichText
 
 val metadataUserId = -1L
 val minimumAccountAge = 365.days
@@ -33,9 +34,70 @@ val englishMonthNames = Seq(
   "November",
   "December",
 )
-val reportNotes =
-  "You can learn more about instances when a post’s reach may be limited by reading our open-source code at https://github.com/xai-org/x-algorithm and the guide at https://help.x.com/rules-and-policies/x-reach-limited. Learn more about account and post-level enforcement options here https://help.x.com/rules-and-policies/enforcement-options. " +
-    "This report is provided on a best-effort basis — the code that generates it is open-source: https://github.com/xai-org/x-algorithm/tree/main/under-the-hood"
+type RichTextEntity = com.twitter.timelines.render.RichTextEntity
+type NoteSpan = {
+  text: String,
+  url: Option[String]
+}
+type NoteBuild = {
+  text: String,
+  entities: Seq[RichTextEntity]
+}
+
+val noteSpans: Seq[NoteSpan] = Seq(
+  {
+    text = "You can learn more about instances when a post’s reach may be limited by reading our ",
+    url = None : Option[String],
+  },
+  { text = "open-source code", url = Some("https://github.com/xai-org/x-algorithm") },
+  { text = " and ", url = None : Option[String] },
+  { text = "guide", url = Some("https://help.x.com/rules-and-policies/x-reach-limited") },
+  {
+    text = ". Learn more about account and post-level ",
+    url = None : Option[String],
+  },
+  { text = "enforcement options", url = Some("https://help.x.com/rules-and-policies/enforcement-options") },
+  {
+    text = ". This report is provided on a best-effort basis — the code that generates it is ",
+    url = None : Option[String],
+  },
+  { text = "open-source", url = Some("https://github.com/xai-org/x-algorithm/tree/main/under-the-hood") },
+)
+
+val reportNoteString = noteSpans.foldLeft("") { (acc, span) =>
+  span.url match {
+    case Some(url) => acc + span.text + " (" + url + ")"
+    case None => acc + span.text
+  }
+}
+
+def linkEntity(fromIndex: Int, linkText: String, url: String): RichTextEntity = {
+  fromIndex = fromIndex,
+  toIndex = fromIndex + linkText.length,
+  ref = Some(Url({
+    url = url,
+    urlType = ExternalUrl,
+  })),
+}
+
+def reportNote(): RichText = {
+  val built = noteSpans.foldLeft[NoteBuild]({ text = "", entities = Seq.empty[RichTextEntity] }) { (acc, span) =>
+    span.url match {
+      case Some(url) => {
+        text = acc.text + span.text,
+        entities = acc.entities ++ Seq(linkEntity(acc.text.length, span.text, url)),
+      }
+      case None => {
+        text = acc.text + span.text,
+        entities = acc.entities,
+      }
+    }
+  }
+  {
+    text = built.text,
+    entities = built.entities,
+  }
+}
 
 val utcYyyyMm = TimeFormat.apply("yyyyMM").withZone("UTC")
 val utcYyyyMmDd = TimeFormat.apply("yyyy-MM-dd").withZone("UTC")
@@ -294,7 +356,7 @@ def buildReportJson(
 
   if (postLabels.isEmpty && accountLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -305,7 +367,7 @@ def buildReportJson(
     }.toJson
   } else if (postLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -315,7 +377,7 @@ def buildReportJson(
     }.toJson
   } else if (accountLabels.isEmpty) {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -325,7 +387,7 @@ def buildReportJson(
     }.toJson
   } else {
     {
-      notes = reportNotes,
+      notes = reportNoteString,
       period = period,
       generatedAt = formatGeneratedAtIso(generatedAtMs),
       postCount = postCount,
@@ -427,6 +489,7 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
                 postsCheckLabel -> false,
                 ageCheckLabel -> ageOk,
               )),
+              note = Some(reportNote()),
             }
             Ok.value(Some({
               reportJson = None,
@@ -450,6 +513,7 @@ val fetchOp = Op.fetch[Key, View, Value] { ctx =>
         val reportInfo = {
           reportPeriod = Some(reportPeriodLabel(monthBucket)),
           eligibilityChecks = Some(eligibilityChecks),
+          note = Some(reportNote()),
         }
         val generatedAtMs = generatedAtMillis(daysIncludedForTs, now.inMillis)
         val periodDays = daysInPeriod(monthBucket, daysIncludedForTs)

@@ -24,8 +24,6 @@ pub struct PostCandidate {
     pub weighted_score: Option<f64>,
     pub score: Option<f64>,
     #[serde(default)]
-    pub author_policy_zeroed: bool,
-    #[serde(default)]
     pub cold_start_lift_to_rank: Option<u32>,
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
@@ -51,6 +49,10 @@ pub struct PostCandidate {
     pub max_video_duration_ms: Option<i32>,
     pub has_photo: Option<bool>,
     pub has_video: Option<bool>,
+    #[serde(default)]
+    pub video_aspect_ratio: Option<f32>,
+    #[serde(default)]
+    pub video_carousel_extra: bool,
     pub media_count: Option<i32>,
     pub quoted_video_duration_ms: Option<i32>,
     pub quoted_has_media: Option<bool>,
@@ -289,6 +291,8 @@ impl CandidateHelpers for PostCandidate {
             reward_rerank_slot_prob: None,
             page_decode_slot_prob: None,
             reranker_head_tag: self.reranker_head_tag,
+            prediction_heads: Vec::new(),
+            prediction_values: Vec::new(),
         }
     }
 

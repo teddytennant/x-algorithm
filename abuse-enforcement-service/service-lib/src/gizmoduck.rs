@@ -25,10 +25,15 @@ pub struct GizmoduckCoreClientConfig {
 
 #[derive(Clone)]
 pub struct GizmoduckCoreClient {
-    inner: Arc<ProdGizmoduckClient>,
+    inner: Arc<dyn GizmoduckClient + Send + Sync>,
 }
 
 impl GizmoduckCoreClient {
+    #[cfg(test)]
+    pub(crate) fn from_client(inner: Arc<dyn GizmoduckClient + Send + Sync>) -> Self {
+        Self { inner }
+    }
+
     pub async fn connect(cfg: &GizmoduckCoreClientConfig) -> Result<Self> {
         let service_url = format!("gizmoduck.gizmoduck.prod.{}.s2s.twttr.net", cfg.zone);
         let strato_cfg = StratoGrpcConfig {

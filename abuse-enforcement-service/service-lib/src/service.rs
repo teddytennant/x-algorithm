@@ -110,6 +110,8 @@ pub struct AppState {
     pub growthbook_environment: String,
         pub kafka_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 pub kafka_producers: crate::KafkaProducers,
+                pub hold_gate: std::sync::Arc<crate::overturn_hold::HoldGate>,
+                pub boot_config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -1412,11 +1414,11 @@ pub async fn handle_rules_get(State(state): State<Arc<AppState>>) -> impl IntoRe
     let cache = &state.rules_cache;
     let user = cache.status(
         EntityType::User,
-        dc.enforcement_rules_yaml(EntityType::User).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::User).as_ref(),
     );
     let post = cache.status(
         EntityType::Post,
-        dc.enforcement_rules_yaml(EntityType::Post).as_deref(),
+        dc.enforcement_rules_yaml(EntityType::Post).as_ref(),
     );
     (StatusCode::OK, Json(json!({ "user": user, "post": post })))
 }
@@ -2075,9 +2077,9 @@ mod tests {
     #[test]
     fn truncate_utf8_does_not_split_multibyte_chars() {
         let prefix = "a".repeat(999);
-        let s = format!("{prefix}ـrest"); 
+        let s = format!("{prefix}ـrest");
         assert!(s.is_char_boundary(999));
-        assert!(!s.is_char_boundary(1000)); 
+        assert!(!s.is_char_boundary(1000));
         let out = truncate_utf8(&s, 1000);
         assert!(out.ends_with("..."));
         assert_eq!(out, format!("{prefix}..."));
@@ -2438,7 +2440,7 @@ mod tests {
             vec!["model_version: v51".to_owned()],
         );
         assert_eq!(action.name(), "addPostLabelsV2");
-        assert_eq!(action.entity_id(), 777); 
+        assert_eq!(action.entity_id(), 777);
         let v = action.to_json();
         let inner = v.get("addLabelsV2").expect("addLabelsV2 key");
 

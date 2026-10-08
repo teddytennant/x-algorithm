@@ -1,6 +1,6 @@
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
-use crate::scorers::ranking_scorer::{RankingScorer, ScoringWeights};
+use crate::scorers::value_model;
 use tonic::async_trait;
 use xai_candidate_pipeline::scorer::Scorer;
 
@@ -17,11 +17,11 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScoresRankingScorer {
         query: &ScoredPostsQuery,
         candidates: &[PostCandidate],
     ) -> Vec<Result<PostCandidate, String>> {
-        let weights = ScoringWeights::from_params(&query.params);
+        let weights = value_model::weights_for(query);
         candidates
             .iter()
             .map(|c| {
-                let weighted = RankingScorer::compute_weighted_score(&weights, query, c);
+                let weighted = value_model::weighted_score(query, &weights, c);
                 Ok(PostCandidate {
                     weighted_score: Some(weighted),
                     score: Some(weighted),

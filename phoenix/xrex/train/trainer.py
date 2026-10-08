@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 from opentelemetry import trace
 
 from xai_configlib import Config, configclass
+
 from xrex.configs.config import Dataset
 from xrex.eval.eval_utils import (
     EvalModule,
@@ -41,7 +42,6 @@ from xai_checkpointing import checksum
 from xai_checkpointing import common as checkpointing_common
 from xai_checkpointing import load as checkpointing_load
 from xai_checkpointing.tree_util import tree_to_dict
-
 from xrex.models.model_utils import Parameter, unwrap_tree
 from xrex.models.recsys_model import RecsysAggregatedModelConfig
 from xrex.models.recsys_two_tower_model import RecsysTwoTowerModelConfig
@@ -182,6 +182,7 @@ class Trainer(Config):
     precision_level: int = 2
     rng_seed: int = 42
     startup_profile: bool = False
+    overlap_step_host_work: bool = False
 
     jax_profile: bool = False
     jax_profile_rank: int = 0
@@ -401,7 +402,7 @@ class Trainer(Config):
         return batch
 
     def create_optim(self) -> None:
-        self.optim = self.optim_config.make()
+        self.optim = self.optim_config.make(self.mesh)
         if self.lr_schedule_in_samples_config is not None:
             assert isinstance(self.lr_schedule_in_samples_config, BaseSampleSchedule)
             assert self.optim_config.learning_rate == 1.0
@@ -769,20 +770,6 @@ class Trainer(Config):
         self.register_jit_function(self.iden_jit, self.state_shape, phase="early")
 
         unwrapped_state_shape = unwrap_tree(self.state_shape)
-
-        def norm(tree):
-            return jax.tree.map(
-                lambda x: jnp.sqrt(jnp.sum(jnp.square(x.astype(jnp.float32)))), tree
-            )
-
-        self.norm_jit = JittedOrCompiled(
-            jax.jit(
-                norm,
-                in_shardings=(self.state_sharding,),
-                out_shardings=jax.sharding.NamedSharding(self.mesh, P()),
-            )
-        )
-        self.register_jit_function(self.norm_jit, unwrapped_state_shape, phase="early")
 
         def compute_checksums(state):
             return checksum.compute_checksums(state, self.state_sharding, self.mesh)
@@ -1170,6 +1157,9 @@ class Trainer(Config):
     def _uses_tensorstore_save(self) -> bool:
         return self.checkpoint_config.save_method == "tensorstore"
 
+    def restore_checkpoint_arrays(self, path, arrays, load_mask, rename, tag, on_replaced):
+        return {}
+
     def maybe_load_checkpoint(
         self, ctx: TrainerContext, tag: str | None = None
     ) -> tuple[bool, int, int]:
@@ -1232,6 +1222,7 @@ class Trainer(Config):
         rename = None
 
         loads: dict[str, dict[str, jax.Array]] = {}
+        independently_verified: dict[str, dict[str, int]] = {}
 
         if ctx.checkpoint.format == "orbax":
             if use_streamed_restore:
@@ -1311,6 +1302,14 @@ class Trainer(Config):
                     )
 
             for checkpoint_path, partial_host_state in loads.items():
+                independently_verified[checkpoint_path] = self.restore_checkpoint_arrays(
+                    checkpoint_path,
+                    partial_host_state,
+                    mask,
+                    rename,
+                    tag,
+                    _graft_replaced if use_streamed_restore else None,
+                )
                 if use_streamed_restore:
                     checkpointing_load.load_checkpoint_streamed(
                         checkpoint_path,
@@ -1352,7 +1351,7 @@ class Trainer(Config):
                     )
                     self.host_state = None
                 else:
-                    self.state = None
+                    staged_state = self.state = None
                     self.state = jax.device_put(self.host_state, self.state_sharding)
                     self.host_state = jax.device_put(self.state, self.host_sharding)
 
@@ -1394,6 +1393,13 @@ class Trainer(Config):
 
         if self.checkpoint_config.verify_checksums:
             checksum_dict = self.checksum_dict()
+            for expected in independently_verified.values():
+                checksum.check_internal_consistency(
+                    checksum_dict, "restored state", names=set(expected)
+                )
+                for name, value in expected.items():
+                    if checksum_dict["global_checksums"][name] != value:
+                        raise ValueError(f"Restored destination checksum mismatch for {name}")
 
         for i, (checkpoint_path, partial_host_state) in enumerate(loads.items()):
             restored_fields = set()
@@ -1435,7 +1441,8 @@ class Trainer(Config):
             if self.checkpoint_config.verify_checksums:
                 checksums_file = f"{checkpoint_path}/checksums.0.json"
                 try:
-                    if checksum.compare_checksum_dicts(
+                    verified = independently_verified.get(checkpoint_path, {})
+                    if (verified and not names) or checksum.compare_checksum_dicts(
                         checksums_file, checksum_dict, rename, names=names
                     ):
                         rank_logger.info("Checkpoint checksums match%s", extra0)
@@ -1462,25 +1469,57 @@ class Trainer(Config):
 
             step = self.state[0].step if isinstance(self.state, list) else self.state.step
             step = step.item()
+            first_step = step
             saved_periodic = False
-            for soft_step in itertools.count():
-                if self.max_steps is not None and step > self.max_steps:
-                    rank_logger.info(f"Step limit reached ({self.max_steps=})")
-                    break
 
-                if self.max_samples is not None and self.elapsed_samples > self.max_samples:
-                    rank_logger.info(f"Step limit reached ({self.max_samples=})")
-                    break
+            dispatched_samples = self.elapsed_samples
+            prev_metrics_ready_time = 0.0
 
+            def is_eval_step(step):
+                return (self.eval_every_n > 0 and step % self.eval_every_n == 0 and step > 0) or (
+                    self.max_steps is not None and step == self.max_steps and self.evals
+                )
+
+            def step_reads_model_state(soft_step):
+                return bool(self.checkpoint_config.should_save(soft_step)) or bool(
+                    is_eval_step(first_step + soft_step)
+                )
+
+            def process_after_next_dispatch(soft_step):
+                return self.overlap_step_host_work and not step_reads_model_state(soft_step)
+
+            def stop_reason(num_steps_awaiting_processing):
+                if (
+                    self.max_steps is not None
+                    and step + num_steps_awaiting_processing > self.max_steps
+                ):
+                    return f"{self.max_steps=}"
+                if self.max_samples is not None and dispatched_samples > self.max_samples:
+                    return f"{self.max_samples=}"
+                return None
+
+            def dispatch_step_to_device(soft_step):
+                nonlocal dispatched_samples
                 next_data_batch_start = time.perf_counter()
                 batch = self.next_data_batch()
                 next_data_batch_time = time.perf_counter() - next_data_batch_start
-                lr = self.lr_schedule_in_samples(self.elapsed_samples, self.batch_size)
+                lr = self.lr_schedule_in_samples(dispatched_samples, self.batch_size)
 
-                if ctx.rank == ctx.world_size - 1:
-                    compute_step_start = time.perf_counter()
+                compute_step_start = time.perf_counter()
                 self.state, metrics, extras = self.update_jit(self.state, batch, lr)
+                del extras
+                dispatched_samples += self.batch_size
 
+                if self.overlap_step_host_work and "valid_step" not in metrics:
+                    metrics = {
+                        k: jax.device_put(v, v.sharding.with_memory_kind("pinned_host"))
+                        for k, v in metrics.items()
+                    }
+
+                return metrics, compute_step_start, next_data_batch_time, soft_step
+
+            def process_step_results(metrics, compute_step_start, next_data_batch_time, soft_step):
+                nonlocal step, saved_periodic, prev_metrics_ready_time
                 if "valid_step" in metrics:
                     valid_step = metrics["valid_step"].item()
                 elif ctx.rank == ctx.world_size - 1:
@@ -1492,12 +1531,11 @@ class Trainer(Config):
                     valid_step = valid_step.item()
 
                 self.elapsed_samples += self.batch_size
-                del extras
+                assert self.elapsed_samples == dispatched_samples or not step_reads_model_state(
+                    soft_step
+                )
 
-                is_eval_step = (
-                    self.eval_every_n > 0 and step % self.eval_every_n == 0 and step > 0
-                ) or (self.max_steps is not None and step == self.max_steps and self.evals)
-                if is_eval_step:
+                if is_eval_step(step):
                     eval_metrics = self.eval(soft_step)
                     metrics.update(eval_metrics)
 
@@ -1506,8 +1544,12 @@ class Trainer(Config):
                 casted_vis_metrics = {}
 
                 if ctx.rank == ctx.world_size - 1:
+                    now = time.perf_counter()
                     metrics["next_data_batch_time"] = next_data_batch_time
-                    metrics["gpu_step_time"] = time.perf_counter() - compute_step_start
+                    metrics["gpu_step_time"] = now - max(
+                        compute_step_start, prev_metrics_ready_time
+                    )
+                    prev_metrics_ready_time = now
                     metrics = self.handle_metrics(soft_step, metrics)
                 else:
                     metrics.clear()
@@ -1523,6 +1565,7 @@ class Trainer(Config):
 
                 if driver_cmd == DriverMessage.SAVE_CHECKPOINT_ASAP:
                     rank_logger.info("Driver requested emergency checkpoint")
+                    self.elapsed_samples = dispatched_samples
                     self.save_checkpoint(blocking=True)
                     ctx.on_completed("Emergency checkpoint saved")
                     raise RuntimeError("Exiting after emergency checkpoint saved")
@@ -1536,6 +1579,23 @@ class Trainer(Config):
                     self.save_checkpoint()
 
                 step += 1
+
+            awaiting_processing = None
+            for soft_step in itertools.count():
+                reason = stop_reason(int(awaiting_processing is not None))
+                if reason is not None:
+                    break
+                dispatched = dispatch_step_to_device(soft_step)
+                if awaiting_processing is not None:
+                    process_step_results(*awaiting_processing)
+                    awaiting_processing = None
+                if process_after_next_dispatch(soft_step):
+                    awaiting_processing = dispatched
+                else:
+                    process_step_results(*dispatched)
+            if awaiting_processing is not None:
+                process_step_results(*awaiting_processing)
+            rank_logger.info(f"Step limit reached ({reason})")
 
             if self.checkpoint_config.save_final_checkpoint and not saved_periodic:
                 self.save_checkpoint()

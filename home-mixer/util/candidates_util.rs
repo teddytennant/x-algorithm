@@ -16,23 +16,41 @@ pub fn related_post_ids_iter(candidate: &PostCandidate) -> impl Iterator<Item = 
         .chain(candidate.in_reply_to_tweet_id)
 }
 
-pub fn vqv_weight(
+pub fn vqv_eligible(
     query: &ScoredPostsQuery,
     candidate: &PostCandidate,
     min_video_duration_ms: i32,
-    vqv_weight_value: f64,
-) -> f64 {
+) -> bool {
     let exceeds_followers = query
         .user_features
         .follower_count
         .map(|count| count >= MAX_FOLLOWERS_THRESHOLD)
         .unwrap_or(false);
 
-    if !exceeds_followers
+    !exceeds_followers
         && candidate
             .min_video_duration_ms
             .is_some_and(|ms| ms > min_video_duration_ms)
-    {
+}
+
+pub fn quoted_vqv_eligible(
+    candidate: &PostCandidate,
+    min_video_duration_ms: i32,
+    enable_duration_check: bool,
+) -> bool {
+    !enable_duration_check
+        || candidate
+            .quoted_video_duration_ms
+            .is_some_and(|ms| ms > min_video_duration_ms)
+}
+
+pub fn vqv_weight(
+    query: &ScoredPostsQuery,
+    candidate: &PostCandidate,
+    min_video_duration_ms: i32,
+    vqv_weight_value: f64,
+) -> f64 {
+    if vqv_eligible(query, candidate, min_video_duration_ms) {
         vqv_weight_value
     } else {
         0.0
@@ -45,14 +63,7 @@ pub fn quoted_vqv_weight(
     quoted_vqv_weight_value: f64,
     enable_duration_check: bool,
 ) -> f64 {
-    if !enable_duration_check {
-        return quoted_vqv_weight_value;
-    }
-
-    if candidate
-        .quoted_video_duration_ms
-        .is_some_and(|ms| ms > min_video_duration_ms)
-    {
+    if quoted_vqv_eligible(candidate, min_video_duration_ms, enable_duration_check) {
         quoted_vqv_weight_value
     } else {
         0.0

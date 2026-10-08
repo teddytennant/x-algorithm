@@ -54,7 +54,7 @@ public class SetSymmetricDiff extends FunctionNode2<Runtime, Set, Set> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(Context<Runtime> context, Set set1, Set set2) {
     return Sets.symmetricDifference(set1, set2);
   }

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 X.AI Corp.
+import enum
+
 from xai_proto import recsys_pb2
 
 action_type_map_raw = {
@@ -177,6 +179,9 @@ notification_engagement_to_action_types = {
     "IsNotificationSent": [
         "ClientNotificationSent",
     ],
+    "IsNotificationSettingOptedOut": [
+        "ClientNotificationSettingOptOut",
+    ],
 }
 
 SEARCH_RELEVANCE_ACTION_INDICES = [
@@ -212,6 +217,12 @@ ads_conversion_engagement_to_action_types = {
     "IsSearchConversion": [
         "AdsSearchConversion",
     ],
+    "IsCustomConversion": [
+        "AdsCustomConversion",
+    ],
+    "IsContentViewConversion": [
+        "AdsContentViewConversion",
+    ],
 }
 
 ads_p_conv_click_engagement_to_action_types = {
@@ -224,6 +235,9 @@ ads_p_conv_click_engagement_to_action_types = {
     ],
     "IsAttributedMactClickInstall": [
         "AdsAttributedMactClickInstall",
+    ],
+    "IsMmpClick": [
+        "AdsMmpClick",
     ],
     "IsAttributedMactPurchase": [
         "AdsAttributedMactPurchase",
@@ -261,6 +275,12 @@ ads_p_conv_click_engagement_to_action_types = {
     "IsAttributedMactViewCustom": [
         "AdsAttributedMactViewCustom",
     ],
+    "IsAttributedMactMmpClickInstall": [
+        "AdsAttributedMactMmpClickInstall",
+    ],
+    "IsAttributedMactMmpViewInstall": [
+        "AdsAttributedMactMmpViewInstall",
+    ],
     "IsPurchaseConversion": [
         "AdsPurchaseConversion",
     ],
@@ -281,6 +301,12 @@ ads_p_conv_click_engagement_to_action_types = {
     ],
     "IsSearchConversion": [
         "AdsSearchConversion",
+    ],
+    "IsCustomConversion": [
+        "AdsCustomConversion",
+    ],
+    "IsContentViewConversion": [
+        "AdsContentViewConversion",
     ],
     "IsAttributedKeyClickConversionDelayed": [
         "AdsAttributedKeyClickConversionDelayed",
@@ -348,6 +374,9 @@ ads_slim_engagement_to_action_types = {
     "IsOpenLink": [
         "ClientTweetOpenLink",
     ],
+    "IsMmpClick": [
+        "AdsMmpClick",
+    ],
     "IsExternalLinkLongDwelled": [
         "ClientTweetExternalLinkLongDwelled",
     ],
@@ -394,6 +423,13 @@ def engagement_to_ids(metric_group):
 
 
 CLICK_ACTION_INDEX = recsys_pb2.ActionName.CLIENT_TWEET_OPEN_LINK
+MMP_CLICK_ACTION_INDEX = recsys_pb2.ActionName.ADS_MMP_CLICK
+
+
+class LineItemObjective(enum.IntEnum):
+    WEBSITE_CLICKS = 5
+
+
 CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_KEY_CLICK_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_CLICK_CONVERSION,
@@ -403,16 +439,46 @@ CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_UPPER_FUNNEL_CONVERSION,
     recsys_pb2.ActionName.ADS_WEB_CONVERSION,
     recsys_pb2.ActionName.ADS_SEARCH_CONVERSION,
+    recsys_pb2.ActionName.ADS_CUSTOM_CONVERSION,
+    recsys_pb2.ActionName.ADS_CONTENT_VIEW_CONVERSION,
     recsys_pb2.ActionName.ADS_SIGN_UP_CONVERSION,
     recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CLICK_INSTALL,
+]
+
+MMP_CLICK_CONDITIONED_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_PURCHASE,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_ADD_TO_CART,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_LEVEL_ACHIEVED,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_TUTORIAL_COMPLETE,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_SIGN_UP,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_CUSTOM,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_MMP_CLICK_INSTALL,
 ]
+MMP_CLICK_VIEW_THROUGH_ACTION_INDICES = [
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_PURCHASE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_ADD_TO_CART,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_LEVEL_ACHIEVED,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_TUTORIAL_COMPLETE,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_SIGN_UP,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_CUSTOM,
+    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_MMP_VIEW_INSTALL,
+]
+
+CONVERSION_KEEP_WEB = 1 << 0
+CONVERSION_KEEP_APP = 1 << 1
+
+CONVERSION_DELAY_NONE = -1
+CONVERSION_DELAY_HEAD_COLUMNS: dict[str, str] = {
+    "IsAttributedClickConversion": "conversionDelayMsSeq",
+    "IsAttributedKeyClickConversion": "conversionDelayMsSeq_KEY",
+    "IsPurchaseConversion": "conversionDelayMsSeq_PURCHASE",
+    "IsSignupConversion": "conversionDelayMsSeq_SIGN_UP",
+    "IsCustomConversion": "conversionDelayMsSeq_CUSTOM",
+    "IsAddToCartConversion": "conversionDelayMsSeq_ADD_TO_CART",
+    "IsCheckoutInitiatedConversion": "conversionDelayMsSeq_CHECKOUT_INITIATED",
+}
+CONVERSION_DELAY_COLUMNS: tuple[str, ...] = tuple(CONVERSION_DELAY_HEAD_COLUMNS.values())
 
 MACT_IN_APP_LOSS_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_PURCHASE,
@@ -432,12 +498,6 @@ MACT_IN_APP_LOSS_ACTION_INDICES = [
 VIEW_THROUGH_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_ATTRIBUTED_KEY_VIEW_CONVERSION,
     recsys_pb2.ActionName.ADS_ATTRIBUTED_VIEW_CONVERSION,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_PURCHASE,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_ADD_TO_CART,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_LEVEL_ACHIEVED,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_TUTORIAL_COMPLETE,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_SIGN_UP,
-    recsys_pb2.ActionName.ADS_ATTRIBUTED_MACT_VIEW_CUSTOM,
     recsys_pb2.ActionName.ADS_PURCHASE_CONVERSION_VIEW_THROUGH,
     recsys_pb2.ActionName.ADS_ADD_TO_CART_CONVERSION_VIEW_THROUGH,
     recsys_pb2.ActionName.ADS_CHECKOUT_INITIATED_CONVERSION_VIEW_THROUGH,
@@ -447,8 +507,6 @@ VIEW_THROUGH_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_LANDING_PAGE_VIEW_CONVERSION_VIEW_THROUGH,
     recsys_pb2.ActionName.ADS_UPPER_FUNNEL_CONVERSION_VIEW_THROUGH,
 ]
-
-STANDARD_CONVERSION_HEAD_INDICES = CLICK_CONDITIONED_ACTION_INDICES + VIEW_THROUGH_ACTION_INDICES
 
 PURCHASE_VALUE_ACTION_INDEX = recsys_pb2.ContinuousActionName.ADS_WEB_CT_PURCHASE_VALUE
 

@@ -98,19 +98,23 @@ ArenaLayout ArenaLayout::build(const PipelineSpec& spec, int world_size) {
     return result;
   };
 
-  const size_t slice_bytes = checkedProduct(
-      {size_t(spec.tokens_per_rank), size_t(spec.shard_width), sizeof(__nv_bfloat16)}
+  layout.block_bytes = checkedProduct(
+      {size_t(world_size),
+       size_t(spec.tokens_per_rank),
+       size_t(spec.shard_width),
+       sizeof(__nv_bfloat16)}
   );
-  layout.token_ids_all =
-      take(checkedProduct({size_t(world_size), size_t(spec.tokens_per_rank), sizeof(int32_t)}));
-  layout.lookup_send = take(checkedProduct({size_t(world_size), slice_bytes}));
-  layout.lookup_recv = take(checkedProduct({size_t(world_size), slice_bytes}));
-  layout.segment_ids_all =
-      take(checkedProduct({size_t(world_size), size_t(spec.tokens_per_rank), sizeof(int32_t)}));
-  layout.update_send = take(checkedProduct({size_t(world_size), slice_bytes}));
-  layout.update_recv = take(checkedProduct({size_t(world_size), slice_bytes}));
-  layout.grad_accum =
-      take(checkedProduct({size_t(spec.num_unique), size_t(spec.shard_width), sizeof(float)}));
+  layout.index_bytes =
+      checkedProduct({size_t(world_size), size_t(spec.tokens_per_rank), sizeof(int32_t)});
+  layout.accum_bytes =
+      checkedProduct({size_t(spec.num_unique), size_t(spec.shard_width), sizeof(float)});
+  layout.token_ids_all = take(layout.index_bytes);
+  layout.lookup_send = take(std::max(layout.block_bytes, layout.accum_bytes));
+  layout.grad_accum = layout.lookup_send;
+  layout.recv = take(layout.block_bytes);
+  layout.segment_ids_all = take(layout.index_bytes);
+  layout.update_stage = take(layout.block_bytes);
+  layout.unique_tokens = take(checkedProduct({size_t(spec.num_unique), sizeof(int32_t)}));
   layout.row_sq_sums = take(checkedProduct({size_t(spec.num_unique) + 1, sizeof(float)}));
   layout.scalars = take(sizeof(UpdateScalars));
   layout.total = offset;
@@ -471,7 +475,7 @@ void AsyncEmbContext::warmupCollectives() {
   submitNccl(
       ncclAlltoAll(
           arena() + layout.lookup_send,
-          arena() + layout.lookup_recv,
+          arena() + layout.recv,
           block_count,
           ncclBfloat16,
           comm_,
@@ -481,8 +485,8 @@ void AsyncEmbContext::warmupCollectives() {
   );
   submitNccl(
       ncclAlltoAll(
-          arena() + layout.update_send,
-          arena() + layout.update_recv,
+          arena() + layout.update_stage,
+          arena() + layout.recv,
           block_count,
           ncclBfloat16,
           comm_,
@@ -551,24 +555,6 @@ void AsyncEmbContext::bindTable(Operation operation, const void* table) {
   last_table_ = table;
 }
 
-void AsyncEmbContext::resetTableBinding() {
-  ensureHealthy();
-  std::lock_guard<std::mutex> lock(state_mu_);
-  for (PipelineState* pipeline : {&lookup_, &update_}) {
-    if (!pipeline->in_flight) {
-      continue;
-    }
-    cudaError_t result = cudaEventQuery(pipeline->done);
-    if (result == cudaErrorNotReady) {
-      throw std::runtime_error("cannot reset table binding while communication is in flight");
-    }
-    XAI_CUDA_CHECK(result);
-    pipeline->in_flight = false;
-  }
-  last_table_phase_ = TablePhase::None;
-  last_table_ = nullptr;
-}
-
 void AsyncEmbContext::enqueueLookup(const LookupJob& job) {
   std::lock_guard<std::recursive_mutex> comm_lock(comm_mu_);
   const auto& layout = layout_;
@@ -592,7 +578,7 @@ void AsyncEmbContext::enqueueLookup(const LookupJob& job) {
   submitNccl(
       ncclAlltoAll(
           arena() + layout.lookup_send,
-          arena() + layout.lookup_recv,
+          arena() + layout.recv,
           size_t(spec.tokens_per_rank) * size_t(spec.shard_width),
           ncclBfloat16,
           comm_,
@@ -608,16 +594,11 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
   const auto& layout = layout_;
   const auto& spec = spec_;
   const SliceLayout slices{spec.tokens_per_rank, spec.shard_width, world_size_};
-  launch_grad_dispatch(
-      job.grads,
-      reinterpret_cast<__nv_bfloat16*>(arena() + layout.update_send),
-      slices,
-      side_stream_
-  );
+  int32_t* segment_ids_all = reinterpret_cast<int32_t*>(arena() + layout.segment_ids_all);
   submitNccl(
       ncclAllGather(
-          job.segment_ids,
-          arena() + layout.segment_ids_all,
+          segment_ids_all + size_t(rank_) * size_t(spec.tokens_per_rank),
+          segment_ids_all,
           spec.tokens_per_rank,
           ncclInt32,
           comm_,
@@ -627,8 +608,8 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
   );
   submitNccl(
       ncclAlltoAll(
-          arena() + layout.update_send,
-          arena() + layout.update_recv,
+          arena() + layout.update_stage,
+          arena() + layout.recv,
           size_t(spec.tokens_per_rank) * size_t(spec.shard_width),
           ncclBfloat16,
           comm_,
@@ -637,9 +618,10 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
       "update gradient all-to-all"
   );
 
+  XAI_CUDA_CHECK(cudaMemsetAsync(arena() + layout.grad_accum, 0, layout.accum_bytes, side_stream_));
   launch_grad_segment_sum(
-      reinterpret_cast<const __nv_bfloat16*>(arena() + layout.update_recv),
-      reinterpret_cast<const int32_t*>(arena() + layout.segment_ids_all),
+      reinterpret_cast<const __nv_bfloat16*>(arena() + layout.recv),
+      segment_ids_all,
       reinterpret_cast<float*>(arena() + layout.grad_accum),
       reinterpret_cast<float*>(arena() + layout.row_sq_sums),
       slices,
@@ -661,9 +643,9 @@ void AsyncEmbContext::enqueueUpdate(const UpdateJob& job, const ApplyUpdateRule&
 
   const float* row_sq_sums = reinterpret_cast<const float*>(arena() + layout.row_sq_sums);
   const ReducedGradients reduced{
-      reinterpret_cast<float*>(arena() + layout.grad_accum),
+      reinterpret_cast<const float*>(arena() + layout.grad_accum),
       row_sq_sums,
-      row_sq_sums + spec.num_unique,
+      reinterpret_cast<const int32_t*>(arena() + layout.unique_tokens),
       reinterpret_cast<UpdateScalars*>(arena() + layout.scalars),
       spec.num_unique,
       spec.shard_width
@@ -704,12 +686,51 @@ void AsyncEmbContext::armLookup(LookupJob job, cudaStream_t main_stream) {
   }
 }
 
-void AsyncEmbContext::armUpdate(
-    UpdateJob job,
+void AsyncEmbContext::stageUpdate(
+    const __nv_bfloat16* grads,
+    const int32_t* segment_ids,
+    const int32_t* unique_tokens,
     const int32_t* pending,
-    ApplyUpdateRule apply,
-    cudaStream_t main_stream,
-    const int32_t* logical_step
+    cudaStream_t main_stream
+) {
+  std::lock_guard<std::mutex> arm_lock(arm_mu_);
+  ensureHealthy();
+  {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    if (update_.armed_step != update_.consumed_step) {
+      throw std::invalid_argument(
+          "async_emb scheduled stage_update before the pending update_done"
+      );
+    }
+    if (staged_) {
+      throw std::invalid_argument("async_emb scheduled stage_update twice without an update_start");
+    }
+  }
+  const SliceLayout slices{spec_.tokens_per_rank, spec_.shard_width, world_size_};
+  launch_grad_dispatch(
+      grads, reinterpret_cast<__nv_bfloat16*>(arena() + layout_.update_stage), slices, main_stream
+  );
+  auto copy = [&](size_t offset, const int32_t* src, size_t count) {
+    XAI_CUDA_CHECK(cudaMemcpyAsync(
+        arena() + offset, src, count * sizeof(int32_t), cudaMemcpyDeviceToDevice, main_stream
+    ));
+  };
+  const size_t tokens_per_rank = size_t(spec_.tokens_per_rank);
+  copy(
+      layout_.segment_ids_all + size_t(rank_) * tokens_per_rank * sizeof(int32_t),
+      segment_ids,
+      tokens_per_rank
+  );
+  copy(layout_.unique_tokens, unique_tokens, size_t(spec_.num_unique));
+  copy(layout_.scalars + offsetof(UpdateScalars, pending), pending, 1);
+  {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    staged_ = true;
+  }
+}
+
+void AsyncEmbContext::armUpdate(
+    UpdateJob job, ApplyUpdateRule apply, cudaStream_t main_stream, const int32_t* logical_step
 ) {
   std::lock_guard<std::mutex> arm_lock(arm_mu_);
   ensureHealthy();
@@ -718,19 +739,20 @@ void AsyncEmbContext::armUpdate(
     std::lock_guard<std::mutex> state_lock(state_mu_);
     if (update_.armed_step != update_.consumed_step) {
       throw std::invalid_argument(
-          "async_emb scheduled an update start before the pending update done"
+          "async_emb scheduled update_start before the pending update_done"
       );
+    }
+    if (lookup_.armed_step != lookup_.consumed_step) {
+      throw std::invalid_argument(
+          "async_emb scheduled update_start before the pending lookup_done"
+      );
+    }
+    if (!staged_ && update_.armed_step != 0) {
+      throw std::invalid_argument("async_emb scheduled update_start without a staged step");
     }
     step = update_.armed_step + 1;
   }
   bindTable(Operation::Update, job.table);
-  XAI_CUDA_CHECK(cudaMemcpyAsync(
-      arena() + layout_.scalars + offsetof(UpdateScalars, pending),
-      pending,
-      sizeof(int32_t),
-      cudaMemcpyDeviceToDevice,
-      main_stream
-  ));
   if (logical_step != nullptr) {
     XAI_CUDA_CHECK(cudaMemcpyAsync(
         arena() + layout_.scalars + offsetof(UpdateScalars, step),
@@ -744,6 +766,7 @@ void AsyncEmbContext::armUpdate(
   enqueueUpdate(job, apply);
   {
     std::lock_guard<std::mutex> state_lock(state_mu_);
+    staged_ = false;
     update_.armed_step = step;
     update_.in_flight = true;
     update_.submitted_at = std::chrono::steady_clock::now();
@@ -758,8 +781,8 @@ void AsyncEmbContext::warmupUpdateRule(const ApplyUpdateRule& apply) {
   auto* bf16 = reinterpret_cast<__nv_bfloat16*>(scratch.data());
   auto* f32 = reinterpret_cast<float*>(scratch.data());
   auto* i32 = reinterpret_cast<int32_t*>(scratch.data());
-  const ReducedGradients reduced{f32, f32, f32, reinterpret_cast<UpdateScalars*>(f32 + 256), 0, 8};
-  const UpdateJob job{bf16, i32, i32, bf16, 1};
+  const ReducedGradients reduced{f32, f32, i32, reinterpret_cast<UpdateScalars*>(f32 + 256), 0, 8};
+  const UpdateJob job{bf16, 1};
   apply(reduced, job, side_stream_);
   XAI_CUDA_CHECK(cudaStreamSynchronize(side_stream_));
 }

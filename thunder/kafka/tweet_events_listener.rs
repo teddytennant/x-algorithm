@@ -58,7 +58,7 @@ fn is_eligible_video(tweet: &Tweet) -> bool {
     };
 
     let [first_media] = media.as_slice() else {
-        return false; 
+        return false;
     };
 
     let Some(crate::schema::tweet_media::MediaInfo::VideoInfo(video_info)) =

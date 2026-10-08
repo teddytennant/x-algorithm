@@ -72,6 +72,9 @@ pub struct Args {
     #[arg(long)]
     pub in_network_events_consumer_mtls_zone: Option<String>,
 
+    #[arg(long)]
+    pub in_network_events_producer_mtls_zone: Option<String>,
+
     #[arg(long, default_value = "innetwork-posts")]
     pub o2_bucket: String,
 

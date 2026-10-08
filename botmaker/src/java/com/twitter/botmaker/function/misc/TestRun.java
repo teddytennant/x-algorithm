@@ -31,9 +31,9 @@ public class TestRun extends ASTNode<Runtime> {
           Type.structTupleOf(
               OutputKey.FIELD_NAMES,
               ImmutableList.of(
-                  Type.STRING, 
-                  Type.STRING, 
-                  Type.STRING 
+                  Type.STRING,
+                  Type.STRING,
+                  Type.STRING
               )
           ),
           Type.OBJECT

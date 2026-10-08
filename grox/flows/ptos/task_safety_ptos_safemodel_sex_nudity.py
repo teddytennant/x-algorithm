@@ -36,8 +36,11 @@ _METRIC_PREFIX = "task.safety_ptos_safemodel_sex_nudity"
 class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
     @classmethod
     async def _exec_with_post(cls, ctx: TaskContext, post: Post) -> None:
+        verdict = "missing"
         try:
-            await asyncio.wait_for(cls._run(ctx, post), timeout=_TASK_TIMEOUT_S)
+            verdict = await asyncio.wait_for(
+                cls._run(ctx, post), timeout=_TASK_TIMEOUT_S
+            )
         except asyncio.TimeoutError:
             Metrics.counter(f"{_METRIC_PREFIX}.timeout.count").add(1)
             logger.warning(
@@ -48,6 +51,15 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
                 1, attributes={"reason": "exception"}
             )
             logger.warning(f"Post {post.id}: safemodel failed: {e}")
+        if verdict:
+            flow = (
+                "deluxe"
+                if ctx.payload.task_type in DELUXE_TIER_TASK_TYPES
+                else "standard"
+            )
+            Metrics.counter(f"{_METRIC_PREFIX}.verdict.count").add(
+                1, attributes={"verdict": verdict, "flow": flow}
+            )
 
     @classmethod
     def _has_adult_content_suspicion(cls, ctx: TaskContext) -> bool:
@@ -60,7 +72,7 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
         )
 
     @classmethod
-    async def _run(cls, ctx: TaskContext, post: Post) -> None:
+    async def _run(cls, ctx: TaskContext, post: Post) -> str | None:
         is_deluxe = ctx.payload.task_type in DELUXE_TIER_TASK_TYPES
         flow = "deluxe" if is_deluxe else "standard"
 
@@ -121,24 +133,24 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
         if n_errors > 0:
             logger.warning(
                 f"Post {post.id}: safemodel had {n_errors} error(s) "
-                f"(buckets_seen={buckets_seen}, n_images={n_images}, n_video_frames={n_video_frames}), skipping comparison"
+                f"(buckets_seen={buckets_seen}, n_images={n_images}, n_video_frames={n_video_frames}), dropping verdict"
             )
             Metrics.counter(f"{_METRIC_PREFIX}.skipped.count").add(
                 1, attributes={"reason": "safemodel_errors", "flow": flow}
             )
-            return
+            return "missing"
 
         logger.info(
             f"Post {post.id} ({flow}): safemodel={'positive' if safemodel_positive else 'negative'} "
             f"(buckets={buckets_seen}, n_errors={n_errors}, n_images={n_images}, n_video_frames={n_video_frames})"
         )
 
-        ctx.state(SafetyPtosState).safemodel_sex_nudity.scored = True
         if safemodel_positive:
             ctx.state(SafetyPtosState).safemodel_sex_nudity.positive = True
             ctx.state(
                 SafetyPtosState
             ).safemodel_sex_nudity.confidence = max_positive_confidence
+        return "positive" if safemodel_positive else "negative"
 
     @classmethod
     def _collect_payloads(cls, post: Post) -> list[tuple[str, bytes]]:
@@ -148,9 +160,9 @@ class TaskSafetyPtosSafemodelSexNudity(TaskWithPost):
                 if media.convo_image and media.convo_image.content:
                     payloads.append(("image", media.convo_image.content))
             elif isinstance(media, Video):
-                if media.convo_video and media.convo_video.frames:
+                if media.convo_video and media.convo_video.stills():
                     for frame in cls._sample_uniform(
-                        media.convo_video.frames, _MAX_FRAMES_PER_VIDEO
+                        media.convo_video.stills(), _MAX_FRAMES_PER_VIDEO
                     ):
                         payloads.append(("video_frame", frame))
             if len(payloads) >= _MAX_PAYLOADS_PER_POST:

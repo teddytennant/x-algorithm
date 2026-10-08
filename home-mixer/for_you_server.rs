@@ -3,13 +3,15 @@ use crate::models::query::ScoredPostsQuery;
 use crate::params;
 use crate::server::QueryBuilder;
 use crate::util::feed_log;
+use crate::util::under_the_hood;
 use crate::util::urt;
 use tonic::Status;
 use xai_candidate_pipeline::candidate_pipeline::CandidatePipeline;
-use xai_home_mixer_proto::FeedItem;
+use xai_home_mixer_proto::{FeedItem, PipelineTrace};
 
 pub(crate) struct ForYouFeedOutput {
     pub items: Vec<FeedItem>,
+    pub pipeline_trace: Option<PipelineTrace>,
 }
 
 pub struct ForYouFeedServer {
@@ -30,13 +32,19 @@ impl ForYouFeedServer {
         query: ScoredPostsQuery,
     ) -> Result<ForYouFeedOutput, Status> {
         if params::TEST_USER_IDS.contains(&query.user_id) {
-            return Ok(ForYouFeedOutput { items: vec![] });
+            return Ok(ForYouFeedOutput {
+                items: vec![],
+                pipeline_trace: None,
+            });
         }
 
-        let result = self.pipeline.execute(query).await;
+        let (result, trace) = self.pipeline.execute_traced(query).await;
         feed_log::log_feed_response(&result);
 
         Ok(ForYouFeedOutput {
+            pipeline_trace: trace
+                .filter(|_| result.query.is_under_the_hood_request)
+                .map(|trace| under_the_hood::pipeline_trace(&trace)),
             items: result.selected_candidates,
         })
     }

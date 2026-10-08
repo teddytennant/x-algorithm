@@ -210,6 +210,7 @@ fn build_entry_info(item: &FeedItem) -> Option<EntryInfo> {
         }),
         Some(feed_item::Item::Frame(_)) => None,
         Some(feed_item::Item::FeedSurvey(_)) => None,
+        Some(feed_item::Item::VideoCarousel(_)) => None,
         None => None,
     }
 }

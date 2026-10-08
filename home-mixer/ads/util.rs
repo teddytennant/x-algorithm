@@ -94,24 +94,91 @@ pub(crate) fn is_bsr_high_ad(ad: &AdIndexInfo) -> bool {
         == BrandSafetyRiskLevel::BsrHigh
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    LowRiskNeighbour,
+    ExcludedHandle(u64),
+    ExcludedKeyword(String),
+}
+
+#[derive(Debug)]
+pub(crate) struct Block {
+    pub(crate) tweet_id: u64,
+    pub(crate) reason: BlockReason,
+}
+
+pub(crate) type SlotTokens = Option<[Option<TokenSequence>; 2]>;
+
+pub(crate) fn low_risk_block(
+    ad: &AdIndexInfo,
+    above: Option<&ScoredPost>,
+    below: Option<&ScoredPost>,
+) -> Option<Block> {
+    if !is_bsr_low_ad(ad) {
+        return None;
+    }
+    [above, below]
+        .into_iter()
+        .flatten()
+        .find(|p| p.brand_safety_verdict() == BrandSafetyVerdict::LowRisk)
+        .map(|post| Block {
+            tweet_id: post.tweet_id,
+            reason: BlockReason::LowRiskNeighbour,
+        })
+}
+
+pub(crate) fn handle_block(
+    ad: &AdIndexInfo,
+    above: Option<&ScoredPost>,
+    below: Option<&ScoredPost>,
+) -> Option<Block> {
+    let handles = match ad.ad_adjacency_control.as_ref() {
+        Some(ctrl) if !ctrl.handles.is_empty() => &ctrl.handles,
+        _ => return None,
+    };
+    [above, below].into_iter().flatten().find_map(|post| {
+        [post.author_id, post.retweeted_user_id, post.quoted_user_id]
+            .iter()
+            .chain(&post.ancestor_users)
+            .find(|&&id| id != 0 && handles.contains(&(id as i64)))
+            .map(|&id| Block {
+                tweet_id: post.tweet_id,
+                reason: BlockReason::ExcludedHandle(id),
+            })
+    })
+}
+
+pub(crate) fn keyword_block(
+    ad: &AdIndexInfo,
+    above: Option<&ScoredPost>,
+    below: Option<&ScoredPost>,
+    slot_tokens: &mut SlotTokens,
+) -> Option<Block> {
+    let keywords = ad_keywords(ad)?;
+    let tokens = slot_tokens.get_or_insert_with(|| {
+        [above, below].map(|post| post.map(|p| tokenize_tweet_text(&p.tweet_text)))
+    });
+    [above, below]
+        .into_iter()
+        .zip(tokens.iter())
+        .find_map(|(post, tokens)| {
+            let (post, tokens) = (post?, tokens.as_ref()?);
+            keywords
+                .iter()
+                .find(|(_, keyword)| tokens.contains_keyword_sequence(keyword))
+                .map(|&(keyword, _)| Block {
+                    tweet_id: post.tweet_id,
+                    reason: BlockReason::ExcludedKeyword(keyword.to_string()),
+                })
+        })
+}
+
 pub(crate) fn should_drop_bsr_low(
     ad: &AdIndexInfo,
     above: Option<&ScoredPost>,
     below: Option<&ScoredPost>,
 ) -> bool {
-    let risk = ad
-        .ad_adjacency_control
-        .as_ref()
-        .map(|c| c.brand_safety_risk())
-        .unwrap_or(BrandSafetyRiskLevel::BsrUnknown);
-    if !matches!(
-        risk,
-        BrandSafetyRiskLevel::BsrLow | BrandSafetyRiskLevel::BsrIas
-    ) {
-        return false;
-    }
-    let is_lr = |p: &ScoredPost| p.brand_safety_verdict() == BrandSafetyVerdict::LowRisk;
-    above.map(is_lr).unwrap_or(false) || below.map(is_lr).unwrap_or(false)
+    low_risk_block(ad, above, below).is_some()
 }
 
 pub(crate) fn should_drop_handle(
@@ -119,18 +186,7 @@ pub(crate) fn should_drop_handle(
     above: Option<&ScoredPost>,
     below: Option<&ScoredPost>,
 ) -> bool {
-    let handles = match ad.ad_adjacency_control.as_ref() {
-        Some(ctrl) if !ctrl.handles.is_empty() => &ctrl.handles,
-        _ => return false,
-    };
-    let in_handles = |id: u64| id != 0 && handles.contains(&(id as i64));
-    let matches = |p: &ScoredPost| {
-        in_handles(p.author_id)
-            || in_handles(p.retweeted_user_id)
-            || in_handles(p.quoted_user_id)
-            || p.ancestor_users.iter().any(|&id| in_handles(id))
-    };
-    above.map(matches).unwrap_or(false) || below.map(matches).unwrap_or(false)
+    handle_block(ad, above, below).is_some()
 }
 
 pub(crate) fn should_drop_keyword(
@@ -138,34 +194,7 @@ pub(crate) fn should_drop_keyword(
     above: Option<&ScoredPost>,
     below: Option<&ScoredPost>,
 ) -> bool {
-    let Some(tokenized_keywords) = tokenize_ad_keywords(ad) else {
-        return false;
-    };
-
-    let text_matches = |p: &ScoredPost| {
-        let tweet_tokens = TWEET_TOKENIZER.tokenize(&p.tweet_text);
-        tokens_match_any_keyword(&tweet_tokens, &tokenized_keywords)
-    };
-    above.map(text_matches).unwrap_or(false) || below.map(text_matches).unwrap_or(false)
-}
-
-pub(crate) fn keyword_matches(
-    ad: &AdIndexInfo,
-    above: Option<&ScoredPost>,
-    below: Option<&ScoredPost>,
-    slot_tokens: &mut Option<[Option<TokenSequence>; 2]>,
-) -> bool {
-    let Some(keywords) = tokenize_ad_keywords(ad) else {
-        return false;
-    };
-    let tokens = slot_tokens.get_or_insert_with(|| {
-        [above, below].map(|post| post.map(|p| tokenize_tweet_text(&p.tweet_text)))
-    });
-    let matches = |t: &Option<TokenSequence>| {
-        t.as_ref()
-            .is_some_and(|t| tokens_match_any_keyword(t, &keywords))
-    };
-    matches(&tokens[0]) || matches(&tokens[1])
+    keyword_block(ad, above, below, &mut None).is_some()
 }
 
 pub(crate) fn tokenize_tweet_text(text: &str) -> TokenSequence {
@@ -173,22 +202,19 @@ pub(crate) fn tokenize_tweet_text(text: &str) -> TokenSequence {
 }
 
 pub(crate) fn tokenize_ad_keywords(ad: &AdIndexInfo) -> Option<Vec<TokenSequence>> {
-    let keywords = match ad.ad_adjacency_control.as_ref() {
-        Some(ctrl) if !ctrl.keywords.is_empty() => &ctrl.keywords,
-        _ => return None,
-    };
+    ad_keywords(ad).map(|keywords| keywords.into_iter().map(|(_, tokens)| tokens).collect())
+}
 
-    let tokenized_keywords: Vec<_> = keywords
+fn ad_keywords(ad: &AdIndexInfo) -> Option<Vec<(&str, TokenSequence)>> {
+    let keywords: Vec<_> = ad
+        .ad_adjacency_control
+        .as_ref()?
+        .keywords
         .iter()
-        .map(|kw| TWEET_TOKENIZER.tokenize(kw))
-        .filter(|seq| !seq.is_empty())
+        .map(|kw| (kw.as_str(), TWEET_TOKENIZER.tokenize(kw)))
+        .filter(|(_, tokens)| !tokens.is_empty())
         .collect();
-
-    if tokenized_keywords.is_empty() {
-        None
-    } else {
-        Some(tokenized_keywords)
-    }
+    (!keywords.is_empty()).then_some(keywords)
 }
 
 pub(crate) fn tokens_match_any_keyword(

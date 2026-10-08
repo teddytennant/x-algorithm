@@ -142,7 +142,7 @@ def get_checksum_dict(state, state_sharding, mesh, checksums=None):
 def adler32_combine(adlers, lengths, BASE=ADLER_BASE):
     A = adlers & 0xFFFF
     B = (adlers >> 16) & 0xFFFF
-    S = (A - 1) % BASE
+    S = (A + BASE - 1) % BASE
 
     lengths = lengths % BASE
 

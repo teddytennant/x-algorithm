@@ -54,11 +54,7 @@ class DriverContext:
     tee: Tee | None = None
 
     on_restart: Callable[[BaseException, int], None] | None = None
-    """Optional callback invoked when the driver restarts after a failure.
-
-    Called with ``(exception, restart_count)`` after the restart count has
-    been incremented but before the next iteration begins.
-    """
+    """Called as ``(exception, restart_count)`` on auto-restart, after the count is incremented."""
 
 
 class Completed(Exception):

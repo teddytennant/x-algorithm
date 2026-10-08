@@ -43,9 +43,9 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import Float32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
-from quack import copy_utils, layout_utils, sm90_utils
-from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.quack import copy_utils, layout_utils, sm90_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import ampere_helpers as sm80_utils
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.cute_dsl_utils import assume_tensor_aligned

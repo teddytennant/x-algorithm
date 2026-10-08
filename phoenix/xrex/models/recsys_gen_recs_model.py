@@ -696,7 +696,6 @@ def _compute_per_position_accuracy(
     def _sharded(local_preds, local_targets, local_mask):
         b, C, D = local_preds.shape
         N = b * C
-
         flat_targets = local_targets.reshape(N, D).astype(jnp.float32)
         flat_mask = local_mask.reshape(N)
 

@@ -60,7 +60,7 @@ public class MapRemove extends FunctionNode2<Runtime, Map, Collection> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(
       Context<Runtime> context,
       Map map,

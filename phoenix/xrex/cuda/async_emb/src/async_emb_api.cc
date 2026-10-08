@@ -206,9 +206,56 @@ ffi::Error LookupDone(
     }
     ctx->streamConsumeDone(stream, AsyncEmbContext::Operation::Lookup);
     launch_lookup_combine(
-        reinterpret_cast<const __nv_bfloat16*>(ctx->arena() + ctx->layout().lookup_recv),
+        reinterpret_cast<const __nv_bfloat16*>(ctx->arena() + ctx->layout().recv),
         static_cast<__nv_bfloat16*>(embeddings->untyped_data()),
         SliceLayout{spec.tokens_per_rank, spec.shard_width, ctx->worldSize()},
+        stream
+    );
+    return ffi::Error::Success();
+  });
+}
+
+ffi::Error StageUpdate(
+    cudaStream_t stream,
+    ffi::AnyBuffer grads,
+    ffi::AnyBuffer segment_ids,
+    ffi::AnyBuffer unique_tokens,
+    ffi::AnyBuffer pending,
+    ffi::AnyBuffer ,
+    ffi::Dictionary attrs,
+    ffi::Result<ffi::AnyBuffer> pin
+) {
+  return ffiGuard([&]() -> ffi::Error {
+    auto context_id = attrs.get<int64_t>("context_id");
+    if (!context_id.has_value()) {
+      return invalid("stage_update: missing context_id");
+    }
+    auto ctx = readyContext(*context_id);
+    if (ctx == nullptr) {
+      return invalid("stage_update: context not initialized");
+    }
+    const auto& spec = ctx->spec();
+    if (grads.element_type() != ffi::DataType::BF16 || grads.dimensions().size() != 2 ||
+        grads.dimensions()[0] != spec.tokens_per_rank || grads.dimensions()[1] != spec.emb_width) {
+      return invalid("stage_update: bad grads shape/dtype");
+    }
+    if (segment_ids.element_type() != ffi::DataType::S32 ||
+        segment_ids.element_count() != size_t(spec.tokens_per_rank)) {
+      return invalid("stage_update: bad segment ids");
+    }
+    if (unique_tokens.element_type() != ffi::DataType::S32 ||
+        unique_tokens.element_count() != size_t(spec.num_unique)) {
+      return invalid("stage_update: bad unique tokens");
+    }
+    if (pending.element_type() != ffi::DataType::S32 || pending.element_count() != 1) {
+      return invalid("stage_update: pending must be s32[1]");
+    }
+    XAI_CUDA_CHECK(cudaMemsetAsync(pin->untyped_data(), 0, pin->size_bytes(), stream));
+    ctx->stageUpdate(
+        static_cast<const __nv_bfloat16*>(grads.untyped_data()),
+        static_cast<const int32_t*>(segment_ids.untyped_data()),
+        static_cast<const int32_t*>(unique_tokens.untyped_data()),
+        static_cast<const int32_t*>(pending.untyped_data()),
         stream
     );
     return ffi::Error::Success();
@@ -224,7 +271,7 @@ ApplyUpdateRule makeRowwiseAdagradRule(
     launch_rowwise_adagrad_apply(
         reduced.row_grads,
         reduced.row_sq_sums,
-        job.unique_tokens,
+        reduced.unique_tokens,
         row_state,
         last_step,
         job.table,
@@ -240,65 +287,46 @@ ApplyUpdateRule makeRowwiseAdagradRule(
 
 std::once_flag rowwise_adagrad_warmup_once;
 
+ffi::Error initializeRowwiseAdagrad(
+    ffi::Dictionary attrs, ffi::CollectiveParamsPartial params, const char* operation
+) {
+  ffi::Error error = initializeContext(attrs, params);
+  if (error.failure()) {
+    return error;
+  }
+  auto ctx = readyContext(*attrs.get<int64_t>("context_id"));
+  if (ctx == nullptr) {
+    return invalid(std::string(operation) + ": context not initialized");
+  }
+  std::call_once(rowwise_adagrad_warmup_once, [&] {
+    ctx->warmupUpdateRule(
+        makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
+    );
+  });
+  return ffi::Error::Success();
+}
+
 ffi::Error RowwiseAdagradUpdateStartInit(
     cudaStream_t,
     ffi::CollectiveParamsPartial params,
     ffi::AnyBuffer,
     ffi::AnyBuffer,
     ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
     ffi::Dictionary attrs,
-    ffi::Result<ffi::AnyBuffer>,
-    ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>
 ) {
-  return ffiGuard([&]() -> ffi::Error {
-    ffi::Error error = initializeContext(attrs, params);
-    if (error.failure()) {
-      return error;
-    }
-    auto ctx = readyContext(*attrs.get<int64_t>("context_id"));
-    if (ctx == nullptr) {
-      return invalid("rowwise_adagrad_update_start: context not initialized");
-    }
-    std::call_once(rowwise_adagrad_warmup_once, [&] {
-      ctx->warmupUpdateRule(
-          makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
-      );
-    });
-    return ffi::Error::Success();
+  return ffiGuard([&] {
+    return initializeRowwiseAdagrad(attrs, params, "rowwise_adagrad_update_start");
   });
 }
 
 ffi::Error validateRowwiseAdagradBuffers(
-    AsyncEmbContext* ctx,
-    const ffi::AnyBuffer& grads,
-    const ffi::AnyBuffer& segment_ids,
-    const ffi::AnyBuffer& unique_tokens,
-    const ffi::AnyBuffer& table,
-    const ffi::AnyBuffer& row_state,
-    const ffi::AnyBuffer& pending
+    const PipelineSpec& spec, const ffi::AnyBuffer& table, const ffi::AnyBuffer& row_state
 ) {
-  const auto& spec = ctx->spec();
   if (32 % spec.shard_width != 0) {
     return invalid("rowwise_adagrad_update_start: shard_width must divide 32 (warp broadcast)");
-  }
-  if (grads.element_type() != ffi::DataType::BF16 ||
-      grads.element_count() != size_t(spec.tokens_per_rank * spec.shard_width * ctx->worldSize())) {
-    return invalid("rowwise_adagrad_update_start: bad grads");
-  }
-  if (segment_ids.element_type() != ffi::DataType::S32 ||
-      segment_ids.element_count() != size_t(spec.tokens_per_rank)) {
-    return invalid("rowwise_adagrad_update_start: bad indices");
-  }
-  if (unique_tokens.element_type() != ffi::DataType::S32 ||
-      unique_tokens.element_count() != size_t(spec.num_unique)) {
-    return invalid("rowwise_adagrad_update_start: bad unique tokens");
   }
   if (table.element_type() != ffi::DataType::BF16 || table.dimensions().size() != 2 ||
       table.dimensions()[1] != spec.shard_width) {
@@ -307,9 +335,6 @@ ffi::Error validateRowwiseAdagradBuffers(
   if (row_state.element_type() != ffi::DataType::F32 ||
       row_state.element_count() != size_t(table.dimensions()[0])) {
     return invalid("rowwise_adagrad_update_start: bad row state");
-  }
-  if (pending.element_type() != ffi::DataType::S32 || pending.element_count() != 1) {
-    return invalid("rowwise_adagrad_update_start: pending must be s32[1]");
   }
   return ffi::Error::Success();
 }
@@ -321,19 +346,13 @@ bool bufferAliased(const ffi::AnyBuffer& in, ffi::Result<ffi::AnyBuffer>& out) {
 ffi::Error RowwiseAdagradUpdateStart(
     cudaStream_t stream,
     ffi::CollectiveParamsPartial,
-    ffi::AnyBuffer grads,
-    ffi::AnyBuffer segment_ids,
-    ffi::AnyBuffer unique_tokens,
     ffi::AnyBuffer table,
     ffi::AnyBuffer row_state,
-    ffi::AnyBuffer pending,
     ffi::AnyBuffer ,
     ffi::Dictionary attrs,
-    ffi::Result<ffi::AnyBuffer> grads_pin,
-    ffi::Result<ffi::AnyBuffer> segment_ids_pin,
-    ffi::Result<ffi::AnyBuffer> unique_tokens_pin,
     ffi::Result<ffi::AnyBuffer> table_out,
-    ffi::Result<ffi::AnyBuffer> state_out
+    ffi::Result<ffi::AnyBuffer> state_out,
+    ffi::Result<ffi::AnyBuffer> pin
 ) {
   return ffiGuard([&]() -> ffi::Error {
     auto context_id = attrs.get<int64_t>("context_id");
@@ -360,33 +379,21 @@ ffi::Error RowwiseAdagradUpdateStart(
         decay_f < 0.f || decay_f > 1.f || !std::isfinite(wd_f) || wd_f <= 0.f || wd_f > 1.f) {
       return invalid("rowwise_adagrad_update_start: invalid optimizer parameters");
     }
-    ffi::Error buffers_error = validateRowwiseAdagradBuffers(
-        ctx.get(), grads, segment_ids, unique_tokens, table, row_state, pending
-    );
+    ffi::Error buffers_error = validateRowwiseAdagradBuffers(ctx->spec(), table, row_state);
     if (buffers_error.failure()) {
       return buffers_error;
     }
-    if (!bufferAliased(grads, grads_pin) || !bufferAliased(segment_ids, segment_ids_pin) ||
-        !bufferAliased(unique_tokens, unique_tokens_pin) || !bufferAliased(table, table_out) ||
-        !bufferAliased(row_state, state_out)) {
+    if (!bufferAliased(table, table_out) || !bufferAliased(row_state, state_out)) {
       return invalid(
           "rowwise_adagrad_update_start: outputs must alias inputs (check input_output_aliases)"
       );
     }
+    XAI_CUDA_CHECK(cudaMemsetAsync(pin->untyped_data(), 0, pin->size_bytes(), stream));
     const auto& spec = ctx->spec();
     const AdagradParams adagrad{lr_f, eps_f, decay_f, 1.f / float(spec.emb_width), wd_f, 0.f, 0.f};
-    UpdateJob job{
-        static_cast<const __nv_bfloat16*>(grads.untyped_data()),
-        static_cast<const int32_t*>(segment_ids.untyped_data()),
-        static_cast<const int32_t*>(unique_tokens.untyped_data()),
-        static_cast<__nv_bfloat16*>(table.untyped_data()),
-        table.dimensions()[0]
-    };
+    UpdateJob job{static_cast<__nv_bfloat16*>(table.untyped_data()), table.dimensions()[0]};
     ctx->armUpdate(
-        job,
-        static_cast<const int32_t*>(pending.untyped_data()),
-        makeRowwiseAdagradRule(adagrad, static_cast<float*>(row_state.untyped_data())),
-        stream
+        job, makeRowwiseAdagradRule(adagrad, static_cast<float*>(row_state.untyped_data())), stream
     );
     return ffi::Error::Success();
   });
@@ -400,55 +407,30 @@ ffi::Error RowwiseAdagradLazyUpdateStartInit(
     ffi::AnyBuffer,
     ffi::AnyBuffer,
     ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
-    ffi::AnyBuffer,
     ffi::Dictionary attrs,
-    ffi::Result<ffi::AnyBuffer>,
-    ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>,
     ffi::Result<ffi::AnyBuffer>
 ) {
-  return ffiGuard([&]() -> ffi::Error {
-    ffi::Error error = initializeContext(attrs, params);
-    if (error.failure()) {
-      return error;
-    }
-    auto ctx = readyContext(*attrs.get<int64_t>("context_id"));
-    if (ctx == nullptr) {
-      return invalid("rowwise_adagrad_lazy_update_start: context not initialized");
-    }
-    std::call_once(rowwise_adagrad_warmup_once, [&] {
-      ctx->warmupUpdateRule(
-          makeRowwiseAdagradRule(AdagradParams{0.f, 1.f, 1.f, 1.f, 1.f, 0.f, 0.f}, nullptr)
-      );
-    });
-    return ffi::Error::Success();
+  return ffiGuard([&] {
+    return initializeRowwiseAdagrad(attrs, params, "rowwise_adagrad_lazy_update_start");
   });
 }
 
 ffi::Error RowwiseAdagradLazyUpdateStart(
     cudaStream_t stream,
     ffi::CollectiveParamsPartial,
-    ffi::AnyBuffer grads,
-    ffi::AnyBuffer segment_ids,
-    ffi::AnyBuffer unique_tokens,
     ffi::AnyBuffer table,
     ffi::AnyBuffer row_state,
     ffi::AnyBuffer last_step,
     ffi::AnyBuffer logical_step,
-    ffi::AnyBuffer pending,
     ffi::AnyBuffer ,
     ffi::Dictionary attrs,
-    ffi::Result<ffi::AnyBuffer> grads_pin,
-    ffi::Result<ffi::AnyBuffer> segment_ids_pin,
-    ffi::Result<ffi::AnyBuffer> unique_tokens_pin,
     ffi::Result<ffi::AnyBuffer> table_out,
     ffi::Result<ffi::AnyBuffer> state_out,
-    ffi::Result<ffi::AnyBuffer> last_step_out
+    ffi::Result<ffi::AnyBuffer> last_step_out,
+    ffi::Result<ffi::AnyBuffer> pin
 ) {
   return ffiGuard([&]() -> ffi::Error {
     auto context_id = attrs.get<int64_t>("context_id");
@@ -476,9 +458,7 @@ ffi::Error RowwiseAdagradLazyUpdateStart(
         wd_rate_f < 0.f) {
       return invalid("rowwise_adagrad_lazy_update_start: invalid optimizer parameters");
     }
-    ffi::Error buffers_error = validateRowwiseAdagradBuffers(
-        ctx.get(), grads, segment_ids, unique_tokens, table, row_state, pending
-    );
+    ffi::Error buffers_error = validateRowwiseAdagradBuffers(ctx->spec(), table, row_state);
     if (buffers_error.failure()) {
       return buffers_error;
     }
@@ -489,28 +469,21 @@ ffi::Error RowwiseAdagradLazyUpdateStart(
     if (logical_step.element_type() != ffi::DataType::S32 || logical_step.element_count() != 1) {
       return invalid("rowwise_adagrad_lazy_update_start: step must be s32[1]");
     }
-    if (!bufferAliased(grads, grads_pin) || !bufferAliased(segment_ids, segment_ids_pin) ||
-        !bufferAliased(unique_tokens, unique_tokens_pin) || !bufferAliased(table, table_out) ||
-        !bufferAliased(row_state, state_out) || !bufferAliased(last_step, last_step_out)) {
+    if (!bufferAliased(table, table_out) || !bufferAliased(row_state, state_out) ||
+        !bufferAliased(last_step, last_step_out)) {
       return invalid(
           "rowwise_adagrad_lazy_update_start: outputs must alias inputs (check "
           "input_output_aliases)"
       );
     }
+    XAI_CUDA_CHECK(cudaMemsetAsync(pin->untyped_data(), 0, pin->size_bytes(), stream));
     const auto& spec = ctx->spec();
     const AdagradParams adagrad{
         lr_f, eps_f, 1.f, 1.f / float(spec.emb_width), 1.f, accum_rate_f, wd_rate_f
     };
-    UpdateJob job{
-        static_cast<const __nv_bfloat16*>(grads.untyped_data()),
-        static_cast<const int32_t*>(segment_ids.untyped_data()),
-        static_cast<const int32_t*>(unique_tokens.untyped_data()),
-        static_cast<__nv_bfloat16*>(table.untyped_data()),
-        table.dimensions()[0]
-    };
+    UpdateJob job{static_cast<__nv_bfloat16*>(table.untyped_data()), table.dimensions()[0]};
     ctx->armUpdate(
         job,
-        static_cast<const int32_t*>(pending.untyped_data()),
         makeRowwiseAdagradRule(
             adagrad,
             static_cast<float*>(row_state.untyped_data()),
@@ -529,6 +502,7 @@ ffi::Error RowwiseAdagradUpdateDone(
     ffi::Dictionary attrs,
     ffi::Result<ffi::AnyBuffer> norm,
     ffi::Result<ffi::AnyBuffer> valid,
+    ffi::Result<ffi::AnyBuffer> pending,
     ffi::Result<ffi::AnyBuffer> done_pin
 ) {
   return ffiGuard([&]() -> ffi::Error {
@@ -541,21 +515,15 @@ ffi::Error RowwiseAdagradUpdateDone(
       return invalid("rowwise_adagrad_update_done: context not initialized");
     }
     ctx->streamConsumeDone(stream, AsyncEmbContext::Operation::Update);
-    const auto& layout = ctx->layout();
-    XAI_CUDA_CHECK(cudaMemcpyAsync(
-        norm->untyped_data(),
-        ctx->arena() + layout.scalars + offsetof(UpdateScalars, norm),
-        4,
-        cudaMemcpyDeviceToDevice,
-        stream
-    ));
-    XAI_CUDA_CHECK(cudaMemcpyAsync(
-        valid->untyped_data(),
-        ctx->arena() + layout.scalars + offsetof(UpdateScalars, valid),
-        4,
-        cudaMemcpyDeviceToDevice,
-        stream
-    ));
+    const int8_t* scalars = ctx->arena() + ctx->layout().scalars;
+    auto copy = [&](ffi::Result<ffi::AnyBuffer>& out, size_t offset) {
+      XAI_CUDA_CHECK(cudaMemcpyAsync(
+          out->untyped_data(), scalars + offset, out->size_bytes(), cudaMemcpyDeviceToDevice, stream
+      ));
+    };
+    copy(norm, offsetof(UpdateScalars, norm));
+    copy(valid, offsetof(UpdateScalars, valid));
+    copy(pending, offsetof(UpdateScalars, pending));
     XAI_CUDA_CHECK(cudaMemsetAsync(done_pin->untyped_data(), 0, done_pin->size_bytes(), stream));
     return ffi::Error::Success();
   });
@@ -602,6 +570,20 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 );
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    kStageUpdate,
+    StageUpdate,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Attrs<ffi::Dictionary>()
+        .Ret<ffi::AnyBuffer>()
+);
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
     kRowwiseAdagradUpdateStartInit,
     RowwiseAdagradUpdateStartInit,
     ffi::Ffi::Bind<ffi::ExecutionStage::kInitialize>()
@@ -610,13 +592,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
         .Attrs<ffi::Dictionary>()
-        .Ret<ffi::AnyBuffer>()
-        .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
@@ -631,13 +607,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
         .Attrs<ffi::Dictionary>()
-        .Ret<ffi::AnyBuffer>()
-        .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
@@ -654,13 +624,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
         .Attrs<ffi::Dictionary>()
-        .Ret<ffi::AnyBuffer>()
-        .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
@@ -678,13 +642,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
         .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
-        .Arg<ffi::AnyBuffer>()
         .Attrs<ffi::Dictionary>()
-        .Ret<ffi::AnyBuffer>()
-        .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
@@ -698,6 +656,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<ffi::PlatformStream<cudaStream_t>>()
         .Arg<ffi::AnyBuffer>()
         .Attrs<ffi::Dictionary>()
+        .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
         .Ret<ffi::AnyBuffer>()
@@ -739,35 +698,26 @@ nb::bytes testSnapshot(int64_t context_id, const std::string& region) {
   }
   const auto& spec = ctx->spec();
   const auto& layout = ctx->layout();
-  const size_t index_bytes =
-      size_t(ctx->worldSize()) * size_t(spec.tokens_per_rank) * sizeof(int32_t);
-  const size_t block_bytes = size_t(ctx->worldSize()) * size_t(spec.tokens_per_rank) *
-                             size_t(spec.shard_width) * sizeof(__nv_bfloat16);
-  using Operation = AsyncEmbContext::Operation;
   struct Region {
-    Operation operation;
     size_t offset;
     size_t bytes;
   };
   const std::unordered_map<std::string, Region> regions = {
-      {"lookup_ids", {Operation::Lookup, layout.token_ids_all, index_bytes}},
-      {"lookup_embeddings", {Operation::Lookup, layout.lookup_recv, block_bytes}},
-      {"lookup_send", {Operation::Lookup, layout.lookup_send, block_bytes}},
-      {"update_indices", {Operation::Update, layout.segment_ids_all, index_bytes}},
-      {"update_gradients", {Operation::Update, layout.update_recv, block_bytes}},
-      {"update_send", {Operation::Update, layout.update_send, block_bytes}},
-      {"update_stats",
-       {Operation::Update, layout.row_sq_sums, size_t(spec.num_unique) * sizeof(float)}},
-      {"update_grad_accum",
-       {Operation::Update,
-        layout.grad_accum,
-        size_t(spec.num_unique) * size_t(spec.shard_width) * sizeof(float)}},
+      {"lookup_ids", {layout.token_ids_all, layout.index_bytes}},
+      {"lookup_send", {layout.lookup_send, layout.block_bytes}},
+      {"recv", {layout.recv, layout.block_bytes}},
+      {"update_indices", {layout.segment_ids_all, layout.index_bytes}},
+      {"update_stage", {layout.update_stage, layout.block_bytes}},
+      {"update_unique", {layout.unique_tokens, size_t(spec.num_unique) * sizeof(int32_t)}},
+      {"update_stats", {layout.row_sq_sums, size_t(spec.num_unique) * sizeof(float)}},
+      {"update_grad_accum", {layout.grad_accum, layout.accum_bytes}},
   };
   auto found = regions.find(region);
   if (found == regions.end()) {
     throw std::invalid_argument("unknown async_emb snapshot region: " + region);
   }
-  waitLatest(context_id, found->second.operation, "test snapshot");
+  waitLatest(context_id, AsyncEmbContext::Operation::Lookup, "test snapshot");
+  waitLatest(context_id, AsyncEmbContext::Operation::Update, "test snapshot");
   std::vector<uint8_t> snapshot = ctx->snapshot(found->second.offset, found->second.bytes);
   return nb::bytes(reinterpret_cast<const char*>(snapshot.data()), snapshot.size());
 }
@@ -778,6 +728,7 @@ NB_MODULE(async_emb_api, m) {
   m.def("lookup_start_init", [] { return encapsulate(kLookupStartInit); });
   m.def("lookup_start", [] { return encapsulate(kLookupStart); });
   m.def("lookup_done", [] { return encapsulate(kLookupDone); });
+  m.def("stage_update", [] { return encapsulate(kStageUpdate); });
   m.def("rowwise_adagrad_update_start_init", [] {
     return encapsulate(kRowwiseAdagradUpdateStartInit);
   });
@@ -797,31 +748,12 @@ NB_MODULE(async_emb_api, m) {
       nb::call_guard<nb::gil_scoped_release>()
   );
   m.def(
-      "drain",
-      [](int64_t context_id) {
-        waitLatest(context_id, AsyncEmbContext::Operation::Lookup, "drain");
-        waitLatest(context_id, AsyncEmbContext::Operation::Update, "drain");
-      },
-      nb::call_guard<nb::gil_scoped_release>()
-  );
-  m.def(
       "abort",
       [](int64_t context_id) {
         auto ctx = findContext(context_id);
         if (ctx != nullptr) {
           ctx->abort();
         }
-      },
-      nb::call_guard<nb::gil_scoped_release>()
-  );
-  m.def(
-      "reset_table_binding",
-      [](int64_t context_id) {
-        auto ctx = readyContext(context_id);
-        if (ctx == nullptr) {
-          throw std::invalid_argument("async_emb context not initialized");
-        }
-        ctx->resetTableBinding();
       },
       nb::call_guard<nb::gil_scoped_release>()
   );

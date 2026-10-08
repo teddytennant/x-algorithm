@@ -35,7 +35,7 @@ impl Selector<ScoredPostsQuery, FeedItem> for FollowingBlenderSelector {
         let blender = FollowingAdBlender {
             result_size: FOLLOWING_MAX_RESULT_SIZE,
         };
-        let mut blended = blender.blend(posts, ads);
+        let mut blended = blender.blend(posts, ads, &mut Vec::new());
 
         insert_prompts(&mut blended, prompts);
         if input_post_count > FOLLOWING_WHO_TO_FOLLOW_MIN_POSTS {

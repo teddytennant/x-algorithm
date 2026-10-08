@@ -1,12 +1,11 @@
 use crate::models::candidate::{CandidateHelpers, PostCandidate};
 use crate::models::query::ScoredPostsQuery;
-use crate::util::composition::Composition;
 use crate::util::tweet_type_metrics::*;
 use crate::util::viewer_history;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use tonic::async_trait;
-use xai_candidate_pipeline::component_library::utils::duration_since_creation_opt;
+use xai_candidate_pipeline::component_library::utils::{Composition, duration_since_creation_opt};
 use xai_candidate_pipeline::hydrator::Hydrator;
 
 const THIRTY_MINUTES_MS: u64 = 30 * 60 * 1000;
@@ -302,9 +301,9 @@ mod tests {
     #[test]
     fn test_bitset_to_bytes_multiple_bytes() {
         let mut bits = HashSet::new();
-        bits.insert(0); 
-        bits.insert(8); 
-        bits.insert(15); 
+        bits.insert(0);
+        bits.insert(8);
+        bits.insert(15);
         let bytes = TweetTypeMetricsHydrator::bitset_to_bytes(&bits);
         assert_eq!(bytes, vec![0b00000001, 0b10000001]);
     }
@@ -312,10 +311,10 @@ mod tests {
     #[test]
     fn test_bitset_to_bytes_large_bit_index() {
         let mut bits = HashSet::new();
-        bits.insert(314); 
+        bits.insert(314);
         let bytes = TweetTypeMetricsHydrator::bitset_to_bytes(&bits);
         assert_eq!(bytes.len(), 40);
-        assert_eq!(bytes[39], 0b00000100); 
+        assert_eq!(bytes[39], 0b00000100);
     }
 
     #[tokio::test]

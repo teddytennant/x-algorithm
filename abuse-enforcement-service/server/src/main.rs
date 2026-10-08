@@ -14,7 +14,8 @@ use xai_service_runner::ServerBuilder;
 use xai_abuse_enforcement_service::auth::ApiKeys;
 use xai_abuse_enforcement_service::config::Config;
 use xai_abuse_enforcement_service::{
-    build_api_router, build_docs_router, build_state, init_runtime_globals, start_kafka_consumers,
+    build_api_router, build_docs_router, build_state, init_runtime_globals, shutdown_kafka,
+    spawn_config_refresh, start_kafka_consumers,
 };
 
 fn admin_ui_public_dir() -> PathBuf {
@@ -84,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(admin_ui)
         .layer(trace_layer);
 
-    let kafka_consumers_handle = start_kafka_consumers(state.clone(), &cfg).await?;
+    let kafka_consumers = start_kafka_consumers(state.clone(), &cfg).await?;
 
     let server = ServerBuilder::new(cfg.port)
         .merge(app)
@@ -92,13 +93,11 @@ async fn main() -> anyhow::Result<()> {
         .on_ready(|| async {
             info!("Server ready and accepting requests (api=/api, docs=/api/docs, admin UI=/)");
         });
-    server.run().await?;
+    spawn_config_refresh(&state, server.shutdown_signal());
+    let served = server.run().await;
 
-    state
-        .kafka_producers
-        .flush_all(Duration::from_secs(5))
-        .await;
-    kafka_consumers_handle.abort();
+    shutdown_kafka(&state, kafka_consumers).await;
+    served?;
     info!("Server shutdown complete");
     Ok(())
 }

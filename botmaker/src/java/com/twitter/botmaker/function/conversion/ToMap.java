@@ -68,7 +68,7 @@ public class ToMap extends FunctionNode1<Runtime, Collection<Pair>> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   public Object apply(Context<Runtime> context, Collection<Pair> collection) {
     Map<Object, Object> hashMap = Maps.newHashMap();
     for (Pair<?, ?> pair : collection) {

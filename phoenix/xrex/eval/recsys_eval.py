@@ -124,6 +124,11 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
         all_post_embeddings = kwargs.get("all_post_embeddings", None)
         dataset_types = kwargs.get("dataset_types", None)
         all_post_ids = kwargs.get("all_post_ids", None)
+        if dataset_types is not None and self.target_dataset_type is RetrievalDataset.HOME:
+            is_home_slice = (dataset_types == RetrievalDataset.HOME_COLD.value) | (
+                dataset_types == RetrievalDataset.HOME_HOT.value
+            )
+            dataset_types = jnp.where(is_home_slice, RetrievalDataset.HOME.value, dataset_types)
         assert all_post_embeddings is not None and all_post_ids is not None
         sorted_post_ids, post_id_sort_idx = build_post_id_sorter(all_post_ids)
         _force_validate = os.environ.get("XAI_EVAL_VALIDATE_MEMBERSHIP") == "1"
@@ -249,6 +254,8 @@ class RecsysTwoTowerEval(EvaluationTaskNew):
                 _user_emb_fn = kwargs.get("user_emb_fn", None)
                 assert _user_emb_fn is not None, "user_emb_fn required for in-batch recall"
                 _user_emb = _user_emb_fn(jax_batch)
+                if _user_emb.ndim == 3:
+                    _user_emb = _user_emb[:, 0]
                 _local_start = jax.process_index() * local_batch_size
                 _user_local = np.asarray(
                     jax.device_get(_user_emb[_local_start : _local_start + local_batch_size])

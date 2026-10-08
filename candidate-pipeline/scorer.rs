@@ -1,4 +1,5 @@
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::type_name_of_val;
@@ -21,10 +22,12 @@ where
         &self,
         query: &Q,
         candidates: &[C],
-        _stage: PipelineStage,
+        stage: PipelineStage,
     ) -> Vec<Result<C, String>> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         let scored = self.score(query, candidates).await;
         let expected_len = candidates.len();
+        stats.finish_with_input(expected_len);
         if scored.len() == expected_len {
             scored
         } else {

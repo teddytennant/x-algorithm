@@ -1,3 +1,4 @@
+pub mod drops;
 mod following_ad_blender;
 mod multi_risk_blender;
 mod partition_organic_blender;
@@ -14,15 +15,30 @@ pub use safe_gap_blender::SafeGapAdsBlender;
 pub use time_gap_blender::{TimeGapAdsBlender, TimeGapConfig};
 
 use util::{record_ad_risk_stats, record_post_verdict_stats};
+use xai_ads_injection_proto::ads_injected_timeline::DroppedAd;
 use xai_home_mixer_proto::{FeedItem, ScoredPost};
 use xai_recsys_proto::AdIndexInfo;
 
 pub trait AdsBlender: Send + Sync {
         fn blend_inner(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem>;
 
-        fn blend(&self, scored_posts: Vec<ScoredPost>, ads: Vec<AdIndexInfo>) -> Vec<FeedItem> {
+    fn blend_inner_with_drops(
+        &self,
+        scored_posts: Vec<ScoredPost>,
+        ads: Vec<AdIndexInfo>,
+        _drops: &mut Vec<DroppedAd>,
+    ) -> Vec<FeedItem> {
+        self.blend_inner(scored_posts, ads)
+    }
+
+        fn blend(
+        &self,
+        scored_posts: Vec<ScoredPost>,
+        ads: Vec<AdIndexInfo>,
+        drops: &mut Vec<DroppedAd>,
+    ) -> Vec<FeedItem> {
         record_post_verdict_stats(&scored_posts);
         record_ad_risk_stats(&ads);
-        self.blend_inner(scored_posts, ads)
+        self.blend_inner_with_drops(scored_posts, ads, drops)
     }
 }

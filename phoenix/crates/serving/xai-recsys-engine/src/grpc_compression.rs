@@ -25,6 +25,15 @@ lazy_static! {
         exponential_buckets(512.0, 2.0, 15).unwrap()
     )
     .unwrap();
+    static ref RESPONSE_UNCOMPRESSED_BYTES: HistogramVec = register_histogram_vec!(
+        "recsys_engine_response_uncompressed_bytes",
+        "gRPC response frame size in bytes before zstd compression, by RPC \
+         method. Recorded when GrpcCompressionService attempts to compress the \
+         response.",
+        &["method"],
+        exponential_buckets(512.0, 2.0, 15).unwrap()
+    )
+    .unwrap();
     static ref RESPONSE_COMPRESS_MS: HistogramVec = register_histogram_vec!(
         "recsys_engine_response_compress_ms",
         "Outbound zstd time in ms (spawn_blocking queue + encode), by method.",
@@ -112,6 +121,9 @@ where
                 return Ok(rebuild_response(parts, data, trailers));
             }
 
+            RESPONSE_UNCOMPRESSED_BYTES
+                .with_label_values(&[&method])
+                .observe(data.len() as f64);
             let original = data.clone();
             let started = Instant::now();
             let result = tokio::task::spawn_blocking(move || compress_grpc_frame(&data)).await;
@@ -255,9 +267,13 @@ mod tests {
     }
 
     async fn call_zstd(payload: Vec<u8>) -> http::Response<axum::body::Body> {
+        call_zstd_method(payload, "PredictNextActions").await
+    }
+
+    async fn call_zstd_method(payload: Vec<u8>, method: &str) -> http::Response<axum::body::Body> {
         let mut svc = GrpcCompressionService::new(FakeSvc { payload });
         let req = http::Request::builder()
-            .uri("/xai_recsys.RecsysPredictor/PredictNextActions")
+            .uri(format!("/xai_recsys.RecsysPredictor/{method}"))
             .header("grpc-accept-encoding", "zstd")
             .body(())
             .unwrap();
@@ -288,6 +304,37 @@ mod tests {
         assert_eq!(
             trailers.get("grpc-status").map(|v| v.as_bytes()),
             Some(&b"0"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn records_frame_size_before_and_after_zstd() {
+        let method = "SizeBeforeAfter";
+        let payload = vec![0u8; 4096];
+        let frame_len = (GRPC_FRAME_HEADER_SIZE + payload.len()) as f64;
+        let resp = call_zstd_method(payload, method).await;
+        let wire = resp.into_body().collect().await.unwrap().to_bytes();
+
+        let before = RESPONSE_UNCOMPRESSED_BYTES.with_label_values(&[method]);
+        assert_eq!(before.get_sample_count(), 1);
+        assert_eq!(before.get_sample_sum(), frame_len);
+
+        let after = RESPONSE_COMPRESSED_BYTES.with_label_values(&[method]);
+        assert_eq!(after.get_sample_count(), 1);
+        assert_eq!(after.get_sample_sum(), wire.len() as f64);
+        assert!(after.get_sample_sum() < before.get_sample_sum());
+    }
+
+    #[tokio::test]
+    async fn too_small_to_compress_records_no_sizes() {
+        let method = "SizeTooSmall";
+        let resp = call_zstd_method(vec![], method).await;
+        resp.into_body().collect().await.unwrap();
+        assert_eq!(
+            RESPONSE_UNCOMPRESSED_BYTES
+                .with_label_values(&[method])
+                .get_sample_count(),
+            0
         );
     }
 }

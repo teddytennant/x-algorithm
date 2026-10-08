@@ -1,28 +1,73 @@
 use crate::models::candidate::{PhoenixScores, PostCandidate};
 use crate::models::fs_recipient::FsRecipientInputs;
 use crate::models::query::ScoredPostsQuery;
+use crate::params::*;
+use crate::scorers::vm_ranker_debias_payload::{candidate_payload, request_payload};
 use xai_vm_ranker_proto as pb;
 
-pub(crate) fn write_value_model_inputs(
-    query: &ScoredPostsQuery,
-    compute_value_model: bool,
-    request: &mut pb::RankRequest,
-) {
-    request.compute_value_model = compute_value_model;
-    request.viewer = query.fs_recipient_inputs.as_ref().map(viewer_context_proto);
-    request.topic_request = query.is_topic_request();
+const DPP_VALUE_MODEL_ID: &str = "dpp";
+
+pub(crate) struct RequestShape {
+    debias: bool,
+    pacing: bool,
 }
 
-pub(crate) fn write_candidate_inputs(candidate: &PostCandidate, out: &mut pb::RankCandidate) {
-    out.author_id = candidate.author_id;
-    out.in_network = candidate.in_network.unwrap_or(false);
-    out.is_retweet = candidate.retweeted_tweet_id.is_some();
-    out.is_reply = candidate.in_reply_to_tweet_id.is_some();
-    out.is_mutual_follow_author = candidate.is_mutual_follow_author == Some(true);
-    out.author_policy_zeroed = candidate.author_policy_zeroed;
-    out.cold_start_lift_to_rank = candidate.cold_start_lift_to_rank;
-    out.min_video_duration_ms = candidate.min_video_duration_ms;
-    out.phoenix_scores = Some(phoenix_scores_proto(&candidate.phoenix_scores));
+impl RequestShape {
+    pub(crate) fn from_query(query: &ScoredPostsQuery) -> Self {
+        Self {
+            debias: !query.has_cached_posts && query.params.get(VMRankerSendDebiasInputs),
+            pacing: query.params.get(VMRankerSendPacingInputs),
+        }
+    }
+
+    pub(crate) fn build(
+        &self,
+        query: &ScoredPostsQuery,
+        candidates: &[PostCandidate],
+        local: &[PostCandidate],
+    ) -> pb::RankRequest {
+        let proto_candidates = candidates
+            .iter()
+            .zip(local)
+            .map(|(c, local)| self.candidate(c, local))
+            .collect();
+        let mut request = pb::RankRequest {
+            viewer_id: query.user_id,
+            candidates: proto_candidates,
+            value_model_id: DPP_VALUE_MODEL_ID.to_string(),
+            compute_value_model: true,
+            viewer: query.fs_recipient_inputs.as_ref().map(viewer_context_proto),
+            topic_request: query.is_topic_request(),
+            ..Default::default()
+        };
+        if self.debias {
+            request.experiment_payload = request_payload(query, candidates).into();
+        }
+        request
+    }
+
+    fn candidate(&self, c: &PostCandidate, local: &PostCandidate) -> pb::RankCandidate {
+        let mut out = pb::RankCandidate {
+            tweet_id: c.tweet_id,
+            author_id: c.author_id,
+            retweeted_tweet_id: c.retweeted_tweet_id.unwrap_or(0),
+            score: local.score,
+            in_network: c.in_network.unwrap_or(false),
+            is_retweet: c.retweeted_tweet_id.is_some(),
+            is_reply: c.in_reply_to_tweet_id.is_some(),
+            is_mutual_follow_author: c.is_mutual_follow_author == Some(true),
+            cold_start_lift_to_rank: local.cold_start_lift_to_rank,
+            min_video_duration_ms: c.min_video_duration_ms,
+            phoenix_scores: Some(phoenix_scores_proto(&c.phoenix_scores)),
+            weighted_score: c.weighted_score,
+            semantic_ids: c.semantic_ids.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        if self.debias || self.pacing {
+            out.experiment_payload = candidate_payload(c, self.debias, self.pacing).into();
+        }
+        out
+    }
 }
 
 fn viewer_context_proto(inputs: &FsRecipientInputs) -> pb::ViewerContext {
@@ -69,6 +114,7 @@ fn phoenix_scores_proto(s: &PhoenixScores) -> pb::PhoenixScores {
         open_link_score: s.open_link_score,
         quoted_vqv_score: s.quoted_vqv_score,
         post_unexplored_score: s.post_unexplored_score,
-        active_secs_5m_residual_norm: s.active_secs_5m_residual_norm,
+        home_video_continuation_secs: s.home_video_continuation_secs,
+        home_profile_visit_secs: s.home_profile_visit_secs,
     }
 }

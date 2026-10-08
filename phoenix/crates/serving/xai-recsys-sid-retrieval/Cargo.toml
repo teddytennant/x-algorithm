@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 X.AI Corp.
+[package]
+name = "xai-recsys-sid-retrieval"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "xai-recsys-sid-retrieval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+arrow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+lazy_static = { workspace = true }
+moka = { workspace = true, features = ["sync"] }
+parquet = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+xai-recsys-server = { workspace = true }
+xai-recsys-sid-proto = { workspace = true }
+xai-recsys-sid-retrieval-proto = { workspace = true }
+
+[lints]
+workspace = true

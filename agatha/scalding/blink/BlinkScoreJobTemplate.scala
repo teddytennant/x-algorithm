@@ -48,6 +48,12 @@ trait BlinkScoreExtractionConfig {
     dateRange: DateRange
   ): Execution[Unit]
 
+  def writeUserBlinkScoreRecords(
+    userBlinkScores: TypedPipe[FlattenedBlinkScore],
+    dateRange: DateRange
+  ): Execution[Unit] =
+    writeUserBlinkScores(BaseBlinkScoreJob.toUserAverages(userBlinkScores), dateRange)
+
   def writeCalibratedUserBlinkScores(
     calibratedUserBlinkScores: TypedPipe[(Long, String, Double)],
     dateRange: DateRange
@@ -77,12 +83,79 @@ object BaseBlinkScoreJob {
       }
       .reduce(_ ++ _)
 
-    val userAverages = config
+    val userPredictions = config
       .getUserPredictions(dateRange)
       .filter(userPrediction => config.labelNames.contains(userPrediction.label))
       .filter(userPrediction =>
         !config.labelFilterFeatureClasses
           .getOrElse(userPrediction.label, Set.empty).contains(userPrediction.featureClass))
+
+    val userScores = scoreUsers(userPredictions, labelPriors).forceToDisk
+
+    val activeUserAverages = toUserAverages(userScores)
+      .groupBy { case (userId, _, _) => userId }
+      .join(GetActiveUsers(DateRange(dateRange.start, RichDate.now)).asKeys)
+      .mapValues(_._1)
+      .values
+
+    Execution
+      .zip(
+        userScores.forceToDiskExecution,
+        activeUserAverages.forceToDiskExecution,
+      ).flatMap {
+        case (userScores, activeUserAverages) =>
+          percentileCalibrateUserAverages(
+            toUserAverages(userScores),
+            activeUserAverages,
+            config.labelNames)
+            .flatMap { calibratedUserAverages =>
+              Execution
+                .zip(
+                  config.writeUserBlinkScoreRecords(userScores, dateRange),
+                  config.writeCalibratedUserBlinkScores(calibratedUserAverages, dateRange)
+                ).unit
+            }
+      }
+  }
+
+  type MomentSums = (Double, Double, Double, Double)
+
+  def momentSums(featureClass: FeatureClass, m0: Double, m1: Double): MomentSums =
+    if (featureClass.subclass == "inbound") (m0, m0 * m1, 0.0, 0.0)
+    else (m0, m0 * m1, m0, m0 * m1)
+
+  def blinkScore(sumM0M1: Double, sumM0: Double, prior: Double): Double =
+    (sumM0M1 + math.log(prior)) / (sumM0 + 1)
+
+  def toFlattenedBlinkScore(
+    userId: Long,
+    label: String,
+    sums: MomentSums,
+    prior: Double
+  ): FlattenedBlinkScore = {
+    val (sumM0, sumM0M1, outboundSumM0, outboundSumM0M1) = sums
+    FlattenedBlinkScore(
+      userId,
+      label,
+      blinkScore(sumM0M1, sumM0, prior),
+      scoreOutbound = Some(blinkScore(outboundSumM0M1, outboundSumM0, prior)),
+      support = Some(sumM0),
+      supportOutbound = Some(outboundSumM0)
+    )
+  }
+
+  def toUserAverages(
+    userScores: TypedPipe[FlattenedBlinkScore]
+  ): TypedPipe[(Long, String, Double)] =
+    userScores.map(s => (s.userId, s.label, s.score))
+
+  def scoreUsers(
+    userPredictions: TypedPipe[UserPrediction],
+    labelPriors: TypedPipe[(String, Double)]
+  )(
+    implicit uniqueId: UniqueID
+  ): TypedPipe[FlattenedBlinkScore] = {
+    userPredictions
       .flatMap { uP =>
         val m0 = uP.moments(0)
         val m1 = uP.moments(1)
@@ -94,7 +167,7 @@ object BaseBlinkScoreJob {
             !m0.isNaN && !m1.isNaN,
             f"Unexpected NaN ${uP.label} ${uP.userId} ${m0} ${m1}, see PFM-1435"
           )
-          Some(((uP.userId, uP.label), (m0, m0 * m1)))
+          Some(((uP.userId, uP.label), momentSums(uP.featureClass, m0, m1)))
         }
       }
       .group
@@ -102,33 +175,10 @@ object BaseBlinkScoreJob {
       .groupBy { case ((_, label), _) => label }
       .hashJoin(labelPriors)
       .mapValues {
-        case (((userId, label), (totalCount, totalSum)), prior) =>
-          (userId, label, (totalSum + math.log(prior)) / (totalCount + 1))
+        case (((userId, label), sums), prior) =>
+          toFlattenedBlinkScore(userId, label, sums, prior)
       }
       .values
-      .forceToDisk
-
-    val activeUserAverages = userAverages
-      .groupBy { case (userId, _, _) => userId }
-      .join(GetActiveUsers(DateRange(dateRange.start, RichDate.now)).asKeys)
-      .mapValues(_._1)
-      .values
-
-    Execution
-      .zip(
-        userAverages.forceToDiskExecution,
-        activeUserAverages.forceToDiskExecution,
-      ).flatMap {
-        case (userAverages, activeUserAverages) =>
-          percentileCalibrateUserAverages(userAverages, activeUserAverages, config.labelNames)
-            .flatMap { calibratedUserAverages =>
-              Execution
-                .zip(
-                  config.writeUserBlinkScores(userAverages, dateRange),
-                  config.writeCalibratedUserBlinkScores(calibratedUserAverages, dateRange)
-                ).unit
-            }
-      }
   }
 
   def percentileCalibrateUserAverages(
@@ -278,9 +328,18 @@ trait BlinkScoreConfig extends BlinkScoreExtractionConfig {
   override def writeUserBlinkScores(
     userBlinkScores: TypedPipe[(Long, String, Double)],
     dateRange: DateRange
+  ): Execution[Unit] =
+    writeUserBlinkScoreRecords(
+      userBlinkScores.map {
+        case (userId, label, score) => FlattenedBlinkScore(userId, label, score)
+      },
+      dateRange)
+
+  override def writeUserBlinkScoreRecords(
+    userBlinkScores: TypedPipe[FlattenedBlinkScore],
+    dateRange: DateRange
   ): Execution[Unit] = {
     userBlinkScores
-      .map { case (userId, label, score) => FlattenedBlinkScore(userId, label, score) }
       .shard(100)
       .writeDALSnapshotExecution(
         AgathaBlinkScoresSnapshotScalaDataset,

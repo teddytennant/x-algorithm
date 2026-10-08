@@ -22,6 +22,7 @@ from grox.flows.ptos.mode import SafetyPtosMode
 from grok_sampler.config import GrokModelConfig, EapiModelConfig
 from grox.flows.ptos.prompts import (
     adult_content_policy_prompt,
+    age_gating_harmful_text_policy_prompt,
     child_safety_policy_prompt,
     hate_or_abuse_policy_prompt,
     illegal_and_regulated_behaviors_policy_prompt,
@@ -102,7 +103,7 @@ _eapi_4_6_internal_breaker = CircuitBreaker(
 
 
 class SafetyPtosCategoryClassifier:
-    result_pattern = re.compile(r"(.*)<json>(.*)</json>", re.DOTALL)
+    result_pattern = re.compile(r"(.*)<json(?!\w)[>}\]]?(.*)</json>", re.DOTALL)
 
     def __init__(
         self,
@@ -520,6 +521,8 @@ class SafetyPtosPolicyClassifier:
             return violent_speech_policy_prompt()
         elif violation.category == SafetyPolicyCategory.SuicideOrSelfHarm:
             return suicide_or_self_harm_policy_prompt()
+        elif violation.category == SafetyPolicyCategory.AgeGatingHarmfulText:
+            return age_gating_harmful_text_policy_prompt()
         else:
             raise ValueError(
                 f"No policy prompt available for category: {violation.category.value}"
@@ -572,6 +575,7 @@ class SafetyPtosPolicyClassifier:
         SafetyPolicyCategory.HateOrAbuse,
         SafetyPolicyCategory.ViolentSpeech,
         SafetyPolicyCategory.SuicideOrSelfHarm,
+        SafetyPolicyCategory.AgeGatingHarmfulText,
     }
 
     DELUXE_4_3_CATEGORIES = {
@@ -587,6 +591,7 @@ class SafetyPtosPolicyClassifier:
     USE_GEMMA_CATEGORIES = {
         SafetyPolicyCategory.Spam,
         SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
+        SafetyPolicyCategory.AgeGatingHarmfulText,
     }
 
     USE_THREAD_RENDERER_CATEGORIES = {

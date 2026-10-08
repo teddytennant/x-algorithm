@@ -1,15 +1,19 @@
 pub mod ad_index_client;
+pub mod author_brand_safety_client;
 pub mod engagement_counts_client;
 pub mod engagement_signals_client;
 pub mod gizmoduck_client;
 pub mod impressed_posts_client;
 pub mod night_owl_client;
 pub mod past_request_timestamps_client;
+pub mod popular_authors_store_client;
 pub mod prompts_client;
 pub mod resurrection_date_client;
 pub mod rotating_channel;
 pub mod s2s;
 pub mod served_history_client;
+pub mod sid_retrieval_client;
+pub mod simclusters_ann_cache_client;
 pub mod simclusters_ann_client;
 pub mod tweet_entity_service_client;
 

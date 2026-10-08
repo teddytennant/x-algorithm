@@ -29,6 +29,56 @@ def _load_sid_decoder(
     )
 
 
+def sid_prefix2_lookup(
+    sids: jnp.ndarray,
+    sid_codebook_size: int,
+    embed_dim: int,
+    lr_multiplier_func: Callable[[int], float],
+    embed_init_scale: float,
+    name_prefix: str,
+) -> jnp.ndarray:
+    sids = sids.astype(jnp.int32)
+    first, second = sids[..., 0], sids[..., 1]
+    prefix2 = jnp.where((first > 0) & (second > 0), (first - 1) * sid_codebook_size + second, 0)
+    table = get_parameter(
+        f"{name_prefix}_sid_prefix2",
+        [sid_codebook_size * sid_codebook_size + 1, embed_dim],
+        dtype=jnp.float32,
+        init=hk.initializers.VarianceScaling(1.0, mode="fan_out"),
+        pspec=P(None, None),
+        lr_multiplier=lr_multiplier_func(embed_dim),
+    )
+    table = table.at[0].set(0.0)
+    return jnp.take(table, prefix2, axis=0)
+
+
+def sid_prefix3_lookup(
+    sids: jnp.ndarray,
+    sid_codebook_size: int,
+    embed_dim: int,
+    rows: int,
+    lr_multiplier_func: Callable[[int], float],
+    embed_init_scale: float,
+    name_prefix: str,
+) -> jnp.ndarray:
+    codes = sids[..., :3].astype(jnp.uint32)
+    exact = ((codes[..., 0] - 1) * sid_codebook_size + (codes[..., 1] - 1)) * sid_codebook_size + (
+        codes[..., 2] - 1
+    )
+    hashed = (exact * jnp.uint32(2654435761)) % jnp.uint32(rows) + 1
+    prefix3 = jnp.where((codes > 0).all(axis=-1), hashed, 0).astype(jnp.int32)
+    table = get_parameter(
+        f"{name_prefix}_sid_prefix3",
+        [rows + 1, embed_dim],
+        dtype=jnp.float32,
+        init=hk.initializers.VarianceScaling(1.0, mode="fan_out"),
+        pspec=P(None, None),
+        lr_multiplier=lr_multiplier_func(embed_dim),
+    )
+    table = table.at[0].set(0.0)
+    return jnp.take(table, prefix3, axis=0)
+
+
 def reconstruct_entity_sid(
     sids: jnp.ndarray,
     target_dim: int,

@@ -502,7 +502,7 @@ public class Compiler<E> {
           result = Exists.of(funcName, getFeatureName(root.getChild(1)));
           break;
         case Filter:
-          assertNumChildren(root, 4); 
+          assertNumChildren(root, 4);
           result = toFilter(context, funcName,
               root.getChild(1), root.getChild(2), root.getChild(3));
           break;
@@ -789,7 +789,7 @@ public class Compiler<E> {
     ASTNode collectionNode = createASTNodeTree(context, collectionTree);
     Optional<ASTNode> batchSizeNode = batchSizeTree.isPresent()
         ? Optional.of(createASTNodeTree(context, batchSizeTree.get()))
-        : Optional.absent(); 
+        : Optional.absent();
 
     final Type fromType;
     if (Collection.class.isAssignableFrom(collectionNode.getReturnType().typeBase)) {

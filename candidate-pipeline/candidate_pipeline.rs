@@ -1,6 +1,6 @@
 use crate::filter::Filter;
 use crate::hydrator::Hydrator;
-use crate::pipeline_summary::{self, StageStats};
+use crate::pipeline_summary::{self, PipelineTrace, StageStats};
 use crate::query_hydrator::QueryHydrator;
 use crate::scorer::Scorer;
 use crate::selector::SelectResult;
@@ -99,13 +99,25 @@ where
     fn result_size(&self) -> usize;
     fn finalize(&self, _query: &Q, _candidates: &mut Vec<C>) {}
 
-    #[xai_stats_macro::receive_stats(latency=Bucket500To2500)]
     async fn execute(&self, query: Q) -> PipelineResult<Q, C> {
+        self.execute_traced(query).await.0
+    }
+
+    async fn execute_traced(&self, query: Q) -> (PipelineResult<Q, C>, Option<PipelineTrace>) {
         xai_stats_receiver::with_scoped_metric_labels(
             vec![("pipeline".to_string(), self.name().to_string())],
-            pipeline_summary::scope(self.execute_stages(query)),
+            pipeline_summary::scope(
+                self.name(),
+                type_name_of_val(self),
+                self.execute_instrumented(query),
+            ),
         )
         .await
+    }
+
+    #[xai_stats_macro::receive_stats(name = "execute", latency = Bucket500To2500)]
+    async fn execute_instrumented(&self, query: Q) -> PipelineResult<Q, C> {
+        self.execute_stages(query).await
     }
 
     async fn execute_stages(&self, query: Q) -> PipelineResult<Q, C> {
@@ -370,16 +382,12 @@ where
         let enabled: Vec<_> = filters.iter().filter(|f| f.enable(query)).collect();
         stats.record_components(filters.len(), enabled.len());
         let mut all_removed = Vec::new();
-        let mut removed_per_filter: Vec<(String, usize)> = Vec::new();
         for filter in enabled {
             let result = filter.run(query, candidates, stage);
-            if !result.removed.is_empty() {
-                removed_per_filter.push((filter.name().to_string(), result.removed.len()));
-            }
             candidates = result.kept;
             all_removed.extend(result.removed);
         }
-        stats.finish_filters(candidates.len(), all_removed.len(), removed_per_filter);
+        stats.finish_filters(candidates.len(), all_removed.len());
         (candidates, all_removed)
     }
 
@@ -401,7 +409,10 @@ where
     }
 
     fn select(&self, query: &Q, candidates: Vec<C>) -> SelectResult<C> {
-        if self.selector().enable(query) {
+        let stats = StageStats::begin(PipelineStage::Selector);
+        let enabled = self.selector().enable(query);
+        stats.record_components(1, enabled as usize);
+        let result = if enabled {
             self.selector()
                 .run(query, candidates, PipelineStage::Selector)
         } else {
@@ -409,7 +420,9 @@ where
                 selected: candidates,
                 non_selected: vec![],
             }
-        }
+        };
+        stats.finish_with_size(result.selected.len());
+        result
     }
 
     fn run_side_effects(&self, input: Arc<SideEffectInput<Q, C>>) {

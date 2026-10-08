@@ -3,11 +3,11 @@ use std::env;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use log::info;
-use xai_kafka::{config::SslConfig, KafkaConsumer, KafkaConsumerBuilder, KafkaMessage};
+use xai_kafka::{config::SslConfig, KafkaConsumer, KafkaConsumerConfigBuilder, KafkaMessage};
 use xai_wily::WilyConfig;
 
 use super::{ConsumerError, EventConsumer, RawBatch};
-use crate::config::Cli;
+use crate::config::{Cli, KafkaAuthMode};
 
 pub struct KafkaEventConsumer {
     inner: KafkaConsumer,
@@ -18,10 +18,46 @@ pub struct KafkaEventConsumer {
 impl KafkaEventConsumer {
     pub async fn from_cli(cli: &Cli) -> Result<Self> {
         let topic = cli.effective_topic().to_string();
+
+        let config = match cli.kafka_auth {
+            KafkaAuthMode::Scram => Self::scram_config(cli, &topic)?,
+            KafkaAuthMode::Mtls => Self::mtls_config(cli, &topic)?,
+        };
+
+        let start_from_minutes_ago = if cli.seek_hours > 0 {
+            Some(cli.seek_hours * 60)
+        } else {
+            None
+        };
+
+        info!(
+            "kafka consumer config: auth={:?}, topic={}, group={}, seek_hours={}, auto_offset_reset={}",
+            cli.kafka_auth, topic, cli.group, cli.seek_hours, cli.auto_offset_reset,
+        );
+
+        let config = config
+            .with_auto_offset_reset(cli.auto_offset_reset.clone())
+            .with_enable_auto_offset_store(false)
+            .with_enable_auto_commit(false)
+            .with_fetch_timeout_ms(5000)
+            .with_start_from_minutes_ago(start_from_minutes_ago);
+        let mut inner = KafkaConsumer::new(config);
+        inner
+            .start()
+            .await
+            .context("failed to start Kafka consumer")?;
+
+        Ok(Self {
+            inner,
+            max_poll_records: cli.max_poll_records,
+            last_batch_metadata: Vec::new(),
+        })
+    }
+
+    fn scram_config(cli: &Cli, topic: &str) -> Result<KafkaConsumerConfigBuilder> {
         let bootstrap = cli.bootstrap.clone();
 
         let is_wily = bootstrap.starts_with('/') || bootstrap.starts_with("s/");
-
         let (wily_config, brokers) = if is_wily {
             (Some(WilyConfig::default()), None)
         } else {
@@ -43,37 +79,23 @@ impl KafkaEventConsumer {
             sasl_password: Some(sasl_password),
         };
 
-        let start_from_minutes_ago = if cli.seek_hours > 0 {
-            Some(cli.seek_hours * 60)
-        } else {
-            None
-        };
+        Ok(
+            KafkaConsumerConfigBuilder::new(bootstrap, topic, &cli.group)
+                .with_brokers(brokers)
+                .with_wily_config(wily_config)
+                .with_ssl(ssl),
+        )
+    }
 
-        info!(
-            "kafka consumer config: topic={}, group={}, seek_hours={}",
-            topic, cli.group, cli.seek_hours,
-        );
-
-        let mut inner = KafkaConsumerBuilder::new(bootstrap, topic, &cli.group)
-            .with_brokers(brokers)
-            .with_wily_config(wily_config)
-            .with_ssl(ssl)
-            .with_auto_offset_reset("latest")
-            .with_enable_auto_offset_store(false)
-            .with_enable_auto_commit(false)
-            .with_fetch_timeout_ms(5000)
-            .with_start_from_minutes_ago(start_from_minutes_ago)
-            .build();
-        inner
-            .start()
-            .await
-            .context("failed to start Kafka consumer")?;
-
-        Ok(Self {
-            inner,
-            max_poll_records: cli.max_poll_records,
-            last_batch_metadata: Vec::new(),
-        })
+    fn mtls_config(cli: &Cli, topic: &str) -> Result<KafkaConsumerConfigBuilder> {
+        let cluster = cli.mtls_cluster()?;
+        KafkaConsumerConfigBuilder::for_cluster_mtls_auto(
+            cluster,
+            topic,
+            &cli.group,
+            cli.kafka_zone.as_deref(),
+        )
+        .with_context(|| format!("failed to configure mTLS consumer for Kafka cluster '{cluster}'"))
     }
 
     fn extract_metadata(msg: &KafkaMessage) -> xai_kafka::KafkaMessageMetadata {

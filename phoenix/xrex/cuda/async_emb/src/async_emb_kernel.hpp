@@ -66,7 +66,7 @@ void launch_grad_segment_sum(
 );
 
 void launch_rowwise_adagrad_apply(
-    float* grad_accum,
+    const float* grad_accum,
     const float* row_sq_sums,
     const int32_t* unique_tokens,
     float* row_state,

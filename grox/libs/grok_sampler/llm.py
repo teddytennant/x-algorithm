@@ -67,7 +67,7 @@ class LiteLLM(ABC, Generic[T]):
 
     async def _sample_streaming(self, query: T, **kwargs) -> AsyncGenerator[str, None]:
         keep_separator = kwargs.get("keep_separator", False)
-        separator = kwargs.get("separator", SEPARATOR)
+        separator = kwargs.pop("separator", SEPARATOR)
         log_prompt = kwargs.get("log_prompt", False)
         stop_predicate: Callable[[str], bool] | None = kwargs.get("stop_predicate")
         request = await self._get_sample_request(query, separator, **kwargs)

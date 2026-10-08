@@ -26,6 +26,41 @@ struct Args {
     datacenter: String,
     #[arg(long, default_value = "")]
     otel_endpoint: String,
+    #[arg(long)]
+    popular_authors_job: bool,
+    #[arg(long)]
+    popular_authors_job_once: bool,
+    #[arg(long, default_value_t = 3600)]
+    popular_authors_job_interval_secs: u64,
+    #[arg(long, default_value_t = xai_home_mixer::util::popular_authors::TOP_POSTING_AUTHORS_FRACTION)]
+    popular_authors_fraction: f64,
+    #[arg(
+        long,
+        default_value = "twttr-bq-timelines-prod.pulse.popular_posting_authors"
+    )]
+    popular_authors_bigquery_table: String,
+    #[arg(long, default_value = "/etc/pulse-bq/key.json")]
+    popular_authors_bigquery_key_path: String,
+    #[arg(long)]
+    popular_authors_egress_proxy: Option<String>,
+    #[arg(long, default_value_t = 30)]
+    popular_authors_max_snapshot_age_hours: u64,
+    #[arg(long)]
+    popular_posts_job: bool,
+    #[arg(long)]
+    popular_posts_job_once: bool,
+    #[arg(long, default_value_t = 300)]
+    popular_posts_job_interval_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    popular_posts_per_author: usize,
+    #[arg(long, default_value_t = 500)]
+    popular_posts_budget: usize,
+    #[arg(long, default_value_t = 8.0)]
+    popular_posts_half_life_hours: f64,
+    #[arg(long)]
+    select_popular_posts: bool,
+    #[arg(long, value_parser = ["authors", "posts"])]
+    dump_popular_store: Option<String>,
 
     #[arg(long, default_value = "penalized_peak_ewma")]
     phoenix_xds_lb_policy: String,
@@ -94,6 +129,57 @@ fn parse_shard(args: &Args) -> Option<ShardCoordinate> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(store) = &args.dump_popular_store {
+        return dump_popular_store(&args.datacenter, store == "posts").await;
+    }
+    if args.popular_authors_job || args.popular_authors_job_once {
+        let _stats =
+            xai_stats_receiver::init_stats_receiver_guarded("home-mixer-popular-authors-job");
+        let _tracing = xai_pipeline_tracing::init_tracing(
+            "xai-home-mixer-popular-authors-job",
+            &args.otel_endpoint,
+        );
+        xai_init_utils::init().rustls();
+        jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER
+            .install_default()
+            .ok();
+        return xai_home_mixer::popular_authors_job::run(
+            xai_home_mixer::popular_authors_job::JobConfig {
+                datacenter: args.datacenter.clone(),
+                interval: Duration::from_secs(args.popular_authors_job_interval_secs),
+                fraction: args.popular_authors_fraction,
+                bigquery_table: args.popular_authors_bigquery_table.clone(),
+                bigquery_key_path: args.popular_authors_bigquery_key_path.clone(),
+                egress_proxy: args.popular_authors_egress_proxy.clone(),
+                max_snapshot_age: Duration::from_secs(
+                    args.popular_authors_max_snapshot_age_hours * 3600,
+                ),
+                once: args.popular_authors_job_once,
+            },
+        )
+        .await;
+    }
+    if args.select_popular_posts {
+        return select_popular_posts_from_stdin(selection_config(&args));
+    }
+    if args.popular_posts_job || args.popular_posts_job_once {
+        let _stats =
+            xai_stats_receiver::init_stats_receiver_guarded("home-mixer-popular-posts-job");
+        let _tracing = xai_pipeline_tracing::init_tracing(
+            "xai-home-mixer-popular-posts-job",
+            &args.otel_endpoint,
+        );
+        xai_init_utils::init().rustls();
+        return xai_home_mixer::popular_posts_job::run(
+            xai_home_mixer::popular_posts_job::JobConfig {
+                datacenter: args.datacenter.clone(),
+                interval: Duration::from_secs(args.popular_posts_job_interval_secs),
+                selection: selection_config(&args),
+                once: args.popular_posts_job_once,
+            },
+        )
+        .await;
+    }
     let shard_coordinate = parse_shard(&args);
 
     xai_stringcenter::init_from_file(params::STRINGCENTER_BUNDLE_PATH);
@@ -151,4 +237,89 @@ async fn main() -> anyhow::Result<()> {
             vm_ranker_xds,
         })
         .await
+}
+
+async fn dump_popular_store(datacenter: &str, posts: bool) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use xai_home_mixer::clients::popular_authors_store_client::{
+        read_raw, POPULAR_AUTHORS_VERSION, POPULAR_POSTS_VERSION,
+    };
+    use xai_home_mixer::util::{popular_authors, popular_posts};
+
+    let version = if posts {
+        POPULAR_POSTS_VERSION
+    } else {
+        POPULAR_AUTHORS_VERSION
+    };
+    let Some(bytes) = read_raw(datacenter, version).await? else {
+        println!("version={version} missing");
+        return Ok(());
+    };
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    if posts {
+        let stored = popular_posts::decode_stored(&bytes).map_err(anyhow::Error::msg)?;
+        let mut per_author: HashMap<u64, usize> = HashMap::new();
+        for p in &stored.posts {
+            *per_author.entry(p.author_id).or_default() += 1;
+        }
+        println!(
+            "version={version} bytes={} generated_at_ms={} posts={} authors={} max_per_author={}",
+            bytes.len(),
+            stored.generated_at_ms,
+            stored.posts.len(),
+            per_author.len(),
+            per_author.values().max().copied().unwrap_or(0)
+        );
+        for p in &stored.posts {
+            println!("post {},{},{}", p.post_id, p.author_id, p.quality);
+        }
+    } else {
+        let stored = popular_authors::decode_stored(&bytes).map_err(anyhow::Error::msg)?;
+        println!(
+            "version={version} bytes={} updated_at_ms={} authors={}",
+            bytes.len(),
+            stored.updated_at_ms,
+            stored.authors.len()
+        );
+    }
+    println!("hex={hex}");
+    Ok(())
+}
+
+fn selection_config(args: &Args) -> xai_home_mixer::util::popular_posts::SelectionConfig {
+    xai_home_mixer::util::popular_posts::SelectionConfig {
+        per_author: args.popular_posts_per_author,
+        budget: args.popular_posts_budget,
+        half_life_hours: args.popular_posts_half_life_hours,
+        ..Default::default()
+    }
+}
+
+fn select_popular_posts_from_stdin(
+    config: xai_home_mixer::util::popular_posts::SelectionConfig,
+) -> anyhow::Result<()> {
+    use std::io::Read;
+    use xai_home_mixer::util::popular_posts::{select_popular_posts, PostViews};
+
+    let mut text = String::new();
+    std::io::stdin().read_to_string(&mut text)?;
+    let mut posts = Vec::new();
+    for line in text
+        .lines()
+        .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        let fields: Vec<&str> = line.split(',').map(str::trim).collect();
+        anyhow::ensure!(fields.len() >= 4, "bad row: {line}");
+        posts.push(PostViews {
+            post_id: fields[0].parse()?,
+            author_id: fields[1].parse()?,
+            age_hours: fields[2].parse()?,
+            views: fields[3].parse()?,
+        });
+    }
+    println!("post_id,author_id,quality");
+    for p in select_popular_posts(&posts, &config) {
+        println!("{},{},{}", p.post_id, p.author_id, p.quality);
+    }
+    Ok(())
 }

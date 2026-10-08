@@ -2,17 +2,20 @@ use crate::models::candidate::CandidateHelpers;
 use crate::models::candidate::PostCandidate;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::{
-    PhoenixInferenceClusterId, PhoenixRankerNewUserHistoryThreshold,
+    EnableHomeExcursionScores, PhoenixInferenceClusterId, PhoenixRankerNewUserHistoryThreshold,
     PhoenixRankerNewUserInferenceClusterId, RerankerHeadTag,
 };
 use crate::util::egress::PredictionDispatch;
 use crate::util::phoenix_request::build_prediction_request;
 use tonic::async_trait;
-use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::PhoenixCluster;
+use xai_candidate_pipeline::component_library::clients::phoenix_prediction_client::{
+    PhoenixCluster, PredictNextActions,
+};
 
+use xai_candidate_pipeline::component_library::models::PhoenixScores;
 use xai_candidate_pipeline::component_library::utils::current_timestamp_millis;
 use xai_candidate_pipeline::scorer::Scorer;
-use xai_recsys_proto::ProductSurface;
+use xai_recsys_proto::{ContinuousActionName, ProductSurface};
 
 pub const PHOENIX_RANKER_KILL_SWITCH_DECIDER: &str = "disable_home_mixer_phoenix_ranker";
 
@@ -103,10 +106,15 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
             Err(err) => return vec![Err(err); candidates.len()],
         };
 
+        let home_excursion_scores = query.params.get(EnableHomeExcursionScores);
         candidates
             .iter()
             .map(|c| PostCandidate {
-                phoenix_scores: predictions.candidate_scores(&c.get_original_tweet_id()),
+                phoenix_scores: if home_excursion_scores {
+                    with_home_excursion_heads(&predictions, c.get_original_tweet_id())
+                } else {
+                    predictions.candidate_scores(&c.get_original_tweet_id())
+                },
                 backbone_scores: predictions.candidate_backbone_scores(&c.get_original_tweet_id()),
                 served_slate_context: predictions
                     .candidate_slate_context(&c.get_original_tweet_id())
@@ -127,5 +135,19 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScorer {
         candidate.prediction_request_id = scored.prediction_request_id;
         candidate.last_scored_at_ms = scored.last_scored_at_ms;
         candidate.reranker_head_tag = scored.reranker_head_tag;
+    }
+}
+
+fn with_home_excursion_heads(predictions: &PredictNextActions, tweet_id: u64) -> PhoenixScores {
+    PhoenixScores {
+        home_video_continuation_secs: predictions.candidate_continuous_value(
+            &tweet_id,
+            ContinuousActionName::HomeVideoContinuationSecs as usize,
+        ),
+        home_profile_visit_secs: predictions.candidate_continuous_value(
+            &tweet_id,
+            ContinuousActionName::HomeProfileVisitSecs as usize,
+        ),
+        ..predictions.candidate_scores(&tweet_id)
     }
 }

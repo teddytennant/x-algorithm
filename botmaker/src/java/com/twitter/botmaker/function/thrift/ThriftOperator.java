@@ -41,7 +41,7 @@ public abstract class ThriftOperator<E, T extends TBase> extends FunctionNode<E>
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   public Object apply(Context<E> context, List<Object> args) throws Exception {
 
     Map<Object, Object> hashMap = Maps.newHashMap();

@@ -65,7 +65,7 @@ public class ToPair extends FunctionNode2<Runtime, Object, Object> {
   }
 
   @Override
-  @SuppressWarnings("unchecked")  
+  @SuppressWarnings("unchecked")
   protected Object apply(Context<Runtime> context, Object arg1, Object arg2) {
     return new Pair(arg1, arg2);
   }

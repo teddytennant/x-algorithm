@@ -10,6 +10,8 @@ macro_rules! using {
 }
 
 pub const NOTICES_ON_TWITTER: &str = rules!("notices-on-x");
+pub const SENSITIVE_MEDIA_APPEAL_PREFIX: &str =
+    "https://x.com/i/safety/report_story_start?source=appealtweet&reported_tweet_id=";
 pub const ENFORCEMENT_OPTIONS: &str = rules!("enforcement-options");
 pub const PUBLIC_INTEREST: &str = rules!("public-interest");
 pub const TWITTER_RULES: &str = rules!("x-rules");
@@ -28,6 +30,9 @@ pub const COMMUNITIES: &str = using!("communities");
 pub const SUPER_FOLLOWS: &str = using!("super-follows");
 pub const PREMIUM_CONTENT: &str = "https://help.x.com/en/using-x/x-premium";
 pub const DMCA_WITHHELD: &str = "https://help.x.com/articles/15795";
+
+pub const APPLE_APP_STORE_UPDATE: &str = "https://apps.apple.com/us/app/x/id333903271%20https://apps.apple.com/app/apple-store/id333903271?pt=9551&ct=age-assurance-update&mt=8";
+pub const GOOGLE_PLAY_STORE_UPDATE: &str = "https://play.google.com/store/apps/details?id=com.twitter.android&referrer=utm_source%3D9551%26utm_medium%3D8%26utm_campaign%3Dage-assurance-update";
 
 pub const PROFILE_SETTINGS: &str = "https://x.com/settings/profile";
 pub const X_DOT_COM: &str = "https://x.com";

@@ -45,9 +45,9 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum
-from quack import copy_utils, layout_utils, sm90_utils
-from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.quack import copy_utils, layout_utils, sm90_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import pipeline as pipeline_custom
 from xrex.cutedsl.ranker_fa4 import utils
 from xrex.cutedsl.ranker_fa4.block_info import BlockInfo

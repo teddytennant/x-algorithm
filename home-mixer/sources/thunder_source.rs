@@ -39,6 +39,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for ThunderSource {
             algorithm: query.params.get(ThunderAlgorithm),
             debug: false,
             is_video_request: false,
+            per_author_limits: None,
         };
 
         let capi = self.thunder_capi_client.as_ref().filter(|_| {

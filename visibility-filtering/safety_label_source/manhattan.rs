@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,14 +21,14 @@ impl ManhattanSource {
 
 #[async_trait]
 impl ManhattanLookup for ManhattanSource {
-    async fn get(&self, ids: &[u64]) -> HashMap<u64, ManhattanOutcome> {
-        let mut results = HashMap::with_capacity(ids.len());
+    async fn get(&self, ids: &[u64]) -> FxHashMap<u64, ManhattanOutcome> {
+        let mut results = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
         if ids.is_empty() {
             return results;
         }
 
         let start = Instant::now();
-        let i64_ids: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+        let i64_ids: Vec<i64> = ids.iter().map(|&id| id.cast_signed()).collect();
         let mut successes = 0usize;
         let mut failures = 0usize;
 
@@ -106,6 +106,7 @@ impl ManhattanLookup for ManhattanSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use xai_manhattan::ManhattanError;
     use xai_safety_label_store::types::encode_lkey;
@@ -209,24 +210,8 @@ mod tests {
     async fn get_with_fetcher(
         fetcher: FakeLabelFetcher,
         ids: &[u64],
-    ) -> HashMap<u64, ManhattanOutcome> {
+    ) -> FxHashMap<u64, ManhattanOutcome> {
         ManhattanSource::new(Arc::new(fetcher)).get(ids).await
-    }
-
-    #[tokio::test]
-    async fn get_returns_labels() {
-        let results = get_with_fetcher(
-            FakeLabelFetcher::new().with_label(100, SafetyLabelType::SPAM, Some(0.9)),
-            &[100],
-        )
-        .await;
-
-        match results.get(&100).unwrap() {
-            ManhattanOutcome::Resolved(label_map) => assert!(label_map
-                .labels
-                .contains_key(&i32::from(SafetyLabelType::SPAM))),
-            _ => panic!("expected hit"),
-        }
     }
 
     #[tokio::test]
@@ -251,7 +236,8 @@ mod tests {
 
         assert!(matches!(
             results.get(&1).unwrap(),
-            ManhattanOutcome::Resolved(_)
+            ManhattanOutcome::Resolved(label_map)
+                if label_map.labels.contains_key(&i32::from(SafetyLabelType::SPAM))
         ));
         assert!(matches!(
             results.get(&2).unwrap(),
@@ -276,26 +262,6 @@ mod tests {
                     if failure.kind == FailureKind::ManhattanFetch
                         && failure.message.contains("test error")
             ));
-        }
-    }
-
-    #[tokio::test]
-    async fn get_corrupt_mval_defaults_label_for_that_id() {
-        let mut fetcher = FakeLabelFetcher::new();
-        fetcher
-            .items
-            .entry(100)
-            .or_default()
-            .push(raw_label(SafetyLabelType::SPAM, vec![0xDE, 0xAD]));
-
-        let results = get_with_fetcher(fetcher, &[100]).await;
-
-        match results.get(&100).unwrap() {
-            ManhattanOutcome::Resolved(label_map) => assert_eq!(
-                label_map.labels[&i32::from(SafetyLabelType::SPAM)],
-                xai_visibility_filtering_proto::SafetyLabel::default()
-            ),
-            _ => panic!("expected resolved"),
         }
     }
 

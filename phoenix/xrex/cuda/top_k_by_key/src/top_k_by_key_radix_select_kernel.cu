@@ -17,7 +17,6 @@ __device__ __forceinline__ uint32_t ordered16(uint16_t raw) {
   return (raw & 0x8000u) ? (uint32_t)(uint16_t)~raw : (uint32_t)(raw | 0x8000u);
 }
 
-
 __global__ void hist_hi_kernel(
     const uint16_t* __restrict__ keys, int64_t n, uint32_t* __restrict__ hist
 ) {

@@ -39,15 +39,15 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
-import quack.activation
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import PipelineAsync
 from cutlass.utils import LayoutEnum
-from quack import layout_utils
-from quack.cute_dsl_utils import ParamsBase
 
+from xrex.cutedsl.quack import activation as quack_activation
+from xrex.cutedsl.quack import layout_utils
+from xrex.cutedsl.quack.cute_dsl_utils import ParamsBase
 from xrex.cutedsl.ranker_fa4 import barrier, copy_utils, pipeline, utils
 from xrex.cutedsl.ranker_fa4.blackwell_helpers import gemm_ptx_w_idx, gemm_w_idx
 from xrex.cutedsl.ranker_fa4.block_info import BlockInfo
@@ -2922,7 +2922,7 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
+                            quack_activation.sub_packed_f32x2(
                                 (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                             )
                         )

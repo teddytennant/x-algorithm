@@ -35,7 +35,7 @@ import com.twitter.util.Try;
 public class BatchedOr extends ASTNode<Runtime> {
 
   private static final Signature SIGNATURE = new Signature(
-      ImmutableList.of(Type.BOOLEAN), 
+      ImmutableList.of(Type.BOOLEAN),
       Type.BOOLEAN,
       Type.BOOLEAN
   );
@@ -131,11 +131,11 @@ public class BatchedOr extends ASTNode<Runtime> {
       Future<List<Try<Boolean>>> batchResponses = Futures.collect(listOfFutures);
       return batchResponses.flatMap(nextVals -> {
         for (Try<Boolean> result : nextVals) {
-          if (result.get()) { 
+          if (result.get()) {
             return Future.True();
           }
         }
-        if (remainingElements == elementsThisRound) { 
+        if (remainingElements == elementsThisRound) {
           return Future.False();
         }
         return evaluate(context, childExtractors, startIdx + elementsThisRound);

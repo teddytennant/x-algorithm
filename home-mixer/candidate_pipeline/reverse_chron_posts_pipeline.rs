@@ -5,6 +5,9 @@ use crate::candidate_hydrators::following_blocked_by_hydrator::FollowingBlockedB
 use crate::candidate_hydrators::quoted_post_text_hydrator::QuotedPostTextHydrator;
 use crate::candidate_hydrators::tweet_type_metrics_hydrator::TweetTypeMetricsHydrator;
 use crate::candidate_hydrators::vf_following_candidate_hydrator::VFFollowingCandidateHydrator;
+use crate::clients::author_brand_safety_client::{
+    AuthorBrandSafetyClient, MockAuthorBrandSafetyClient,
+};
 use crate::clients::night_owl_client::{MockNightOwlClient, NightOwlClient, ProdNightOwlClient};
 use crate::clients::s2s::{S2S_CHAIN_PATH, S2S_CRT_PATH, S2S_KEY_PATH};
 use crate::clients::tweet_entity_service_client::{MockTESClient, ProdTESClient, TESClient};
@@ -56,6 +59,7 @@ impl ReverseChronPostsPipeline {
             xai_vf_client,
             vf_safety_labels_client,
             socialgraph_client,
+            author_brand_safety_client,
         ) = tokio::join!(
             async {
                 Arc::new(
@@ -112,6 +116,7 @@ impl ReverseChronPostsPipeline {
                     .expect("Failed to create flock SocialGraphClient"),
                 ) as Arc<dyn SocialGraphClientOps>
             },
+            super::shared_author_brand_safety_client(datacenter),
         );
 
         Self::build(
@@ -121,6 +126,7 @@ impl ReverseChronPostsPipeline {
             xai_vf_client,
             vf_safety_labels_client,
             socialgraph_client,
+            author_brand_safety_client,
         )
         .await
     }
@@ -133,6 +139,7 @@ impl ReverseChronPostsPipeline {
             Arc::new(MockVfClient) as Arc<dyn VfClient + Send + Sync>,
             Arc::new(MockTweetSafetyLabelClient) as Arc<dyn TweetSafetyLabelClient>,
             Arc::new(MockSocialGraphClient) as Arc<dyn SocialGraphClientOps>,
+            Arc::new(MockAuthorBrandSafetyClient::default()) as Arc<dyn AuthorBrandSafetyClient>,
         )
         .await
     }
@@ -144,6 +151,7 @@ impl ReverseChronPostsPipeline {
         xai_vf_client: Arc<dyn VfClient + Send + Sync>,
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
         socialgraph_client: Arc<dyn SocialGraphClientOps>,
+        author_brand_safety_client: Arc<dyn AuthorBrandSafetyClient>,
     ) -> Self {
         let sources: Vec<Box<dyn Source<ScoredPostsQuery, PostCandidate>>> =
             vec![Box::new(FollowingNightOwlSource {
@@ -172,6 +180,7 @@ impl ReverseChronPostsPipeline {
             )),
             Box::new(AdsBrandSafetyVfHydrator {
                 client: vf_safety_labels_client,
+                author_client: Some(author_brand_safety_client),
             }),
             Box::new(TweetTypeMetricsHydrator::new()),
         ];

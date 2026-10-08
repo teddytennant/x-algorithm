@@ -18,6 +18,9 @@ use xai_x_thrift::tweet_safety_label::{
 const DEFAULT_TIMEOUT_MS: u64 = 200;
 const DEFAULT_MAX_BATCH_SIZE: usize = 50;
 
+pub const LATENCY_VM_METRIC: &str = "vf_client_get_safety_labels_latency_ms_vm";
+pub const BATCH_LATENCY_VM_METRIC: &str = "vf_client_get_safety_labels_batch_latency_ms_vm";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SafetyLabelFailure {
     LookupFailed,
@@ -61,6 +64,7 @@ impl VfServiceClient {
 
 enum RequestStatus {
     Completed,
+    Degraded,
     Cancelled,
 }
 
@@ -79,8 +83,12 @@ impl RequestMetricsGuard {
         }
     }
 
-    fn mark_completed(&mut self) {
-        self.result = RequestStatus::Completed;
+        fn mark_completed(&mut self, failed_ids: usize) {
+        self.result = if failed_ids > 0 {
+            RequestStatus::Degraded
+        } else {
+            RequestStatus::Completed
+        };
     }
 }
 
@@ -92,15 +100,15 @@ impl Drop for RequestMetricsGuard {
 
         let result = match self.result {
             RequestStatus::Completed => "completed",
+            RequestStatus::Degraded => "degraded",
             RequestStatus::Cancelled => "cancelled",
         };
 
         sr.incr("vf_client_get_safety_labels", &[("requests", result)], 1);
-        sr.observe(
-            "vf_client_get_safety_labels_latency_ms",
+        sr.observe_vm(
+            LATENCY_VM_METRIC,
             &[],
             self.start.elapsed().as_secs_f64() * 1000.0,
-            xai_stats_receiver::HistogramBuckets::Bucket0To50,
         );
     }
 }
@@ -280,11 +288,10 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
                     labels.extend(batch.labels);
                     failures.extend(batch.failures);
                     if let Some(sr) = global_stats_receiver() {
-                        sr.observe(
-                            "vf_client_get_safety_labels_batch_latency_ms",
+                        sr.observe_vm(
+                            BATCH_LATENCY_VM_METRIC,
                             &[("result", "success")],
                             batch_elapsed.as_secs_f64() * 1000.0,
-                            xai_stats_receiver::HistogramBuckets::Bucket0To50,
                         );
                     }
                 }
@@ -302,11 +309,10 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
                             &[("code", error_type)],
                             1,
                         );
-                        sr.observe(
-                            "vf_client_get_safety_labels_batch_latency_ms",
+                        sr.observe_vm(
+                            BATCH_LATENCY_VM_METRIC,
                             &[("result", "error")],
                             batch_elapsed.as_secs_f64() * 1000.0,
-                            xai_stats_receiver::HistogramBuckets::Bucket0To50,
                         );
                     }
                     let start = i * self.max_batch_size;
@@ -328,7 +334,7 @@ impl TweetSafetyLabelClient for ProdTweetSafetyLabelClient {
             );
         }
 
-        request_metrics.mark_completed();
+        request_metrics.mark_completed(failures.len());
         Ok(SafetyLabelsBatch { labels, failures })
     }
 }
@@ -351,6 +357,7 @@ impl TweetSafetyLabelClient for MockTweetSafetyLabelClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RecordingReceiver;
     use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -653,5 +660,25 @@ mod tests {
             ])
         );
         handle.abort();
+    }
+
+    fn request_guard_with(receiver: Arc<RecordingReceiver>) -> RequestMetricsGuard {
+        RequestMetricsGuard {
+            start: Instant::now(),
+            receiver: Some(receiver),
+            result: RequestStatus::Cancelled,
+        }
+    }
+
+    #[test]
+    fn request_guard_counts_completed_degraded_or_cancelled() {
+        let sr = Arc::new(RecordingReceiver::default());
+        request_guard_with(sr.clone()).mark_completed(0);
+        request_guard_with(sr.clone()).mark_completed(2);
+        drop(request_guard_with(sr.clone()));
+        for status in ["completed", "degraded", "cancelled"] {
+            let key = format!("vf_client_get_safety_labels|requests={status}");
+            assert_eq!(sr.counter(&key), 1, "{key}");
+        }
     }
 }

@@ -81,6 +81,7 @@ impl Source<ScoredPostsQuery, PostCandidate> for PhoenixTopicsSource {
                 None,
                 query.params.get(PhoenixXdsRetrievalMaxRetries),
                 query.params.get(EnablePhoenixRetrievalFallback),
+                vec![],
             )
             .await
             .map_err(|e| format!("PhoenixTopicsSource: {e}"))?;

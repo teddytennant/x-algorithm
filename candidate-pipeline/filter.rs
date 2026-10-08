@@ -1,4 +1,5 @@
 use crate::candidate_pipeline::{PipelineCandidate, PipelineQuery, PipelineStage};
+use crate::pipeline_summary::ComponentStats;
 use crate::util;
 use crate::SPAN_LEVEL;
 use std::any::{type_name_of_val, Any};
@@ -28,7 +29,9 @@ where
         filter_rate = Empty,
     ))]
     fn run(&self, query: &Q, candidates: Vec<C>, stage: PipelineStage) -> FilterResult<C> {
+        let stats = ComponentStats::begin(stage, self.name(), type_name_of_val(self));
         let result = self.filter(query, candidates);
+        stats.finish_filter(result.kept.len(), result.removed.len());
         let total = result.kept.len() + result.removed.len();
         let rate = if total > 0 {
             result.removed.len() as f64 / total as f64

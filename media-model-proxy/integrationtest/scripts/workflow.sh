@@ -13,7 +13,7 @@ function usage {
 LOG_LEVEL="INFO"
 ENV="staging"
 MP_ENV="prod"
-MEDIA_PATH_PREFIX=""  
+MEDIA_PATH_PREFIX=""
 
 while [ -n "$1" ]; do
   case "$1" in
